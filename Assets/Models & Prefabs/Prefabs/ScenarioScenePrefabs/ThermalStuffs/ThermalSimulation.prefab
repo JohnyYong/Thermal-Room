@@ -1,0 +1,82 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1606142170015161716
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 5626175337288553190}
+  - component: {fileID: 5793500181761506877}
+  m_Layer: 0
+  m_Name: ThermalSimulation
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &5626175337288553190
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1606142170015161716}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 61, y: 103.4, z: -46.4}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &5793500181761506877
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1606142170015161716}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 491beab9c3bb5524bbf4ffca5e453234, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::ThermalSimulation
+  simulation: {fileID: 7200000, guid: c7336b4bd967d0447ae419d94b1153dc, type: 3}
+  thermalSurfaceMaterial: {fileID: 2100000, guid: 2cc5425eb5bd33e4695620493de80760, type: 2}
+  thermalVolume: {fileID: 0}
+  cellSize: 0.8
+  fireSource: {fileID: 0}
+  firePower: 0
+  diffusionRate: 0.6
+  buoyancyStrength: 0.05
+  coolingRate: 0
+  solidHeatTransferRate: 0
+  solidConductionRate: 0.05
+  solidDiffusionRate: 0.15
+  solidToAirRate: 1
+  airToSolidRate: 2
+  solidCoolingRate: 0.001
+  turbulenceStrength: 0
+  vorticityStrength: 10
+  radiationRange: 0
+  radiationPower: 0
+  burningRadiationRange: 15
+  burningRadiationPower: 0
+  burnRate: 1
+  burnHeat: 350
+  flameAirHeat: 100
+  smokeGenerationRate: 80
+  smokeDecayRate: 0
+  smokeDiffusionRate: 0.3
+  pressureIterations: 10
+  volumeMaterial: {fileID: 2100000, guid: 7173fd66319a4cf4484a84382a49d49c, type: 2}
+  smokeVolumeMaterial: {fileID: 2100000, guid: 9d01482b0141bcb41b9301141f8d13c5, type: 2}
+  fireVolumeMaterial: {fileID: 2100000, guid: 83e407758b8edf04c8445aa28b7db41c, type: 2}
+  fireHeatVolumeMaterial: {fileID: 2100000, guid: cb7c2357614e2fc4895fbc18d28fe1d9, type: 2}
+  thermalGreyscaleMaterial: {fileID: 2100000, guid: 6a9bfb91158a3df4a9927b4e262c0074, type: 2}
+  thermalSurfaceRenderers: []
+  igniteEverything: 0
+  simulationActive: 1

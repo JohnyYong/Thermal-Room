@@ -1,0 +1,1575 @@
+#pragma kernel HeatStep
+#pragma kernel BuoyancyStep
+#pragma kernel AdvectTemperatureStep
+#pragma kernel AdvectVelocityStep
+#pragma kernel ComputeDivergence
+#pragma kernel SolvePressure
+#pragma kernel ProjectVelocity
+#pragma kernel SolidHeatTransferStep
+#pragma kernel SolidConductionStep
+#pragma kernel SolidToAirStep
+#pragma kernel RadiationStep
+#pragma kernel CombustionStep
+#pragma kernel CombustionToAirStep
+
+#pragma kernel ComputeCurl
+#pragma kernel VorticityConfinementStep
+
+#pragma kernel AdvectSmokeStep
+#pragma kernel SmokeGenerationStep
+
+#pragma kernel FlameGenerationStep
+#pragma kernel AdvectFlameStep
+
+#pragma kernel FlameHeatStep
+
+#pragma kernel RuntimeIgnite
+
+#pragma kernel ExtinguishStep
+
+#pragma kernel SuppressantDecayStep
+
+Texture3D<float> TemperatureIn;
+RWTexture3D<float> TemperatureOut;
+Texture3D<float4> VelocityIn;
+RWTexture3D<float4> VelocityOut;
+Texture3D<float> Obstacle;
+RWTexture3D<float> MaterialVolume;
+RWTexture3D<float> ObstacleOut;
+Texture3D<float> PressureIn;
+RWTexture3D<float> PressureOut;
+
+RWTexture3D<float> Divergence;
+
+Texture3D<float> SolidTemperatureIn;
+RWTexture3D<float> SolidTemperatureOut;
+
+Texture3D<float> FuelIn;
+RWTexture3D<float> FuelOut;
+
+Texture3D<float> BurningIn;
+RWTexture3D<float> BurningOut;
+
+Texture3D<float> SuppressantIn;
+RWTexture3D<float> SuppressantOut;
+
+Texture3D<float4> CurlIn;
+RWTexture3D<float4> CurlOut;
+
+Texture3D<float> SmokeIn;
+RWTexture3D<float> SmokeOut;
+
+Texture3D<float> FlameIn;
+RWTexture3D<float> FlameOut;
+
+RWTexture3D<float> FlameHeatOut;
+
+float BuoyancyStrength;
+
+int GridX;
+int GridY;
+int GridZ;
+
+float DiffusionRate;
+float SolidDiffusionRate;
+
+float DeltaTime;
+
+float AmbientTemp;
+float CoolingRate;
+
+float TurbulenceStrength;
+
+float3 FirePosition;
+float FireRadius;
+float FirePower;
+float SolidHeatTransferRate; // unused
+float SolidConductionRate; // unused
+float SolidToAirRate;
+
+float AirToSolidRate;
+float SolidCoolingRate;
+
+float RadiationRange;
+float RadiationPower;
+float BurningRadiationRange;
+float BurningRadiationPower;
+
+float BurnRate;
+float BurnHeat;
+
+float FlameAirHeat;
+
+float VorticityStrength;
+
+float SmokeGenerationRate;
+float SmokeDecayRate;
+float SmokeDiffusionRate;
+
+float FlameTemperatureMin;
+float FlameTemperatureMax;
+
+float ExtinguishStrength;
+
+//runtime fire
+struct BurningVoxel
+{
+    uint x;
+    uint y;
+    uint z;
+    uint pad;
+};
+
+StructuredBuffer<BurningVoxel> RuntimeVoxels;
+
+uint RuntimeVoxelCount;
+
+float RuntimeFuel;
+float RuntimeMaterial;
+
+bool CanIgniteVoxel(int3 voxel)
+{
+    if (voxel.x < 0 || voxel.y < 0 || voxel.z < 0 || voxel.x >= GridX ||
+        voxel.y >= GridY || voxel.z >= GridZ)
+        return false;
+
+    if (Obstacle[voxel] < 0.5)
+        return false;
+
+    if (BurningIn[voxel] > 0.5)
+        return false;
+
+    if (FuelIn[voxel] <= 0)
+        return false;
+
+    return true;
+}
+
+float GetConductivity(float material)
+{
+    if (material < 1.5)
+        return 0.02 * SolidConductionRate; // Wood
+
+    if (material < 2.5)
+        return 0.50 * SolidConductionRate; // Steel
+
+    if (material < 3.5)
+        return 0.05 * SolidConductionRate; // Concrete
+
+    if (material < 4.5)
+        return 0.08 * SolidConductionRate; // Glass
+
+    if (material < 5.5)
+        return 0.01 * SolidConductionRate; // Cloth
+
+    return 0.05 * SolidConductionRate;
+}
+
+float GetHeatCapacity(float material)
+{
+    if (material < 1.5)
+        return 1.7; // Wood
+
+    if (material < 2.5)
+        return 0.5; // Steel
+
+    if (material < 3.5)
+        return 3.0; // Concrete
+
+    if (material < 4.5)
+        return 0.8; // Glass
+
+    if (material < 5.5)
+        return 0.6; // Cloth
+
+    return 1.0;
+}
+
+bool IsSurfaceVoxel(uint3 id)
+{
+    int3 neighbors[6] =
+    {
+        int3(id.x + 1, id.y, id.z), int3(id.x - 1, id.y, id.z),
+
+        int3(id.x, id.y + 1, id.z), int3(id.x, id.y - 1, id.z),
+
+        int3(id.x, id.y, id.z + 1), int3(id.x, id.y, id.z - 1)
+    };
+
+    for (int i = 0; i < 6; i++)
+    {
+        int3 n = neighbors[i];
+
+        if (n.x < 0 || n.y < 0 || n.z < 0 || n.x >= GridX || n.y >= GridY ||
+            n.z >= GridZ)
+            continue;
+
+        if (Obstacle[n] < 0.5)
+            return true;
+    }
+
+    return false;
+}
+
+bool HasLineOfSightToFire(uint3 id)
+{
+    float3 start = float3(id);
+
+    float3 end = FirePosition;
+
+    float3 dir = normalize(end - start);
+
+    float dist = distance(start, end);
+
+    int steps = (int) dist;
+
+    for (int i = 1; i < steps; i++)
+    {
+        float3 p = start + dir * i;
+
+        // maybe change to a proper 3d DDA traversal but for now im using this
+        // aight
+        int3 voxel = int3(round(p));
+
+        if (voxel.x < 0 || voxel.y < 0 || voxel.z < 0 || voxel.x >= GridX ||
+            voxel.y >= GridY || voxel.z >= GridZ)
+            continue;
+
+        if (Obstacle[voxel] > 0.5)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+float GetIgnitionTemperature(float material)
+{
+    if (material < 1.5)
+        return 250; // Wood
+
+    if (material < 2.5)
+        return 999999; // Steel
+
+    if (material < 3.5)
+        return 999999; // Concrete
+
+    if (material < 4.5)
+        return 999999; // Glass
+
+    if (material < 5.5)
+        return 180; // Cloth
+
+    return 999999;
+}
+
+bool IsExposedToAir(uint3 id)
+{
+    int3 neighbors[6] =
+    {
+        int3(id.x + 1, id.y, id.z), int3(id.x - 1, id.y, id.z),
+
+        int3(id.x, id.y + 1, id.z), int3(id.x, id.y - 1, id.z),
+
+        int3(id.x, id.y, id.z + 1), int3(id.x, id.y, id.z - 1)
+    };
+
+    for (int i = 0; i < 6; i++)
+    {
+        int3 n = neighbors[i];
+
+        if (n.x < 0 || n.y < 0 || n.z < 0 || n.x >= GridX || n.y >= GridY ||
+            n.z >= GridZ)
+            continue;
+
+        if (Obstacle[n] < 0.5)
+            return true;
+    }
+
+    return false;
+}
+
+[numthreads(64, 1, 1)]
+void RuntimeIgnite(uint id : SV_DispatchThreadID)
+{
+    if (id >= RuntimeVoxelCount)
+        return;
+
+    BurningVoxel voxel = RuntimeVoxels[id];
+
+    int3 p = int3(
+        voxel.x,
+        voxel.y,
+        voxel.z);
+
+    // Only replace existing obstacle voxels.
+    if (ObstacleOut[p] < 0.5)
+        return;
+
+    ObstacleOut[p] = 1.0;
+    MaterialVolume[p] = RuntimeMaterial;
+    FuelOut[p] = RuntimeFuel;
+    BurningOut[p] = 1.0;
+}
+
+[numthreads(8, 8, 8)]
+void HeatStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        TemperatureOut[id] = TemperatureIn[id];
+
+        return;
+    }
+
+    float temp = TemperatureIn[id];
+
+    float diffusion = 0;
+
+    if (id.x > 0 && id.x < GridX - 1 && id.y > 0 && id.y < GridY - 1 &&
+        id.z > 0 && id.z < GridZ - 1)
+    {
+        diffusion = TemperatureIn[int3(id.x + 1, id.y, id.z)] +
+                    TemperatureIn[int3(id.x - 1, id.y, id.z)] +
+
+                    TemperatureIn[int3(id.x, id.y + 1, id.z)] +
+                    TemperatureIn[int3(id.x, id.y - 1, id.z)] +
+
+                    TemperatureIn[int3(id.x, id.y, id.z + 1)] +
+                    TemperatureIn[int3(id.x, id.y, id.z - 1)] -
+
+                    temp * 6;
+    }
+
+    float dist = distance(float3(id), FirePosition);
+
+    float fire = saturate(1.0 - dist / FireRadius);
+
+    temp += fire * FirePower * DeltaTime;
+
+    temp += diffusion * DiffusionRate * DeltaTime;
+
+    temp += (AmbientTemp - temp) * CoolingRate * DeltaTime;
+
+    TemperatureOut[id] = temp;
+}
+
+[numthreads(8, 8, 8)]
+void BuoyancyStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        VelocityOut[id] = float4(0, 0, 0, 0);
+        return;
+    }
+
+    float temp = TemperatureIn[id];
+
+    float4 velocity = VelocityIn[id];
+
+    float buoyancy = max(temp - AmbientTemp, 0);
+
+    velocity.y += buoyancy * BuoyancyStrength * DeltaTime;
+
+    // TURBULENCE IS 0 NOW
+    //  Turbulence from temperature gradients
+    if (id.x > 0 && id.x < GridX - 1 && id.y > 0 && id.y < GridY - 1 &&
+        id.z > 0 && id.z < GridZ - 1)
+    {
+        float gradX = TemperatureIn[int3(id.x + 1, id.y, id.z)] -
+                      TemperatureIn[int3(id.x - 1, id.y, id.z)];
+
+        float gradZ = TemperatureIn[int3(id.x, id.y, id.z + 1)] -
+                      TemperatureIn[int3(id.x, id.y, id.z - 1)];
+
+        velocity.x += gradX * TurbulenceStrength * DeltaTime;
+
+        velocity.z += gradZ * TurbulenceStrength * DeltaTime;
+    }
+
+    velocity.xyz *= 0.999;
+
+    VelocityOut[id] = velocity;
+}
+
+float SampleTemperature(float3 pos)
+{
+    pos = clamp(pos, float3(0, 0, 0), float3(GridX - 2, GridY - 2, GridZ - 2));
+
+    int3 p0 = int3(floor(pos));
+    int3 p1 = p0 + 1;
+
+    float3 f = frac(pos);
+
+    float c000 = TemperatureIn[p0];
+
+    float c100 = TemperatureIn[int3(p1.x, p0.y, p0.z)];
+
+    float c010 = TemperatureIn[int3(p0.x, p1.y, p0.z)];
+
+    float c110 = TemperatureIn[int3(p1.x, p1.y, p0.z)];
+
+    float c001 = TemperatureIn[int3(p0.x, p0.y, p1.z)];
+
+    float c101 = TemperatureIn[int3(p1.x, p0.y, p1.z)];
+
+    float c011 = TemperatureIn[int3(p0.x, p1.y, p1.z)];
+
+    float c111 = TemperatureIn[p1];
+
+    float c00 = lerp(c000, c100, f.x);
+    float c10 = lerp(c010, c110, f.x);
+
+    float c01 = lerp(c001, c101, f.x);
+    float c11 = lerp(c011, c111, f.x);
+
+    float c0 = lerp(c00, c10, f.y);
+    float c1 = lerp(c01, c11, f.y);
+
+    return lerp(c0, c1, f.z);
+}
+
+float4 SampleVelocity(float3 pos)
+{
+    pos = clamp(pos, float3(0, 0, 0), float3(GridX - 2, GridY - 2, GridZ - 2));
+
+    int3 p0 = int3(floor(pos));
+    int3 p1 = p0 + 1;
+
+    float3 f = frac(pos);
+
+    float4 c000 = VelocityIn[p0];
+
+    float4 c100 = VelocityIn[int3(p1.x, p0.y, p0.z)];
+
+    float4 c010 = VelocityIn[int3(p0.x, p1.y, p0.z)];
+
+    float4 c110 = VelocityIn[int3(p1.x, p1.y, p0.z)];
+
+    float4 c001 = VelocityIn[int3(p0.x, p0.y, p1.z)];
+
+    float4 c101 = VelocityIn[int3(p1.x, p0.y, p1.z)];
+
+    float4 c011 = VelocityIn[int3(p0.x, p1.y, p1.z)];
+
+    float4 c111 = VelocityIn[p1];
+
+    float4 c00 = lerp(c000, c100, f.x);
+    float4 c10 = lerp(c010, c110, f.x);
+
+    float4 c01 = lerp(c001, c101, f.x);
+    float4 c11 = lerp(c011, c111, f.x);
+
+    float4 c0 = lerp(c00, c10, f.y);
+    float4 c1 = lerp(c01, c11, f.y);
+
+    return lerp(c0, c1, f.z);
+}
+
+[numthreads(8, 8, 8)]
+void AdvectTemperatureStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        TemperatureOut[id] = 0;
+        return;
+    }
+
+    float4 velocity = VelocityIn[id];
+
+    float3 currentPos = float3(id);
+
+    float3 previousPos = currentPos - velocity.xyz * DeltaTime;
+
+    float advectedTemperature = SampleTemperature(previousPos);
+
+    TemperatureOut[id] = advectedTemperature;
+}
+
+[numthreads(8, 8, 8)]
+void AdvectVelocityStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        VelocityOut[id] = 0;
+        return;
+    }
+
+    float4 velocity = VelocityIn[id];
+
+    float3 currentPos = float3(id);
+
+    float3 previousPos = currentPos - velocity.xyz * DeltaTime;
+
+    float4 advectedVelocity = SampleVelocity(previousPos);
+
+    VelocityOut[id] = advectedVelocity;
+}
+
+[numthreads(8, 8, 8)]
+void ComputeDivergence(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x <= 0 || id.y <= 0 || id.z <= 0 || id.x >= GridX - 1 ||
+        id.y >= GridY - 1 || id.z >= GridZ - 1)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        Divergence[id] = 0;
+        return;
+    }
+
+    float vxR = VelocityIn[int3(id.x + 1, id.y, id.z)].x;
+
+    float vxL = VelocityIn[int3(id.x - 1, id.y, id.z)].x;
+
+    float vyU = VelocityIn[int3(id.x, id.y + 1, id.z)].y;
+
+    float vyD = VelocityIn[int3(id.x, id.y - 1, id.z)].y;
+
+    float vzF = VelocityIn[int3(id.x, id.y, id.z + 1)].z;
+
+    float vzB = VelocityIn[int3(id.x, id.y, id.z - 1)].z;
+
+    float div = (vxR - vxL + vyU - vyD + vzF - vzB) * 0.5;
+
+    Divergence[id] = div;
+}
+
+[numthreads(8, 8, 8)]
+void SolvePressure(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x <= 0 || id.y <= 0 || id.z <= 0 || id.x >= GridX - 1 ||
+        id.y >= GridY - 1 || id.z >= GridZ - 1)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        PressureOut[id] = 0;
+        return;
+    }
+
+    float pCenter = PressureIn[id];
+
+    float pL = Obstacle[int3(id.x - 1, id.y, id.z)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x - 1, id.y, id.z)];
+
+    float pR = Obstacle[int3(id.x + 1, id.y, id.z)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x + 1, id.y, id.z)];
+
+    float pD = Obstacle[int3(id.x, id.y - 1, id.z)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x, id.y - 1, id.z)];
+
+    float pU = Obstacle[int3(id.x, id.y + 1, id.z)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x, id.y + 1, id.z)];
+
+    float pB = Obstacle[int3(id.x, id.y, id.z - 1)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x, id.y, id.z - 1)];
+
+    float pF = Obstacle[int3(id.x, id.y, id.z + 1)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x, id.y, id.z + 1)];
+
+    float div = Divergence[id];
+
+    PressureOut[id] = (pL + pR + pD + pU + pB + pF - div) / 6.0;
+}
+
+[numthreads(8, 8, 8)]
+void ProjectVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (Obstacle[id] > 0.5)
+    {
+        VelocityOut[id] = float4(0, 0, 0, 0);
+        return;
+    }
+
+    if (id.x <= 0 || id.y <= 0 || id.z <= 0 || id.x >= GridX - 1 ||
+        id.y >= GridY - 1 || id.z >= GridZ - 1)
+        return;
+
+    float pCenter = PressureIn[id];
+
+    float pL = Obstacle[int3(id.x - 1, id.y, id.z)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x - 1, id.y, id.z)];
+
+    float pR = Obstacle[int3(id.x + 1, id.y, id.z)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x + 1, id.y, id.z)];
+
+    float pD = Obstacle[int3(id.x, id.y - 1, id.z)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x, id.y - 1, id.z)];
+
+    float pU = Obstacle[int3(id.x, id.y + 1, id.z)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x, id.y + 1, id.z)];
+
+    float pB = Obstacle[int3(id.x, id.y, id.z - 1)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x, id.y, id.z - 1)];
+
+    float pF = Obstacle[int3(id.x, id.y, id.z + 1)] > 0.5
+                   ? pCenter
+                   : PressureIn[int3(id.x, id.y, id.z + 1)];
+
+    float4 velocity = VelocityIn[id];
+
+    bool leftWall = id.x <= 1;
+    bool rightWall = id.x >= GridX - 2;
+
+    bool bottomWall = id.y <= 1;
+    bool topWall = id.y >= GridY - 2;
+
+    bool backWall = id.z <= 1;
+    bool frontWall = id.z >= GridZ - 2;
+
+    if (leftWall)
+        velocity.x = max(velocity.x, 0);
+
+    if (rightWall)
+        velocity.x = min(velocity.x, 0);
+
+    if (bottomWall)
+        velocity.y = max(velocity.y, 0);
+
+    if (topWall)
+        velocity.y = min(velocity.y, 0);
+
+    if (backWall)
+        velocity.z = max(velocity.z, 0);
+
+    if (frontWall)
+        velocity.z = min(velocity.z, 0);
+
+    velocity.x -= (pR - pL) * 0.5;
+    velocity.y -= (pU - pD) * 0.5;
+    velocity.z -= (pF - pB) * 0.5;
+
+    VelocityOut[id] = velocity;
+}
+
+[numthreads(8, 8, 8)]
+void SolidHeatTransferStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] < 0.5)
+        return;
+
+    float solidTemp = SolidTemperatureIn[id];
+
+    float material = MaterialVolume[id];
+
+    float conductivity = GetConductivity(material);
+
+    float heatCapacity = GetHeatCapacity(material);
+
+    float airTemp = 0;
+    int count = 0;
+
+    int3 neighbors[6] =
+    {
+        int3(id.x + 1, id.y, id.z), int3(id.x - 1, id.y, id.z),
+
+        int3(id.x, id.y + 1, id.z), int3(id.x, id.y - 1, id.z),
+
+        int3(id.x, id.y, id.z + 1), int3(id.x, id.y, id.z - 1)
+    };
+
+    for (int i = 0; i < 6; i++)
+    {
+        int3 n = neighbors[i];
+
+        if (n.x < 0 || n.y < 0 || n.z < 0 || n.x >= GridX || n.y >= GridY ||
+            n.z >= GridZ)
+            continue;
+
+        if (Obstacle[n] < 0.5)
+        {
+            airTemp += TemperatureIn[n];
+
+            count++;
+        }
+    }
+
+    // if (count > 0)
+    //{
+    //     airTemp /= count;
+
+    //    float airHeat =
+    //        (airTemp - solidTemp) * SolidHeatTransferRate * DeltaTime;
+
+    //    solidTemp += airHeat / heatCapacity;
+    //}
+
+    if (count > 0)
+    {
+        airTemp /= count;
+
+        float delta = airTemp - solidTemp;
+
+        if (delta > 0)
+        {
+            // Air hotter than solid
+            float airHeat = delta * AirToSolidRate * DeltaTime;
+
+            solidTemp += airHeat / heatCapacity;
+        }
+        else
+        {
+            // Solid hotter than air
+            float airHeat = delta * SolidCoolingRate * DeltaTime;
+
+            solidTemp += airHeat / heatCapacity;
+        }
+    }
+
+    SolidTemperatureOut[id] = solidTemp;
+}
+
+[numthreads(8, 8, 8)]
+void SolidConductionStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] < 0.5)
+        return;
+
+    float temp = SolidTemperatureIn[id];
+
+    float material = MaterialVolume[id];
+
+    float conductivity = GetConductivity(material);
+
+    float heatCapacity = GetHeatCapacity(material);
+
+    float diffusion = 0;
+
+    int3 offsets[6] =
+    {
+        int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0),
+                        int3(0, -1, 0), int3(0, 0, 1), int3(0, 0, -1)
+    };
+
+    for (int i = 0; i < 6; i++)
+    {
+        int3 n = int3(id) + offsets[i];
+
+        if (n.x < 0 || n.x >= GridX || n.y < 0 || n.y >= GridY || n.z < 0 ||
+            n.z >= GridZ)
+        {
+            continue;
+        }
+
+        if (Obstacle[n] < 0.5)
+        {
+            continue;
+        }
+
+        diffusion += SolidTemperatureIn[n] - temp;
+    }
+
+    float conductionHeat =
+        diffusion * SolidDiffusionRate * conductivity * DeltaTime;
+
+    temp += conductionHeat / heatCapacity;
+
+    SolidTemperatureOut[id] = temp;
+}
+
+[numthreads(8, 8, 8)]
+void SolidToAirStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+        return;
+
+    float airTemp = TemperatureIn[id];
+
+    float solidTempSum = 0;
+    int solidCount = 0;
+
+    int3 neighbors[6] =
+    {
+        int3(id.x + 1, id.y, id.z), int3(id.x - 1, id.y, id.z),
+
+        int3(id.x, id.y + 1, id.z), int3(id.x, id.y - 1, id.z),
+
+        int3(id.x, id.y, id.z + 1), int3(id.x, id.y, id.z - 1)
+    };
+
+    for (int i = 0; i < 6; i++)
+    {
+        int3 n = neighbors[i];
+
+        if (n.x < 0 || n.y < 0 || n.z < 0 || n.x >= GridX || n.y >= GridY ||
+            n.z >= GridZ)
+            continue;
+
+        if (Obstacle[n] > 0.5)
+        {
+            solidTempSum += SolidTemperatureIn[n];
+
+            solidCount++;
+        }
+    }
+
+    if (solidCount > 0)
+    {
+        float solidTemp = solidTempSum / solidCount;
+
+        airTemp += (solidTemp - airTemp) * SolidToAirRate * DeltaTime;
+    }
+
+    TemperatureOut[id] = airTemp;
+}
+
+[numthreads(8, 8, 8)]
+void RadiationStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] < 0.5)
+        return;
+
+    float solidTemp = SolidTemperatureIn[id];
+
+    if (!IsSurfaceVoxel(id))
+    {
+        SolidTemperatureOut[id] = SolidTemperatureIn[id];
+
+        return;
+    }
+
+    // if (!HasLineOfSightToFire(id))
+    //{
+    //     SolidTemperatureOut[id] =
+    //     solidTemp;
+
+    //    return;
+    //}
+
+    float material = MaterialVolume[id];
+
+    float heatCapacity = GetHeatCapacity(material);
+
+    float dist = distance(float3(id), FirePosition);
+
+    // if (dist > RadiationRange)
+    //{
+    //     SolidTemperatureOut[id] =
+    //         solidTemp;
+
+    //    return;
+    //}
+
+    float radiation = saturate(1.0 - dist / RadiationRange);
+
+    solidTemp += radiation * RadiationPower * DeltaTime / heatCapacity;
+
+    float maxBurnRadiation = 0;
+
+    // int searchRadius =
+    //     (int)ceil(BurningRadiationRange);
+
+    // capped
+    int searchRadius = min((int) ceil(BurningRadiationRange), 6);
+
+    for (int z = -searchRadius; z <= searchRadius; z++)
+    {
+        for (int y = -searchRadius; y <= searchRadius; y++)
+        {
+            for (int x = -searchRadius; x <= searchRadius; x++)
+            {
+                int3 n = int3(id) + int3(x, y, z);
+
+                if (n.x < 0 || n.y < 0 || n.z < 0 || n.x >= GridX ||
+                    n.y >= GridY || n.z >= GridZ)
+                    continue;
+
+                if (BurningIn[n] < 0.5)
+                    continue;
+
+                float dist = distance(float3(id), float3(n));
+
+                if (dist < 0.001)
+                    continue;
+
+                if (dist > BurningRadiationRange)
+                    continue;
+
+                float burnRadiation =
+                    saturate(1.0 - dist / BurningRadiationRange);
+
+                maxBurnRadiation = max(maxBurnRadiation, burnRadiation);
+            }
+        }
+    }
+    solidTemp +=
+        maxBurnRadiation * BurningRadiationPower * DeltaTime / heatCapacity;
+
+    SolidTemperatureOut[id] = solidTemp;
+}
+
+[numthreads(64, 1, 1)]
+void ExtinguishStep(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+
+    if (index >= RuntimeVoxelCount)
+        return;
+
+    BurningVoxel voxel = RuntimeVoxels[index];
+
+    int3 p = int3(voxel.x, voxel.y, voxel.z);
+
+    // Reduce burning gradually
+    float burning = BurningOut[p];
+
+    burning = max(
+    0.0,
+    burning - ExtinguishStrength * DeltaTime);
+
+    BurningOut[p] = burning;
+
+    // Deposit dry powder
+    SuppressantOut[p] =
+    min(
+        1.0,
+        SuppressantIn[p] +
+        ExtinguishStrength *
+        DeltaTime *
+        2.0);
+
+    // Flame shrinks
+    FlameOut[p] *= 0.90;
+
+    // Smoke decreases
+    SmokeOut[p] *= 0.95;
+
+    // Cool air
+    TemperatureOut[p] =
+    max(
+        AmbientTemp,
+        TemperatureOut[p] -
+        250.0 *
+        ExtinguishStrength *
+        DeltaTime);
+
+    // Cool solid
+    SolidTemperatureOut[p] =
+    max(
+        AmbientTemp,
+        SolidTemperatureOut[p] -
+        600.0 *
+        ExtinguishStrength *
+        DeltaTime);
+}
+
+[numthreads(8, 8, 8)]
+void CombustionStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] < 0.5)
+    {
+        FuelOut[id] = 0;
+        BurningOut[id] = 0;
+
+        SolidTemperatureOut[id] = SolidTemperatureIn[id];
+
+        return;
+    }
+
+    float fuel = FuelIn[id];
+
+    float burning = BurningIn[id];
+
+    BurningOut[id] = burning;
+
+    FuelOut[id] = fuel;
+
+    float material = MaterialVolume[id];
+
+    float ignitionTemp = GetIgnitionTemperature(material);
+
+    float temp = SolidTemperatureIn[id];
+
+    if (burning < 1.0 &&
+    fuel > 0 &&
+    temp > ignitionTemp &&
+    SuppressantIn[id] < 0.25 &&
+    IsExposedToAir(id))
+    {
+        burning += 0.5 * DeltaTime;
+        burning = min(burning, 1.0);
+    }
+
+    if (burning < 0.5)
+    {
+        FuelOut[id] = fuel;
+        BurningOut[id] = burning;
+
+        SolidTemperatureOut[id] = SolidTemperatureIn[id];
+
+        return;
+    }
+
+    fuel -= BurnRate * burning * DeltaTime;
+
+    if (burning > 0.05)
+    {
+        if (!IsExposedToAir(id))
+        {
+            burning = 0;
+        }
+
+        temp += BurnHeat * burning * DeltaTime;
+
+        int3 neighbors[6] =
+        {
+            int3(id.x + 1, id.y, id.z), int3(id.x - 1, id.y, id.z),
+
+            int3(id.x, id.y + 1, id.z), int3(id.x, id.y - 1, id.z),
+
+            int3(id.x, id.y, id.z + 1), int3(id.x, id.y, id.z - 1)
+        };
+
+        for (int i = 0; i < 6; i++)
+        {
+            int3 n = neighbors[i];
+
+            if (!CanIgniteVoxel(n))
+                continue;
+
+            float neighborMaterial = MaterialVolume[n];
+
+            float neighborIgnition = GetIgnitionTemperature(neighborMaterial);
+
+            float neighborTemp = SolidTemperatureIn[n];
+
+            if (neighborTemp > neighborIgnition)
+            {
+                BurningOut[n] =
+            min(
+                1.0,
+                BurningIn[n] + 0.3 * DeltaTime);
+            }
+        }
+
+        SolidTemperatureOut[id] = temp;
+    }
+    else
+    {
+        SolidTemperatureOut[id] = SolidTemperatureIn[id];
+    }
+
+    fuel = max(fuel, 0);
+
+    if (fuel <= 0)
+    {
+        burning = 0;
+    }
+
+    FuelOut[id] = fuel;
+
+    BurningOut[id] = burning;
+}
+
+[numthreads(8, 8, 8)]
+void CombustionToAirStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (BurningIn[id] < 0.5)
+        return;
+
+    int3 neighbors[6] =
+    {
+        int3(id.x + 1, id.y, id.z), int3(id.x - 1, id.y, id.z),
+
+        int3(id.x, id.y + 1, id.z), int3(id.x, id.y - 1, id.z),
+
+        int3(id.x, id.y, id.z + 1), int3(id.x, id.y, id.z - 1)
+    };
+
+    for (int i = 0; i < 6; i++)
+    {
+        int3 n = neighbors[i];
+
+        if (n.x < 0 || n.y < 0 || n.z < 0 || n.x >= GridX || n.y >= GridY ||
+            n.z >= GridZ)
+            continue;
+
+        if (Obstacle[n] > 0.5)
+            continue;
+
+        float temp = TemperatureIn[n];
+
+        temp += FlameAirHeat * DeltaTime;
+
+        TemperatureOut[n] = temp;
+    }
+}
+
+[numthreads(8, 8, 8)]
+void SmokeGenerationStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    float smoke = SmokeIn[id];
+
+    if (BurningIn[id] > 0.5)
+    {
+        smoke += SmokeGenerationRate * DeltaTime;
+    }
+
+    SmokeOut[id] = smoke;
+}
+
+float SampleSmoke(float3 pos)
+{
+    pos = clamp(pos, float3(0, 0, 0), float3(GridX - 2, GridY - 2, GridZ - 2));
+
+    int3 p0 = int3(floor(pos));
+    int3 p1 = p0 + 1;
+
+    float3 f = frac(pos);
+
+    float c000 = SmokeIn[p0];
+
+    float c100 = SmokeIn[int3(p1.x, p0.y, p0.z)];
+
+    float c010 = SmokeIn[int3(p0.x, p1.y, p0.z)];
+
+    float c110 = SmokeIn[int3(p1.x, p1.y, p0.z)];
+
+    float c001 = SmokeIn[int3(p0.x, p0.y, p1.z)];
+
+    float c101 = SmokeIn[int3(p1.x, p0.y, p1.z)];
+
+    float c011 = SmokeIn[int3(p0.x, p1.y, p1.z)];
+
+    float c111 = SmokeIn[p1];
+
+    float c00 = lerp(c000, c100, f.x);
+    float c10 = lerp(c010, c110, f.x);
+
+    float c01 = lerp(c001, c101, f.x);
+    float c11 = lerp(c011, c111, f.x);
+
+    float c0 = lerp(c00, c10, f.y);
+    float c1 = lerp(c01, c11, f.y);
+
+    return lerp(c0, c1, f.z);
+}
+
+float SampleFlame(float3 pos)
+{
+    pos = clamp(pos, float3(0, 0, 0), float3(GridX - 2, GridY - 2, GridZ - 2));
+
+    int3 p0 = int3(floor(pos));
+    int3 p1 = p0 + 1;
+
+    float3 f = frac(pos);
+
+    float c000 = FlameIn[p0];
+
+    float c100 = FlameIn[int3(p1.x, p0.y, p0.z)];
+
+    float c010 = FlameIn[int3(p0.x, p1.y, p0.z)];
+
+    float c110 = FlameIn[int3(p1.x, p1.y, p0.z)];
+
+    float c001 = FlameIn[int3(p0.x, p0.y, p1.z)];
+
+    float c101 = FlameIn[int3(p1.x, p0.y, p1.z)];
+
+    float c011 = FlameIn[int3(p0.x, p1.y, p1.z)];
+
+    float c111 = FlameIn[p1];
+
+    float c00 = lerp(c000, c100, f.x);
+    float c10 = lerp(c010, c110, f.x);
+
+    float c01 = lerp(c001, c101, f.x);
+    float c11 = lerp(c011, c111, f.x);
+
+    float c0 = lerp(c00, c10, f.y);
+    float c1 = lerp(c01, c11, f.y);
+
+    return lerp(c0, c1, f.z);
+}
+
+[numthreads(8, 8, 8)]
+void AdvectSmokeStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        SmokeOut[id] = 0;
+        return;
+    }
+
+    if (id.x == 0 || id.x == GridX - 1 || id.y == 0 || id.y == GridY - 1 ||
+        id.z == 0 || id.z == GridZ - 1)
+    {
+        SmokeOut[id] = SmokeIn[id];
+        return;
+    }
+
+    float4 velocity = VelocityIn[id];
+
+    float3 currentPos = float3(id);
+
+    float3 previousPos = currentPos - velocity.xyz * DeltaTime;
+
+    float smoke = SampleSmoke(previousPos);
+
+    float diffusion = 0;
+
+    if (id.x > 0 && id.x < GridX - 1 && id.y > 0 && id.y < GridY - 1 &&
+        id.z > 0 && id.z < GridZ - 1)
+    {
+        diffusion = SmokeIn[int3(id.x + 1, id.y, id.z)] +
+                    SmokeIn[int3(id.x - 1, id.y, id.z)] +
+
+                    SmokeIn[int3(id.x, id.y + 1, id.z)] +
+                    SmokeIn[int3(id.x, id.y - 1, id.z)] +
+
+                    SmokeIn[int3(id.x, id.y, id.z + 1)] +
+                    SmokeIn[int3(id.x, id.y, id.z - 1)] -
+
+                    smoke * 6;
+    }
+
+    smoke += diffusion * SmokeDiffusionRate * DeltaTime;
+
+    smoke *= (1.0 - SmokeDecayRate * DeltaTime);
+
+    SmokeOut[id] = max(0, smoke);
+}
+
+[numthreads(8, 8, 8)]
+void ComputeCurl(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x <= 0 || id.x >= GridX - 1 || id.y <= 0 || id.y >= GridY - 1 ||
+        id.z <= 0 || id.z >= GridZ - 1)
+    {
+        CurlOut[id] = 0;
+        return;
+    }
+
+    float dVz_dY = (VelocityIn[int3(id.x, id.y + 1, id.z)].z -
+                    VelocityIn[int3(id.x, id.y - 1, id.z)].z) *
+                   0.5;
+
+    float dVy_dZ = (VelocityIn[int3(id.x, id.y, id.z + 1)].y -
+                    VelocityIn[int3(id.x, id.y, id.z - 1)].y) *
+                   0.5;
+
+    float dVx_dZ = (VelocityIn[int3(id.x, id.y, id.z + 1)].x -
+                    VelocityIn[int3(id.x, id.y, id.z - 1)].x) *
+                   0.5;
+
+    float dVz_dX = (VelocityIn[int3(id.x + 1, id.y, id.z)].z -
+                    VelocityIn[int3(id.x - 1, id.y, id.z)].z) *
+                   0.5;
+
+    float dVy_dX = (VelocityIn[int3(id.x + 1, id.y, id.z)].y -
+                    VelocityIn[int3(id.x - 1, id.y, id.z)].y) *
+                   0.5;
+
+    float dVx_dY = (VelocityIn[int3(id.x, id.y + 1, id.z)].x -
+                    VelocityIn[int3(id.x, id.y - 1, id.z)].x) *
+                   0.5;
+
+    float3 curl;
+
+    curl.x = dVz_dY - dVy_dZ;
+    curl.y = dVx_dZ - dVz_dX;
+    curl.z = dVy_dX - dVx_dY;
+
+    float curlMagnitude = length(curl);
+
+    CurlOut[id] = float4(curl, curlMagnitude);
+}
+
+[numthreads(8, 8, 8)]
+void VorticityConfinementStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x <= 1 || id.x >= GridX - 2 || id.y <= 1 || id.y >= GridY - 2 ||
+        id.z <= 1 || id.z >= GridZ - 2)
+    {
+        VelocityOut[id] = VelocityIn[id];
+        return;
+    }
+
+    float curlL = CurlIn[int3(id.x - 1, id.y, id.z)].w;
+
+    float curlR = CurlIn[int3(id.x + 1, id.y, id.z)].w;
+
+    float curlD = CurlIn[int3(id.x, id.y - 1, id.z)].w;
+
+    float curlU = CurlIn[int3(id.x, id.y + 1, id.z)].w;
+
+    float curlB = CurlIn[int3(id.x, id.y, id.z - 1)].w;
+
+    float curlF = CurlIn[int3(id.x, id.y, id.z + 1)].w;
+
+    float3 N;
+
+    N.x = curlR - curlL;
+    N.y = curlU - curlD;
+    N.z = curlF - curlB;
+
+    float len = length(N);
+
+    N /= (len + 1e-5);
+
+    float4 velocity = VelocityIn[id];
+
+    float4 curlData = CurlIn[id];
+
+    float3 omega = curlData.xyz;
+
+    float omegaMagnitude = curlData.w;
+
+    float3 force = cross(N, omega) * VorticityStrength;
+
+    velocity.xyz += force * DeltaTime;
+
+    VelocityOut[id] = velocity;
+}
+
+[numthreads(8, 8, 8)]
+void FlameGenerationStep(int3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (id.x == 0 || id.x == GridX - 1 ||
+        id.y == 0 || id.y == GridY - 1 ||
+        id.z == 0 || id.z == GridZ - 1)
+    {
+        FlameOut[id] = 0;
+        return;
+    }
+
+    float flame = FlameIn[id];
+
+    // Flame naturally dies away
+    flame -= 1.8 * DeltaTime;
+
+    flame = max(flame, 0);
+
+    //---------------------------------------
+    // Burning material feeds the flame slowly
+    //---------------------------------------
+
+    if (BurningIn[id] > 0.02)
+    {
+        flame += BurningIn[id] * 3.0 * DeltaTime;
+    }
+
+    //---------------------------------------
+    // Hot gases keep flames alive
+    //---------------------------------------
+
+    float thermal =
+        saturate((TemperatureIn[id] - 250.0) / 600.0);
+
+    flame += thermal * 0.7 * DeltaTime;
+
+    //---------------------------------------
+    // Limit intensity
+    //---------------------------------------
+
+    flame = saturate(flame);
+
+    //---------------------------------------
+    // Shape the brightness
+    //---------------------------------------
+
+    flame = pow(flame, 1.4);
+
+    FlameOut[id] = flame;
+}
+
+[numthreads(8, 8, 8)]
+void AdvectFlameStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        FlameOut[id] = 0;
+        return;
+    }
+
+    float flameHere = FlameIn[id];
+
+    float3 velocity = VelocityIn[id].xyz;
+
+    // Flames naturally rise faster than smoke
+    velocity.y += flameHere * 4.0;
+
+    // Small random sideways motion
+    float random =
+        frac(sin(dot(float3(id), float3(12.9898, 78.233, 37.719))) * 43758.5453);
+
+    velocity.x += (random - 0.5) * flameHere * 0.5;
+    velocity.z += (0.5 - random) * flameHere * 0.5;
+
+    float3 currentPos = float3(id);
+
+    float3 previousPos =
+        currentPos - velocity * DeltaTime;
+
+    float flame =
+        SampleFlame(previousPos);
+
+    // Faster decay
+    flame *= 0.97;
+
+    // Remove weak flame
+    flame = max(0, flame - 0.02);
+
+    FlameOut[id] = flame;
+}
+
+[numthreads(8, 8, 8)]
+void FlameHeatStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        FlameHeatOut[id] = 0;
+        return;
+    }
+
+    float temp = TemperatureIn[id];
+    float smoke = SmokeIn[id];
+    float flame = FlameIn[id];
+
+    // Start with the actual air temperature
+    float heat = temp;
+
+    // Smoke keeps some heat
+    heat += smoke * 80.0;
+
+    // Flames appear hotter
+    heat += flame * 200.0;
+
+    FlameHeatOut[id] = heat;
+}
+
+[numthreads(8, 8, 8)]
+void SuppressantDecayStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
+        return;
+
+    SuppressantOut[id] =
+        max(
+            0.0,
+            SuppressantIn[id] -
+            0.02 * DeltaTime);  
+}   
+
+#pragma kernel CharAccumStep
+
+RWTexture3D<float> CharVolume;
+float CharRate;
+float CharStartTemp;
+float CharFullTemp;
+
+// BurningIn only ever holds a nonzero value on solid/Obstacle voxels (see
+// RuntimeIgnite and CombustionStep -- both write BurningOut only where
+// Obstacle >= 0.5). Char is meant to build in the AIR immediately around a
+// burning surface, not inside the solid itself, so this samples the
+// 6-connected neighbors of an air voxel looking for a burning solid.
+float SampleBurningNeighbor(int3 p)
+{
+	if (p.x < 0 || p.y < 0 || p.z < 0 ||
+		p.x >= GridX || p.y >= GridY || p.z >= GridZ)
+		return 0.0;
+
+	if (Obstacle[p] < 0.5)
+		return 0.0;
+
+	return BurningIn[p];
+}
+
+[numthreads(8,8,8)]
+void CharAccumStep (uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= (uint)GridX || id.y >= (uint)GridY || id.z >= (uint)GridZ) return;
+
+
+	if (Obstacle[id] > 0.5)
+	{
+		return;
+	}
+
+	int3 p = int3(id);
+
+	float burning = 0.0;
+	burning = max(burning, SampleBurningNeighbor(p + int3(1, 0, 0)));
+	burning = max(burning, SampleBurningNeighbor(p - int3(1, 0, 0)));
+	burning = max(burning, SampleBurningNeighbor(p + int3(0, 1, 0)));
+	burning = max(burning, SampleBurningNeighbor(p - int3(0, 1, 0)));
+	burning = max(burning, SampleBurningNeighbor(p + int3(0, 0, 1)));
+	burning = max(burning, SampleBurningNeighbor(p - int3(0, 0, 1)));
+
+	CharVolume[id] = min(
+		CharVolume[id] + burning * CharRate * DeltaTime, 1.0);
+}
+#pragma kernel CopyVolumeToBuffer
+
+Texture3D<float> CopySource;
+RWStructuredBuffer<float> CopyDest;
+int3 CopyDims;
+
+[numthreads(8,8,4)]
+void CopyVolumeToBuffer(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= (uint)CopyDims.x || id.y >= (uint)CopyDims.y || id.z >= (uint)CopyDims.z)
+		return;
+
+	int index = id.x + CopyDims.x * (id.y + CopyDims.y * id.z);
+	CopyDest[index] = CopySource[id];
+}
