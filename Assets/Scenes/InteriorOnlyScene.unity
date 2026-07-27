@@ -606,7 +606,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 2774220344278030320, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_LocalPosition.x
-      value: 2.74
+      value: 1.48
       objectReference: {fileID: 0}
     - target: {fileID: 2774220344278030320, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_LocalPosition.y
@@ -614,7 +614,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 2774220344278030320, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_LocalPosition.z
-      value: -12.96
+      value: -7.25
       objectReference: {fileID: 0}
     - target: {fileID: 2774220344278030320, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_LocalRotation.w
@@ -667,6 +667,9 @@ PrefabInstance:
     - targetCorrespondingSourceObject: {fileID: 7241455859189163582, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       insertIndex: -1
       addedObject: {fileID: 1527504059}
+    - targetCorrespondingSourceObject: {fileID: 7241455859189163582, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 1527504063}
   m_SourcePrefab: {fileID: -5645937942226959685, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
 --- !u!1001 &1091706104
 PrefabInstance:
@@ -812,6 +815,26 @@ CanvasRenderer:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1127721265}
   m_CullTransparentMesh: 1
+--- !u!1 &1233917373 stripped
+GameObject:
+  m_CorrespondingSourceObject: {fileID: 8041559948501782081, guid: d140395ff42dc4040a48803323ac84ff, type: 3}
+  m_PrefabInstance: {fileID: 6299307227650127459}
+  m_PrefabAsset: {fileID: 0}
+--- !u!114 &1233917375
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1233917373}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: bbd6f177e77a25341b56949909a431b2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::CharOverlayController
+  _charOverlayMat: {fileID: 2100000, guid: 674be610bbce629478a5fc249a53bdab, type: 2}
+  _charBoost: 1
+  _burn: 0
 --- !u!224 &1324035815 stripped
 RectTransform:
   m_CorrespondingSourceObject: {fileID: 1359416765982718367, guid: 9c5bea08b951b10499ee7beee0a3c9bd, type: 3}
@@ -1079,6 +1102,23 @@ MonoBehaviour:
   _charOverlayMat: {fileID: 2100000, guid: 674be610bbce629478a5fc249a53bdab, type: 2}
   _charBoost: 1
   _burn: 0
+--- !u!114 &1527504063
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1527504055}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f47fe70536866784bbb545f1f07bc3a5, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::ThermalMaterial
+  materialType: 1
+  includeChildren: 1
+  combustible: 1
+  igniteInstant: 0
+  fuelAmount: 100
 --- !u!1001 &1569913675
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -1089,15 +1129,15 @@ PrefabInstance:
     m_Modifications:
     - target: {fileID: 252017047017340163, guid: 2d4684d6bc6dae04d86b10e963c730e1, type: 3}
       propertyPath: m_Size.x
-      value: 0.75
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 252017047017340163, guid: 2d4684d6bc6dae04d86b10e963c730e1, type: 3}
       propertyPath: m_Size.y
-      value: 0.75
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 252017047017340163, guid: 2d4684d6bc6dae04d86b10e963c730e1, type: 3}
       propertyPath: m_Size.z
-      value: 0.75
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 252017047017340163, guid: 2d4684d6bc6dae04d86b10e963c730e1, type: 3}
       propertyPath: m_Center.x
@@ -1165,11 +1205,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8076615207932926017, guid: 2d4684d6bc6dae04d86b10e963c730e1, type: 3}
       propertyPath: m_Name
-      value: VFX_Fire_01_Big_Smoke
-      objectReference: {fileID: 0}
-    - target: {fileID: 8076615207932926017, guid: 2d4684d6bc6dae04d86b10e963c730e1, type: 3}
-      propertyPath: m_IsActive
-      value: 1
+      value: Fire
       objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
@@ -1978,6 +2014,10 @@ PrefabInstance:
       propertyPath: m_IsActive
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 5328784964871279060, guid: d140395ff42dc4040a48803323ac84ff, type: 3}
+      propertyPath: 'm_Materials.Array.data[0]'
+      value: 
+      objectReference: {fileID: 2100000, guid: 31109dbd44aa5314d9c87a22735faeac, type: 2}
     - target: {fileID: 5489326029091552902, guid: d140395ff42dc4040a48803323ac84ff, type: 3}
       propertyPath: m_IsActive
       value: 0
@@ -2041,6 +2081,9 @@ PrefabInstance:
     - targetCorrespondingSourceObject: {fileID: 7101509367674734705, guid: d140395ff42dc4040a48803323ac84ff, type: 3}
       insertIndex: -1
       addedObject: {fileID: 6299307227650127461}
+    - targetCorrespondingSourceObject: {fileID: 8041559948501782081, guid: d140395ff42dc4040a48803323ac84ff, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 1233917375}
   m_SourcePrefab: {fileID: 100100000, guid: d140395ff42dc4040a48803323ac84ff, type: 3}
 --- !u!1 &6299307227650127460 stripped
 GameObject:
@@ -2193,9 +2236,9 @@ SceneRoots:
   - {fileID: 1358331000}
   - {fileID: 1091706104}
   - {fileID: 1359248450}
-  - {fileID: 890666624}
   - {fileID: 787653414}
   - {fileID: 6299307227650127459}
   - {fileID: 1017159709}
   - {fileID: 333528174}
   - {fileID: 1569913675}
+  - {fileID: 890666624}

@@ -35,6 +35,40 @@ public class ThermalSimulation : MonoBehaviour
 
     public Transform fireSource;
 
+    // Runtime-spawned, moving heat sources (fireballs, torches, etc).
+    // Unlike `fireSource` above (one fixed Inspector-assigned Transform) or
+    // RegisterRuntimeBurningObject (ignites a fixed set of voxels once, at
+    // whatever position the object was at that instant), any number of
+    // these can be added/removed freely while playing, and each reports
+    // its LIVE position every FixedUpdate -- so heat genuinely follows a
+    // moving source instead of staying behind at its spawn point.
+    const int MaxFireSources = 32;
+    readonly List<IMobileFireSource> _fireSources = new();
+    ComputeBuffer fireSourceBuffer;
+    FireSourceGPU[] _fireSourceCPUBuffer;
+    bool _loggedFireSourceOverflow;
+
+    // Must match FireSourceData in ThermalSimulation.compute field-for-field
+    // (same order, no gaps) -- StructuredBuffer layout is purely positional.
+    struct FireSourceGPU
+    {
+        public Vector3 position;
+        public float heatRadius;
+        public float heatPower;
+        public float radiationRange;
+        public float radiationPower;
+    }
+
+    public void RegisterFireSource(IMobileFireSource src)
+    {
+        if (!_fireSources.Contains(src)) _fireSources.Add(src);
+    }
+
+    public void UnregisterFireSource(IMobileFireSource src)
+    {
+        _fireSources.Remove(src);
+    }
+
     RenderTexture temperatureA;
     RenderTexture temperatureB;
 
@@ -248,6 +282,9 @@ public class ThermalSimulation : MonoBehaviour
         copyVolumeKernel = simulation.FindKernel("CopyVolumeToBuffer");
         volumeReadBuffer = new ComputeBuffer(gridX * gridY * gridZ, sizeof(float));
 
+        fireSourceBuffer = new ComputeBuffer(MaxFireSources, sizeof(float) * 7);
+        _fireSourceCPUBuffer = new FireSourceGPU[MaxFireSources];
+
         runtimeVoxelBuffer = new ComputeBuffer(100000, sizeof(uint) * 4);
 
         temperatureA = CreateVolume();
@@ -302,9 +339,9 @@ public class ThermalSimulation : MonoBehaviour
         IsInitialized = true;
 
         ResetChar();
-    }
+}
 
-    void CalculateGridSize()
+void CalculateGridSize()
     {
         Bounds bounds = GetSimulationBounds();
 
@@ -333,6 +370,66 @@ public class ThermalSimulation : MonoBehaviour
         rt.Create();
 
         return rt;
+    }
+
+    // Uploads every active heat source (the legacy single `fireSource`
+    // Transform, if assigned, plus any registered IMobileFireSource) into
+    // one buffer that both HeatStep and RadiationStep read from, sampling
+    // each source's CURRENT world position fresh this frame. Called once
+    // per FixedUpdate before those two dispatches.
+    void BuildFireSourceBuffer()
+    {
+        int count = 0;
+
+        if (fireSource != null)
+        {
+            _fireSourceCPUBuffer[count++] = new FireSourceGPU
+            {
+                position = WorldToVoxel(fireSource.position),
+                heatRadius = 8f,
+                heatPower = firePower,
+                radiationRange = radiationRange,
+                radiationPower = radiationPower
+            };
+        }
+
+        for (int i = 0; i < _fireSources.Count && count < MaxFireSources; i++)
+        {
+            IMobileFireSource src = _fireSources[i];
+            if (src == null) continue; // defensive: destroyed without unregistering
+
+            _fireSourceCPUBuffer[count++] = new FireSourceGPU
+            {
+                position = WorldToVoxel(src.WorldPosition),
+                heatRadius = src.HeatRadius,
+                heatPower = src.HeatPower,
+                radiationRange = src.RadiationRange,
+                radiationPower = src.RadiationPower
+            };
+        }
+
+        if (count >= MaxFireSources && _fireSources.Count + (fireSource != null ? 1 : 0) > MaxFireSources)
+        {
+            if (!_loggedFireSourceOverflow)
+            {
+                Debug.LogWarning($"[ThermalSimulation] More than {MaxFireSources} active fire sources -- extras are being ignored until some are removed.");
+                _loggedFireSourceOverflow = true;
+            }
+        }
+        else
+        {
+            _loggedFireSourceOverflow = false;
+        }
+
+        // Upload the whole fixed-size array every frame (a few hundred
+        // bytes -- trivial) rather than a partial range, so we don't have
+        // to special-case count == 0. Unused slots are simply never read,
+        // since the kernels loop exactly `count` times.
+        fireSourceBuffer.SetData(_fireSourceCPUBuffer);
+
+        simulation.SetBuffer(heatKernel, "FireSources", fireSourceBuffer);
+        simulation.SetBuffer(radiationKernel, "FireSources", fireSourceBuffer);
+        simulation.SetInt("FireSourceCount", count);
     }
 
     void FixedUpdate()
@@ -390,13 +487,10 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("DiffusionRate", diffusionRate);
 
-        Vector3 fireVoxelPos = WorldToVoxel(fireSource.position);
-
-        simulation.SetVector("FirePosition", fireVoxelPos);
-
-        simulation.SetFloat("FireRadius", 8);
-
-        simulation.SetFloat("FirePower", firePower);
+        // Rebuilds and uploads FireSources once per tick -- covers both
+        // HeatStep (here) and RadiationStep (later this same tick) with
+        // every source's current live position.
+        BuildFireSourceBuffer();
 
         simulation.SetTexture(heatKernel, "Obstacle", obstacleVolume);
 
@@ -550,12 +644,6 @@ public class ThermalSimulation : MonoBehaviour
                               solidTemperatureB);
 
         simulation.SetTexture(radiationKernel, "Obstacle", obstacleVolume);
-
-        simulation.SetVector("FirePosition", WorldToVoxel(fireSource.position));
-
-        simulation.SetFloat("RadiationRange", radiationRange);
-
-        simulation.SetFloat("RadiationPower", radiationPower);
 
         simulation.SetTexture(radiationKernel, "MaterialVolume",
                               materialVolume);
@@ -974,6 +1062,7 @@ public class ThermalSimulation : MonoBehaviour
     void OnDestroy()
     {
         volumeReadBuffer?.Release();
+        fireSourceBuffer?.Release();
     }
 
     public RenderTexture GetTemperatureVolume()

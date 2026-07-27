@@ -80,9 +80,24 @@ float CoolingRate;
 
 float TurbulenceStrength;
 
-float3 FirePosition;
-float FireRadius;
-float FirePower;
+// A single Transform-driven "FirePosition" only ever supported one fire,
+// and had to be wired up in the Inspector ahead of time. Runtime-spawned,
+// moving fire sources (thrown fireballs, torches, etc.) need any number of
+// them, added/removed freely while playing, each contributing heat from
+// wherever it currently is. FireSources holds one entry per active source,
+// rebuilt from C# every FixedUpdate from live Transform positions.
+struct FireSourceData
+{
+    float3 position;       // voxel space, sampled fresh every tick
+    float  heatRadius;     // HeatStep falloff radius
+    float  heatPower;      // HeatStep injection strength
+    float  radiationRange; // RadiationStep falloff range
+    float  radiationPower; // RadiationStep injection strength
+};
+
+StructuredBuffer<FireSourceData> FireSources;
+int FireSourceCount;
+
 float SolidHeatTransferRate; // unused
 float SolidConductionRate; // unused
 float SolidToAirRate;
@@ -90,8 +105,6 @@ float SolidToAirRate;
 float AirToSolidRate;
 float SolidCoolingRate;
 
-float RadiationRange;
-float RadiationPower;
 float BurningRadiationRange;
 float BurningRadiationPower;
 
@@ -211,11 +224,11 @@ bool IsSurfaceVoxel(uint3 id)
     return false;
 }
 
-bool HasLineOfSightToFire(uint3 id)
+bool HasLineOfSightToFire(uint3 id, float3 firePos)
 {
     float3 start = float3(id);
 
-    float3 end = FirePosition;
+    float3 end = firePos;
 
     float3 dir = normalize(end - start);
 
@@ -303,10 +316,14 @@ void RuntimeIgnite(uint id : SV_DispatchThreadID)
         voxel.y,
         voxel.z);
 
-    // Only replace existing obstacle voxels.
-    if (ObstacleOut[p] < 0.5)
-        return;
-
+    // Previously this bailed out unless the voxel was ALREADY an obstacle
+    // (from the one-time FindObstacleColliders scan in Start()). That meant
+    // only objects present in the scene before Play could ever ignite --
+    // anything spawned/duplicated during Play had a collider that was
+    // never in that one-time scan, so every one of its voxels failed this
+    // check and silently ignited nothing. Runtime-spawned solids need to
+    // become real obstacle voxels here too, not just re-confirm existing
+    // ones.
     ObstacleOut[p] = 1.0;
     MaterialVolume[p] = RuntimeMaterial;
     FuelOut[p] = RuntimeFuel;
@@ -345,11 +362,16 @@ void HeatStep(uint3 id : SV_DispatchThreadID)
                     temp * 6;
     }
 
-    float dist = distance(float3(id), FirePosition);
+    float fireHeat = 0.0;
+    for (int fsi = 0; fsi < FireSourceCount; fsi++)
+    {
+        FireSourceData fs = FireSources[fsi];
+        float dist = distance(float3(id), fs.position);
+        float fire = saturate(1.0 - dist / max(fs.heatRadius, 0.0001));
+        fireHeat += fire * fs.heatPower;
+    }
 
-    float fire = saturate(1.0 - dist / FireRadius);
-
-    temp += fire * FirePower * DeltaTime;
+    temp += fireHeat * DeltaTime;
 
     temp += diffusion * DiffusionRate * DeltaTime;
 
@@ -878,19 +900,16 @@ void RadiationStep(uint3 id : SV_DispatchThreadID)
 
     float heatCapacity = GetHeatCapacity(material);
 
-    float dist = distance(float3(id), FirePosition);
+    float radiantHeat = 0.0;
+    for (int fsi = 0; fsi < FireSourceCount; fsi++)
+    {
+        FireSourceData fs = FireSources[fsi];
+        float dist = distance(float3(id), fs.position);
+        float radiation = saturate(1.0 - dist / max(fs.radiationRange, 0.0001));
+        radiantHeat += radiation * fs.radiationPower;
+    }
 
-    // if (dist > RadiationRange)
-    //{
-    //     SolidTemperatureOut[id] =
-    //         solidTemp;
-
-    //    return;
-    //}
-
-    float radiation = saturate(1.0 - dist / RadiationRange);
-
-    solidTemp += radiation * RadiationPower * DeltaTime / heatCapacity;
+    solidTemp += radiantHeat * DeltaTime / heatCapacity;
 
     float maxBurnRadiation = 0;
 
@@ -1539,7 +1558,10 @@ void CharAccumStep (uint3 id : SV_DispatchThreadID)
 {
 	if (id.x >= (uint)GridX || id.y >= (uint)GridY || id.z >= (uint)GridZ) return;
 
-
+	// Solid voxels don't carry char themselves -- char is a scorching of
+	// the air/surface around the fire. (Previously this zeroed CharVolume
+	// here every step; since BurningIn is only ever set on these same
+	// Obstacle voxels, that wiped out char before it could ever be read.)
 	if (Obstacle[id] > 0.5)
 	{
 		return;
@@ -1558,6 +1580,12 @@ void CharAccumStep (uint3 id : SV_DispatchThreadID)
 	CharVolume[id] = min(
 		CharVolume[id] + burning * CharRate * DeltaTime, 1.0);
 }
+
+// AsyncGPUReadback.Request() does not reliably return the full depth of a
+// Tex3D RenderTexture on all backends -- it can silently give back only the
+// z=0 slice. To read a volume back on the CPU correctly, copy it into a
+// linear StructuredBuffer with this kernel first, then read the buffer back
+// instead of the texture. See ThermalSimulation.RequestVolumeReadback().
 #pragma kernel CopyVolumeToBuffer
 
 Texture3D<float> CopySource;
