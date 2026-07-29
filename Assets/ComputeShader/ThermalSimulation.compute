@@ -1098,7 +1098,7 @@ void CombustionStep(uint3 id : SV_DispatchThreadID)
                 BurningOut[n] =
             min(
                 1.0,
-                BurningIn[n] + 0.3 * DeltaTime);
+                BurningIn[n] + 0.1 * DeltaTime);
             }
         }
 
@@ -1418,7 +1418,8 @@ void FlameGenerationStep(int3 id : SV_DispatchThreadID)
 
     if (BurningIn[id] > 0.02)
     {
-        flame += BurningIn[id] * 3.0 * DeltaTime;
+    //The fire rate here is the one to alter to control fire spreading rate
+        flame += BurningIn[id] * 1.5 * DeltaTime;
     }
 
     //---------------------------------------
@@ -1535,12 +1536,8 @@ RWTexture3D<float> CharVolume;
 float CharRate;
 float CharStartTemp;
 float CharFullTemp;
+int UseTimeForBurn;   // NEW
 
-// BurningIn only ever holds a nonzero value on solid/Obstacle voxels (see
-// RuntimeIgnite and CombustionStep -- both write BurningOut only where
-// Obstacle >= 0.5). Char is meant to build in the AIR immediately around a
-// burning surface, not inside the solid itself, so this samples the
-// 6-connected neighbors of an air voxel looking for a burning solid.
 float SampleBurningNeighbor(int3 p)
 {
 	if (p.x < 0 || p.y < 0 || p.z < 0 ||
@@ -1558,10 +1555,6 @@ void CharAccumStep (uint3 id : SV_DispatchThreadID)
 {
 	if (id.x >= (uint)GridX || id.y >= (uint)GridY || id.z >= (uint)GridZ) return;
 
-	// Solid voxels don't carry char themselves -- char is a scorching of
-	// the air/surface around the fire. (Previously this zeroed CharVolume
-	// here every step; since BurningIn is only ever set on these same
-	// Obstacle voxels, that wiped out char before it could ever be read.)
 	if (Obstacle[id] > 0.5)
 	{
 		return;
@@ -1576,6 +1569,14 @@ void CharAccumStep (uint3 id : SV_DispatchThreadID)
 	burning = max(burning, SampleBurningNeighbor(p - int3(0, 1, 0)));
 	burning = max(burning, SampleBurningNeighbor(p + int3(0, 0, 1)));
 	burning = max(burning, SampleBurningNeighbor(p - int3(0, 0, 1)));
+
+	// NEW: quick demo mode -- collapse whatever burning intensity into a
+	// flat on/off, so char grows at a steady CharRate purely from time
+	// spent adjacent to fire, rather than fluctuating with sim intensity.
+	if (UseTimeForBurn == 1)
+	{
+		burning = step(0.01, burning); // 0 or 1
+	}
 
 	CharVolume[id] = min(
 		CharVolume[id] + burning * CharRate * DeltaTime, 1.0);

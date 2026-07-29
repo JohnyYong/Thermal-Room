@@ -191,9 +191,13 @@ public class ThermalSimulation : MonoBehaviour
     public float charRate = 0.15f;       // 0-1 over ~7s at full heat
     public float charStartTemp = 150f;
     public float charFullTemp = 400f;
+    public bool useTimeForBurn = false; 
 
     // Cached once in Start so we don't call FindObjectsOfType twice.
     ThermalMaterial[] _thermalObjects;
+
+
+
 
     public bool IsInitialized { get; private set; }
 
@@ -462,7 +466,7 @@ void CalculateGridSize()
         simulation.SetFloat("CharStartTemp", charStartTemp);
 
         simulation.SetFloat("CharFullTemp", charFullTemp);
-
+        simulation.SetInt("UseTimeForBurn", useTimeForBurn ? 1 : 0);
         simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
 
         simulation.Dispatch(charAccumKernel, Mathf.CeilToInt(gridX / 8f),
@@ -1642,10 +1646,6 @@ void CalculateGridSize()
             {
                 return x + gx * (y + gy * z);
             }
-
-            Debug.Log($"(0,0,0) = {data[Index(0, 0, 0)]}");
-            Debug.Log($"(79,24,45) = {data[Index(79, 24, 45)]}");
-            Debug.Log($"(72,22,38) = {data[Index(72, 22, 38)]}");
 
             float max = 0f;
             int burningCount = 0;

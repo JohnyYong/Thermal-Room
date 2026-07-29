@@ -32,6 +32,8 @@ public class ThermalPositionToggle : MonoBehaviour
     private bool isAtPositionB = false;
     private Coroutine moveRoutine;
 
+    [SerializeField] private bool inXRMode = false; //Need to make it use #if XR_ENABLED 
+
     private void Start()
     {
         // Start at Position A by default
@@ -44,7 +46,7 @@ public class ThermalPositionToggle : MonoBehaviour
 
     private void Update()
     {
-        if (Input.GetKeyDown(toggleKey))
+        if (Input.GetKeyDown(toggleKey) && !inXRMode)
         {
             ToggleThermalPosition();
         }

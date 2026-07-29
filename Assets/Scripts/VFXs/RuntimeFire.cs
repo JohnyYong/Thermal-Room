@@ -58,6 +58,7 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
         // purely a moving heat source below.
         if (col != null && mat != null)
         {
+            Debug.Log("RunTimeFire: " + col.bounds.center);
             ThermalSimulation.Instance.RegisterRuntimeBurningObject(col, mat);
         }
 
