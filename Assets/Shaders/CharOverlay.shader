@@ -8,6 +8,14 @@ Shader "Custom/CharOverlay"
         _EdgeSoftness("Edge Softness", Range(0.01, 0.5)) = 0.12
         _Burn("Burn (fallback, used outside the thermal volume)", Range(0,1)) = 0
         _MaxCharAlpha("Max Char Opacity", Range(0,1)) = 1
+
+        // Set from C# (CharOverlayController.BuildOverlayClone) to the
+        // source mesh's OBJECT-SPACE bounds. Declared here (not just in the
+        // CBUFFER) so the SRP Batcher packs/validates this material
+        // correctly -- omitting a CBUFFER field from Properties is what
+        // caused the values to arrive as garbage on some GPUs/drivers.
+        _MeshBoundsCenter("Mesh Bounds Center (internal, set by script)", Vector) = (0,0,0,0)
+        _MeshBoundsSize("Mesh Bounds Size (internal, set by script)", Vector) = (1,1,1,0)
     }
 
     SubShader
@@ -47,12 +55,14 @@ Shader "Custom/CharOverlay"
                 float  _EdgeSoftness;
                 float  _Burn;
                 float  _MaxCharAlpha;
+                float3 _MeshBoundsCenter;
+                float3 _MeshBoundsSize;
             CBUFFER_END
 
-            // Bound globally every FixedUpdate by ThermalSimulation, not per
-            // material -- these carry the REAL, spatially-accurate char data
-            // from the simulation. Textures can't live in a constant buffer,
-            // so they're declared outside CBUFFER.
+            // Bound globally every FixedUpdate by ThermalSimulation. Kept
+            // declared here (harmless if unused) in case you want to layer
+            // fine local detail back in later, but the main mask below no
+            // longer reads from it -- see note in frag().
             TEXTURE3D(_CharTex);
             float3 _ThermalVolumeMin;
             float3 _ThermalVolumeSize;
@@ -92,9 +102,24 @@ Shader "Custom/CharOverlay"
                 return lerp(y0, y1, f.z);
             }
 
-            float CharPattern(float3 worldPos)
+            // Remaps raw object-space coords into a fixed, mesh-agnostic
+            // range (~-0.5..0.5 across the object) so _NoiseScale means
+            // "cells across the object" no matter how the mesh's own units
+            // are baked, and no matter what scale the surrounding SCENE is
+            // built at (world position / Transform scale never enter this
+            // at all, unlike sampling from positionWS). max(...,0.0001)
+            // guards a zero-extent axis from producing a divide-by-zero.
+            float3 NormalizeObjectSpace(float3 posOS)
             {
-                float3 p = worldPos * _NoiseScale;
+                float3 safeSize = max(_MeshBoundsSize, 0.0001);
+                return (posOS - _MeshBoundsCenter) / safeSize;
+            }
+
+            float CharPattern(float3 posOS)
+            {
+                float3 normalizedPos = NormalizeObjectSpace(posOS);
+
+                float3 p = normalizedPos * _NoiseScale;
                 float sum = 0, amp = 0.5, total = 0;
                 int octaves = (int)_NoiseDetail;
 
@@ -135,6 +160,7 @@ Shader "Custom/CharOverlay"
                 float4 positionCS : SV_POSITION;
                 float3 positionWS : TEXCOORD0;
                 float3 normalWS   : TEXCOORD1;
+                float3 positionOS : TEXCOORD2;
                 UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
@@ -147,26 +173,27 @@ Shader "Custom/CharOverlay"
                 VertexPositionInputs pos = GetVertexPositionInputs(IN.positionOS.xyz);
                 OUT.positionCS = pos.positionCS;
                 OUT.positionWS = pos.positionWS;
+                OUT.positionOS = IN.positionOS.xyz;
                 OUT.normalWS = TransformObjectToWorldNormal(IN.normalOS);
                 return OUT;
             }
 
             half4 frag(Varyings IN) : SV_Target
             {
-                // Real, spatially-accurate char amount AT THIS PIXEL, not a
-                // single value shared across the whole mesh. This is what
-                // makes charring localize to the exact surface the fire
-                // actually touched, on a mesh of any size.
-                float localBurn = SampleCharAt(IN.positionWS);
+                // ROBUST MODE: driven entirely by _Burn, the single
+                // per-OBJECT accumulated char value (set by
+                // CharOverlayController from ThermalSampler's MAX reading
+                // over the whole object's SampleBounds). This deliberately
+                // gives up per-pixel spatial accuracy (it can't show "this
+                // face stayed clean while the opposite face charred") in
+                // exchange for being completely independent of the thermal
+                // simulation's voxel grid resolution -- a coarse grid, a
+                // rescaled scene, or a small object no longer produce
+                // blocky/incomplete coverage, because there's no per-pixel
+                // 3D texture lookup left to under-resolve.
+                float localBurn = saturate(_Burn);
 
-                // If this point of the mesh isn't inside the simulated
-                // thermal volume at all (e.g. object partly outside the sim
-                // bounds), fall back to the old uniform _Burn so it doesn't
-                // just silently never char.
-                if (localBurn <= 0.0)
-                    localBurn = _Burn;
-
-                float pattern = CharPattern(IN.positionWS);
+                float pattern = CharPattern(IN.positionOS);
 
                 // Burn sweeps the threshold through the noise -> patches grow
                 float charMask = 1.0 - smoothstep(

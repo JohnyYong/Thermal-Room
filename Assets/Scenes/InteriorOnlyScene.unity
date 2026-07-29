@@ -554,11 +554,11 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 1578370449379930058, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalPosition.x
-      value: 0
+      value: -0.217
       objectReference: {fileID: 0}
     - target: {fileID: 1578370449379930058, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalPosition.y
-      value: 0
+      value: -1.117
       objectReference: {fileID: 0}
     - target: {fileID: 1578370449379930058, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalPosition.z
@@ -1116,6 +1116,10 @@ PrefabInstance:
       propertyPath: m_LocalPosition.z
       value: -154.2
       objectReference: {fileID: 0}
+    - target: {fileID: -8298944676564928818, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
+      propertyPath: m_ConstrainProportionsScale
+      value: 1
+      objectReference: {fileID: 0}
     - target: {fileID: -6689036041284674117, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_Name
       value: WoodenCrate
@@ -1134,15 +1138,15 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 2774220344278030320, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_LocalPosition.x
-      value: 0
+      value: -0.076043
       objectReference: {fileID: 0}
     - target: {fileID: 2774220344278030320, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_LocalPosition.y
-      value: 0
+      value: 0.034
       objectReference: {fileID: 0}
     - target: {fileID: 2774220344278030320, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_LocalPosition.z
-      value: 0
+      value: 0.557
       objectReference: {fileID: 0}
     - target: {fileID: 2774220344278030320, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
       propertyPath: m_LocalRotation.w
@@ -1354,10 +1358,6 @@ MonoBehaviour:
   _charOverlayMat: {fileID: 2100000, guid: 674be610bbce629478a5fc249a53bdab, type: 2}
   _charBoost: 1
   _burn: 0
-  _liveTuneNoise: 0
-  _noiseScale: 1.2
-  _noiseDetail: 3
-  _edgeSoftness: 0.12
 --- !u!4 &1351792178 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: -8679921383154817045, guid: 8b0960a60aeacc949ac0430e127a7623, type: 3}
@@ -1467,11 +1467,11 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: cellSize
-      value: 0.5
+      value: 0.3
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: charRate
-      value: 10
+      value: 0.01
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: firePower
@@ -1595,15 +1595,15 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 2450680036448011354, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.x
-      value: 44.2052
+      value: 27.794903
       objectReference: {fileID: 0}
     - target: {fileID: 2450680036448011354, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.y
-      value: 17.002
+      value: 10.690348
       objectReference: {fileID: 0}
     - target: {fileID: 2450680036448011354, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.z
-      value: 34.004
+      value: 21.380695
       objectReference: {fileID: 0}
     - target: {fileID: 4634991026615086758, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalPosition.x
@@ -1627,15 +1627,15 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 7323585529557386240, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.x
-      value: 44.2052
+      value: 27.794903
       objectReference: {fileID: 0}
     - target: {fileID: 7323585529557386240, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.y
-      value: 17.002
+      value: 10.690348
       objectReference: {fileID: 0}
     - target: {fileID: 7323585529557386240, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.z
-      value: 34.004005
+      value: 21.3807
       objectReference: {fileID: 0}
     - target: {fileID: 7323585529557386240, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalPosition.x
@@ -1655,27 +1655,27 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 7357905605052054674, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.x
-      value: 44.2052
+      value: 27.794903
       objectReference: {fileID: 0}
     - target: {fileID: 7357905605052054674, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.y
-      value: 17.002
+      value: 10.690348
       objectReference: {fileID: 0}
     - target: {fileID: 7357905605052054674, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.z
-      value: 34.004
+      value: 21.380695
       objectReference: {fileID: 0}
     - target: {fileID: 8611435791031750250, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.x
-      value: 44.2052
+      value: 27.794903
       objectReference: {fileID: 0}
     - target: {fileID: 8611435791031750250, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.y
-      value: 17.002
+      value: 10.690348
       objectReference: {fileID: 0}
     - target: {fileID: 8611435791031750250, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.z
-      value: 34.004
+      value: 21.380695
       objectReference: {fileID: 0}
     - target: {fileID: 9104327960978393458, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_IsActive
@@ -1780,10 +1780,6 @@ MonoBehaviour:
   _charOverlayMat: {fileID: 2100000, guid: 674be610bbce629478a5fc249a53bdab, type: 2}
   _charBoost: 5
   _burn: 0
-  _liveTuneNoise: 0
-  _noiseScale: 1.2
-  _noiseDetail: 3
-  _edgeSoftness: 0.12
 --- !u!114 &1527504063
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1799,7 +1795,7 @@ MonoBehaviour:
   materialType: 1
   includeChildren: 1
   combustible: 1
-  igniteInstant: 0
+  igniteInstant: 1
   fuelAmount: 100
 --- !u!1 &1749963063
 GameObject:
