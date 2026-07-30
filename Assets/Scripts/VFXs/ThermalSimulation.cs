@@ -196,8 +196,10 @@ public class ThermalSimulation : MonoBehaviour
     // Cached once in Start so we don't call FindObjectsOfType twice.
     ThermalMaterial[] _thermalObjects;
 
-
-
+    public float CellSizePublic => cellSize;
+    public Vector3 SimBoundsMin => GetSimulationBounds().min;
+    public RenderTexture GetBurningVolume() => burningA;
+    public RenderTexture GetObstacleVolume() => obstacleVolume;
 
     public bool IsInitialized { get; private set; }
 
@@ -1154,8 +1156,8 @@ void CalculateGridSize()
                         else
                         {
                             Vector3 closest = collider.ClosestPoint(voxelPos);
-                            inside = Vector3.SqrMagnitude(closest - voxelPos) <
-                                     0.000001f;
+                            float dist = Vector3.Distance(closest, voxelPos);
+                            inside = dist < cellSize * 0.5f;   // within half a voxel counts as solid
                         }
 
                         if (!inside) continue;
