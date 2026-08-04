@@ -162,6 +162,7 @@ Shader "Custom/CharOverlay"
                 float3 normalWS   : TEXCOORD1;
                 float3 positionOS : TEXCOORD2;
                 UNITY_VERTEX_INPUT_INSTANCE_ID
+                UNITY_VERTEX_OUTPUT_STEREO
             };
 
             Varyings vert(Attributes IN)
@@ -169,6 +170,7 @@ Shader "Custom/CharOverlay"
                 Varyings OUT = (Varyings)0;
                 UNITY_SETUP_INSTANCE_ID(IN);
                 UNITY_TRANSFER_INSTANCE_ID(IN, OUT);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(OUT);
 
                 VertexPositionInputs pos = GetVertexPositionInputs(IN.positionOS.xyz);
                 OUT.positionCS = pos.positionCS;
@@ -180,6 +182,7 @@ Shader "Custom/CharOverlay"
 
             half4 frag(Varyings IN) : SV_Target
             {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(IN);
 
                 float localBurn = saturate(_Burn);
 

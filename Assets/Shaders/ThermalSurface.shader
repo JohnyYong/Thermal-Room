@@ -26,18 +26,39 @@ Shader "Custom/ThermalSurface"
 
         Blend SrcAlpha OneMinusSrcAlpha
         ZWrite Off
+        Offset -1, -50
 
         Pass
         {
-            CGPROGRAM
+            Name "ForwardThermal"
+
+            Tags
+            {
+                "LightMode" = "UniversalForward"
+            }
+
+            HLSLPROGRAM
 
             #pragma vertex vert
             #pragma fragment frag
+            #pragma multi_compile_instancing
 
-            #include "UnityCG.cginc"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
-            sampler3D _SolidTemperatureTex;
-            sampler3D _ObstacleTex;
+            // Modern URP 3D texture binding -- the legacy `sampler3D` +
+            // `tex3D()` Cg compatibility macros this used to use are not
+            // reliably supported for script-assigned RenderTextures across
+            // every graphics backend (already known to silently fail under
+            // DX12, see FireHeatVolume.shader; Vulkan/XR is the same class
+            // of problem). TEXTURE3D/SAMPLER/SAMPLE_TEXTURE3D is the
+            // correct SRP-safe way to bind and sample a Texture3D/3D
+            // RenderTexture and matches what this file's own DepthNormals
+            // pass already does correctly below.
+            TEXTURE3D(_SolidTemperatureTex);
+            SAMPLER(sampler_SolidTemperatureTex);
+
+            TEXTURE3D(_ObstacleTex);
+            SAMPLER(sampler_ObstacleTex);
 
             float3 _ThermalVolumeMin;
             float3 _ThermalVolumeSize;
@@ -51,26 +72,38 @@ Shader "Custom/ThermalSurface"
             struct appdata
             {
                 float4 vertex : POSITION;
+                float3 normal : NORMAL;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
             struct v2f
             {
                 float4 pos : SV_POSITION;
                 float3 worldPos : TEXCOORD0;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+                UNITY_VERTEX_OUTPUT_STEREO
             };
 
             v2f vert(appdata v)
             {
                 v2f o;
+                UNITY_SETUP_INSTANCE_ID(v);
+                UNITY_TRANSFER_INSTANCE_ID(v, o);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
 
-                o.pos =
-                    UnityObjectToClipPos(
-                        v.vertex);
+                // Genuine geometric nudge toward the camera along the
+                // surface normal, on top of the ShaderLab Offset above.
+                // Unlike Offset (a depth-buffer bias whose effectiveness
+                // depends on the platform's depth precision), this actually
+                // moves the vertex in world space -- so it can't flicker
+                // due to a mobile GPU's lower-precision depth buffer no
+                // longer resolving a -1 unit bias reliably.
+                float3 worldPos = TransformObjectToWorld(v.vertex.xyz);
+                float3 worldNormal = TransformObjectToWorldNormal(v.normal);
+                worldPos += worldNormal * 0.003;
 
-                o.worldPos =
-                    mul(
-                        unity_ObjectToWorld,
-                        v.vertex).xyz;
+                o.pos = TransformWorldToHClip(worldPos);
+                o.worldPos = worldPos;
 
                 return o;
             }
@@ -168,15 +201,17 @@ Shader "Custom/ThermalSurface"
                                     sampleUV);
 
                             float obstacle =
-                                tex3D(
+                                SAMPLE_TEXTURE3D(
                                     _ObstacleTex,
+                                    sampler_ObstacleTex,
                                     sampleUV).r;
 
                             if (obstacle > 0.5)
                             {
                                 temp +=
-                                    tex3D(
+                                    SAMPLE_TEXTURE3D(
                                         _SolidTemperatureTex,
+                                        sampler_SolidTemperatureTex,
                                         sampleUV).r
                                     * w;
 
@@ -188,18 +223,21 @@ Shader "Custom/ThermalSurface"
 
                 if (weight < 0.0001)
                 {
-                    return tex3D(
+                    return SAMPLE_TEXTURE3D(
                         _SolidTemperatureTex,
+                        sampler_SolidTemperatureTex,
                         uvw).r;
                 }
 
                 return temp / weight;
             }
 
-            fixed4 frag(
+            float4 frag(
                 v2f i)
                 : SV_Target
             {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
+
                 float3 uvw =
                     (i.worldPos -
                      _ThermalVolumeMin) /
@@ -246,7 +284,7 @@ Shader "Custom/ThermalSurface"
                     alpha);
             }
 
-            ENDCG
+            ENDHLSL
         }
 
         Pass
@@ -265,6 +303,7 @@ Shader "Custom/ThermalSurface"
 
             #pragma vertex vertDepth
             #pragma fragment fragDepth
+            #pragma multi_compile_instancing
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
@@ -272,17 +311,23 @@ Shader "Custom/ThermalSurface"
             {
                 float4 positionOS : POSITION;
                 float3 normalOS : NORMAL;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
             struct Varyings
             {
                 float4 positionHCS : SV_POSITION;
                 float3 normalWS : TEXCOORD0;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+                UNITY_VERTEX_OUTPUT_STEREO
             };
 
             Varyings vertDepth(Attributes input)
             {
                 Varyings output;
+                UNITY_SETUP_INSTANCE_ID(input);
+                UNITY_TRANSFER_INSTANCE_ID(input, output);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);
 
                 VertexPositionInputs pos =
                     GetVertexPositionInputs(
@@ -301,6 +346,8 @@ Shader "Custom/ThermalSurface"
             float4 fragDepth(Varyings input)
                 : SV_Target
             {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+
                 float3 normal =
                     normalize(input.normalWS);
 
