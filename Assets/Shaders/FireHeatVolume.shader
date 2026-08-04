@@ -6,7 +6,7 @@ Shader "Custom/FireHeatVolume" {
     SubShader {
         Tags { "RenderPipeline" =
                    "UniversalPipeline" "Queue" =
-                       "Transparent" "RenderType" = "Transparent" }
+                       "Transparent+1" "RenderType" = "Transparent" }
 
         Blend SrcAlpha OneMinusSrcAlpha Cull Front ZWrite Off ZTest Always
 
@@ -34,11 +34,6 @@ Shader "Custom/FireHeatVolume" {
                 float3 boxMin,
                 float3 boxMax)
             {
-                // Guard against zero (or near-zero) direction components.
-                // 1.0/0 = Inf, and (0)*Inf = NaN, which poisons the whole
-                // ray -> ThermalPalette(NaN) -> solid black. The Editor's
-                // shader compiler tolerated this; the DX12 build does not.
-                // Clamp each component away from 0 while preserving its sign.
                 float3 safeDir;
                 safeDir.x = (rayDir.x >= 0.0)
                     ? max(rayDir.x, 1e-6) : min(rayDir.x, -1e-6);

@@ -33,7 +33,22 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
     [SerializeField] private float _radiationRange = 10f;
     [SerializeField] private float _radiationPower = 60f;
 
+    [Header("Debug: fuel depletion")]
+    [Tooltip("Periodically read back fuel over this object's own ignited " +
+             "voxel range and log once it hits zero -- pinpoints exactly " +
+             "when/why this object's fire dies out.")]
+    [SerializeField] private bool _logFuelDepletion = true;
+    [SerializeField] private float _fuelCheckInterval = 0.5f;
+
     private bool _registeredAsFireSource;
+
+    private Collider _collider;
+    private bool _hasIgnitedVoxelRange;
+    private Vector3Int _fuelVoxelMin, _fuelVoxelMax;
+    private bool _everSeenFuel;
+    private bool _loggedDepletion;
+    private float _fuelCheckTimer;
+    private bool _fuelReadbackPending;
 
     public Vector3 WorldPosition => transform.position;
     public float HeatRadius => _heatRadius;
@@ -45,6 +60,7 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
     {
         Collider col = GetComponent<Collider>();
         ThermalMaterial mat = GetComponent<ThermalMaterial>();
+        _collider = col;
 
         while (ThermalSimulation.Instance == null ||
                !ThermalSimulation.Instance.IsInitialized)
@@ -60,6 +76,8 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
         {
             Debug.Log("RunTimeFire: " + col.bounds.center);
             ThermalSimulation.Instance.RegisterRuntimeBurningObject(col, mat);
+
+            CacheFuelVoxelRange(col);
         }
 
         TryRegisterFireSource();
@@ -74,6 +92,9 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
         // until registration succeeds, same reasoning as the Start()
         // coroutine above but for re-enables after the initial Start().
         if (!_registeredAsFireSource) TryRegisterFireSource();
+
+        if (_logFuelDepletion && _hasIgnitedVoxelRange && !_loggedDepletion)
+            UpdateFuelWatch();
     }
 
     private void TryRegisterFireSource()
@@ -93,5 +114,85 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
         if (ThermalSimulation.Instance != null)
             ThermalSimulation.Instance.UnregisterFireSource(this);
         _registeredAsFireSource = false;
+    }
+
+    // ------------------------------------------------------------------
+    // Fuel depletion watcher (debug only)
+    // ------------------------------------------------------------------
+
+    private void CacheFuelVoxelRange(Collider col)
+    {
+        ThermalSimulation sim = ThermalSimulation.Instance;
+
+        Vector3 vA = sim.WorldToVoxel(col.bounds.min);
+        Vector3 vB = sim.WorldToVoxel(col.bounds.max);
+
+        int gx = sim.GridXPublic;
+        int gy = sim.GridYPublic;
+        int gz = sim.GridZPublic;
+
+        _fuelVoxelMin = new Vector3Int(
+            Mathf.Clamp(Mathf.FloorToInt(Mathf.Min(vA.x, vB.x)), 0, gx - 1),
+            Mathf.Clamp(Mathf.FloorToInt(Mathf.Min(vA.y, vB.y)), 0, gy - 1),
+            Mathf.Clamp(Mathf.FloorToInt(Mathf.Min(vA.z, vB.z)), 0, gz - 1));
+
+        _fuelVoxelMax = new Vector3Int(
+            Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(vA.x, vB.x)), 0, gx - 1),
+            Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(vA.y, vB.y)), 0, gy - 1),
+            Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(vA.z, vB.z)), 0, gz - 1));
+
+        _hasIgnitedVoxelRange = true;
+    }
+
+    private void UpdateFuelWatch()
+    {
+        _fuelCheckTimer += Time.deltaTime;
+        if (_fuelCheckTimer < _fuelCheckInterval || _fuelReadbackPending) return;
+        _fuelCheckTimer = 0f;
+
+        ThermalSimulation sim = ThermalSimulation.Instance;
+        if (sim == null) return;
+
+        RenderTexture fuelRT = sim.GetFuelVolume();
+        if (fuelRT == null) return;
+
+        _fuelReadbackPending = true;
+        float requestTime = Time.time;
+
+        sim.RequestVolumeReadback(fuelRT, data =>
+        {
+            _fuelReadbackPending = false;
+            if (_loggedDepletion) return; // already logged from a previous request
+
+            int gx = sim.GridXPublic;
+            int gy = sim.GridYPublic;
+
+            float maxFuel = 0f;
+
+            for (int z = _fuelVoxelMin.z; z <= _fuelVoxelMax.z; z++)
+                for (int y = _fuelVoxelMin.y; y <= _fuelVoxelMax.y; y++)
+                    for (int x = _fuelVoxelMin.x; x <= _fuelVoxelMax.x; x++)
+                    {
+                        int idx = x + gx * (y + gy * z);
+                        if (idx < 0 || idx >= data.Length) continue;
+                        if (data[idx] > maxFuel) maxFuel = data[idx];
+                    }
+
+            if (maxFuel > 0.001f)
+            {
+                _everSeenFuel = true;
+                return;
+            }
+
+            // Only log the transition from "had fuel" to "out of fuel" --
+            // not the very first frame, in case ignition itself takes a
+            // beat to write RuntimeFuel into the voxels.
+            if (_everSeenFuel)
+            {
+                _loggedDepletion = true;
+                Debug.Log($"[RuntimeFire] '{name}' fuel depleted (snap to burning=0) " +
+                          $"at t={requestTime:F2}s (detected at t={Time.time:F2}s).");
+            }
+        });
     }
 }

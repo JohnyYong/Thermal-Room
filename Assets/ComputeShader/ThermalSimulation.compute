@@ -111,6 +111,11 @@ float BurningRadiationPower;
 float BurnRate;
 float BurnHeat;
 
+// When true, fuel is never consumed by combustion, so burning never snaps
+// to 0 from running out -- fire continues indefinitely instead of dying
+// once its fuel depletes.
+int InfiniteFuel;
+
 float FlameAirHeat;
 
 float VorticityStrength;
@@ -1060,7 +1065,10 @@ void CombustionStep(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    fuel -= BurnRate * burning * DeltaTime;
+    if (!InfiniteFuel)
+    {
+        fuel -= BurnRate * burning * DeltaTime;
+    }
 
     if (burning > 0.05)
     {
@@ -1111,7 +1119,7 @@ void CombustionStep(uint3 id : SV_DispatchThreadID)
 
     fuel = max(fuel, 0);
 
-    if (fuel <= 0)
+    if (fuel <= 0 && !InfiniteFuel)
     {
         burning = 0;
     }
@@ -1260,12 +1268,14 @@ void AdvectSmokeStep(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    if (id.x == 0 || id.x == GridX - 1 || id.y == 0 || id.y == GridY - 1 ||
-        id.z == 0 || id.z == GridZ - 1)
-    {
-        SmokeOut[id] = SmokeIn[id];
-        return;
-    }
+    // NOTE: previously held SmokeOut = SmokeIn (froze smoke) for every
+    // outer face of the simulation grid (id == 0 or id == GridDim - 1 on
+    // any axis). That shell coincides with the room's walls/ceiling
+    // (GetSimulationBounds() == the ThermalVolume transform, sized to the
+    // room), so smoke could never reach the true boundary and permanently
+    // sat at whatever value it started with there. SampleSmoke() already
+    // clamps its sample position to [0, GridDim - 2], so removing this is
+    // safe -- there's no out-of-range read to guard against.
 
     float4 velocity = VelocityIn[id];
 
@@ -1397,13 +1407,13 @@ void FlameGenerationStep(int3 id : SV_DispatchThreadID)
     if (id.x >= GridX || id.y >= GridY || id.z >= GridZ)
         return;
 
-    if (id.x == 0 || id.x == GridX - 1 ||
-        id.y == 0 || id.y == GridY - 1 ||
-        id.z == 0 || id.z == GridZ - 1)
-    {
-        FlameOut[id] = 0;
-        return;
-    }
+    // NOTE: previously zeroed FlameOut for every outer face of the
+    // simulation grid (id == 0 or id == GridDim - 1 on any axis). That
+    // shell coincides with the room's walls/ceiling (GetSimulationBounds()
+    // == the ThermalVolume transform, sized to the room), so flame could
+    // never build up there even as the fire spread toward it -- this is
+    // what made FireHeatVolume (heat = temp + smoke*80 + flame*200) fade
+    // out specifically as the fire's edge approached a wall/ceiling.
 
     float flame = FlameIn[id];
 

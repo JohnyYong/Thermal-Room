@@ -201,7 +201,11 @@ public class ThermalSimulation : MonoBehaviour
     public RenderTexture GetBurningVolume() => burningA;
     public RenderTexture GetObstacleVolume() => obstacleVolume;
 
+    public RenderTexture GetFireHeatVolume() => flameHeatA;
+    public RenderTexture GetFuelVolume() => fuelA;
     public bool IsInitialized { get; private set; }
+
+     public bool infiniteFuel = false;
 
     // DEBUG//
     public bool igniteEverything;
@@ -770,6 +774,9 @@ void CalculateGridSize()
         simulation.SetFloat("BurnRate", burnRate);
 
         simulation.SetFloat("BurnHeat", burnHeat);
+
+
+        simulation.SetInt("InfiniteFuel", infiniteFuel ? 1 : 0);
 
         simulation.SetTexture(combustionKernel, "SolidTemperatureIn",
                               solidTemperatureA);
