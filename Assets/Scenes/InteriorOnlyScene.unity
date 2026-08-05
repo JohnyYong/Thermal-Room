@@ -895,15 +895,15 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8750811429352361384, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Size.x
-      value: 1.6975048
+      value: 2.1
       objectReference: {fileID: 0}
     - target: {fileID: 8750811429352361384, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Size.y
-      value: 1.6294588
+      value: 2.1
       objectReference: {fileID: 0}
     - target: {fileID: 8750811429352361384, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Size.z
-      value: 1.5
+      value: 2.1
       objectReference: {fileID: 0}
     - target: {fileID: 8750811429352361384, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Center.x
@@ -1041,7 +1041,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 3553784685162901195, guid: 9c5bea08b951b10499ee7beee0a3c9bd, type: 3}
       propertyPath: m_CullingMask.m_Bits
-      value: 585
+      value: 584
       objectReference: {fileID: 0}
     - target: {fileID: 5523509911670780574, guid: 9c5bea08b951b10499ee7beee0a3c9bd, type: 3}
       propertyPath: m_LocalScale.x

@@ -1,6 +1,7 @@
 using ScenarioEditor;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Unity.Collections;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -446,6 +447,10 @@ void CalculateGridSize()
     {
         // Char globals bound before the gate so char stays visible in normal
         // view even while the sim is paused.
+
+        Debug.Log($"[ThermalSimulation] Created {thermalSurfaceRenderers.Length} thermal clones. " +
+           $"Total '_Thermal' objects in scene: {GameObject.FindObjectsByType<Renderer>(FindObjectsSortMode.None).Count(r => r.name.EndsWith("_Thermal"))}");
+
         Bounds bounds = GetSimulationBounds();
 
         Shader.SetGlobalTexture("_CharTex", charVolume);
@@ -978,7 +983,7 @@ void CalculateGridSize()
 
         Shader.SetGlobalTexture("_ObstacleTex", obstacleVolume);
 
-
+            
         volumeMaterial.SetTexture("_TemperatureTex", temperatureA);
 
         simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
