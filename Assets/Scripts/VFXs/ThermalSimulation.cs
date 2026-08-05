@@ -1,6 +1,7 @@
 using ScenarioEditor;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Unity.Collections;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -196,10 +197,16 @@ public class ThermalSimulation : MonoBehaviour
     // Cached once in Start so we don't call FindObjectsOfType twice.
     ThermalMaterial[] _thermalObjects;
 
+    public float CellSizePublic => cellSize;
+    public Vector3 SimBoundsMin => GetSimulationBounds().min;
+    public RenderTexture GetBurningVolume() => burningA;
+    public RenderTexture GetObstacleVolume() => obstacleVolume;
 
-
-
+    public RenderTexture GetFireHeatVolume() => flameHeatA;
+    public RenderTexture GetFuelVolume() => fuelA;
     public bool IsInitialized { get; private set; }
+
+     public bool infiniteFuel = false;
 
     // DEBUG//
     public bool igniteEverything;
@@ -440,6 +447,10 @@ void CalculateGridSize()
     {
         // Char globals bound before the gate so char stays visible in normal
         // view even while the sim is paused.
+
+        Debug.Log($"[ThermalSimulation] Created {thermalSurfaceRenderers.Length} thermal clones. " +
+           $"Total '_Thermal' objects in scene: {GameObject.FindObjectsByType<Renderer>(FindObjectsSortMode.None).Count(r => r.name.EndsWith("_Thermal"))}");
+
         Bounds bounds = GetSimulationBounds();
 
         Shader.SetGlobalTexture("_CharTex", charVolume);
@@ -769,6 +780,9 @@ void CalculateGridSize()
 
         simulation.SetFloat("BurnHeat", burnHeat);
 
+
+        simulation.SetInt("InfiniteFuel", infiniteFuel ? 1 : 0);
+
         simulation.SetTexture(combustionKernel, "SolidTemperatureIn",
                               solidTemperatureA);
 
@@ -969,7 +983,7 @@ void CalculateGridSize()
 
         Shader.SetGlobalTexture("_ObstacleTex", obstacleVolume);
 
-
+            
         volumeMaterial.SetTexture("_TemperatureTex", temperatureA);
 
         simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
@@ -1154,8 +1168,8 @@ void CalculateGridSize()
                         else
                         {
                             Vector3 closest = collider.ClosestPoint(voxelPos);
-                            inside = Vector3.SqrMagnitude(closest - voxelPos) <
-                                     0.000001f;
+                            float dist = Vector3.Distance(closest, voxelPos);
+                            inside = dist < cellSize * 0.5f;   // within half a voxel counts as solid
                         }
 
                         if (!inside) continue;

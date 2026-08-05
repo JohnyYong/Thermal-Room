@@ -162,6 +162,7 @@ Shader "Custom/CharOverlay"
                 float3 normalWS   : TEXCOORD1;
                 float3 positionOS : TEXCOORD2;
                 UNITY_VERTEX_INPUT_INSTANCE_ID
+                UNITY_VERTEX_OUTPUT_STEREO
             };
 
             Varyings vert(Attributes IN)
@@ -169,6 +170,7 @@ Shader "Custom/CharOverlay"
                 Varyings OUT = (Varyings)0;
                 UNITY_SETUP_INSTANCE_ID(IN);
                 UNITY_TRANSFER_INSTANCE_ID(IN, OUT);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(OUT);
 
                 VertexPositionInputs pos = GetVertexPositionInputs(IN.positionOS.xyz);
                 OUT.positionCS = pos.positionCS;
@@ -180,29 +182,17 @@ Shader "Custom/CharOverlay"
 
             half4 frag(Varyings IN) : SV_Target
             {
-                // ROBUST MODE: driven entirely by _Burn, the single
-                // per-OBJECT accumulated char value (set by
-                // CharOverlayController from ThermalSampler's MAX reading
-                // over the whole object's SampleBounds). This deliberately
-                // gives up per-pixel spatial accuracy (it can't show "this
-                // face stayed clean while the opposite face charred") in
-                // exchange for being completely independent of the thermal
-                // simulation's voxel grid resolution -- a coarse grid, a
-                // rescaled scene, or a small object no longer produce
-                // blocky/incomplete coverage, because there's no per-pixel
-                // 3D texture lookup left to under-resolve.
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(IN);
+
                 float localBurn = saturate(_Burn);
 
                 float pattern = CharPattern(IN.positionOS);
 
-                // Burn sweeps the threshold through the noise -> patches grow
                 float charMask = 1.0 - smoothstep(
                     localBurn - _EdgeSoftness,
                     localBurn + _EdgeSoftness,
                     pattern);
 
-                // Alpha IS the char mask -- clean areas are fully transparent,
-                // so the original material shows through untouched.
                 float alpha = charMask * _MaxCharAlpha;
 
                 return half4(_CharColor.rgb, alpha);
