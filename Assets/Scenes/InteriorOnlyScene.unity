@@ -750,6 +750,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: cded085d155cde949b60f67a11dbc3bd, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Unity.RenderPipelines.Core.Runtime::UnityEngine.Rendering.ProbeVolume
+  version: 2
+  globalVolume: 0
   mode: 1
   size: {x: 46.073723, y: 36.161556, z: 93.51872}
   overrideRendererFilters: 0
@@ -780,8 +782,6 @@ MonoBehaviour:
     e33: 1
   cachedHashCode: -1636887846
   fillEmptySpaces: 0
-  version: 2
-  globalVolume: 0
 --- !u!4 &890666624
 Transform:
   m_ObjectHideFlags: 0
@@ -1123,7 +1123,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: charRate
-      value: 0.005
+      value: 0.0005
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: firePower
