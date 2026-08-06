@@ -1615,7 +1615,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 1033311274402943813, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_Enabled
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 1033311274402943813, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_TurnAmount
@@ -1624,6 +1624,10 @@ PrefabInstance:
     - target: {fileID: 1953067873861365444, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_Name
       value: XR Stuff
+      objectReference: {fileID: 0}
+    - target: {fileID: 3629507752098839897, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
       objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
