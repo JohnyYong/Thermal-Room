@@ -701,7 +701,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Unity.RenderPipelines.Core.Runtime::UnityEngine.Rendering.ProbeVolumePerSceneData
   serializedBakingSet: {fileID: 11400000, guid: 4e23f7fc6c6a9814e80754e5d8d0a45c, type: 2}
-  sceneGUID: e4c54d43c097c3349a7c1ea55cb7ef45
+  sceneGUID: e093b8f24e8f0184f803c83da31dfc56
   obsoleteAsset: {fileID: 0}
   obsoleteCellSharedDataAsset: {fileID: 0}
   obsoleteCellSupportDataAsset: {fileID: 0}
@@ -1119,7 +1119,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: cellSize
-      value: 0.7
+      value: 0.3
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: charRate
@@ -1431,7 +1431,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: dadfc8845bc706240a15205f8a5985c8, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::ThermalVoxelVisualizer
-  _field: 2
+  _field: 0
   _threshold: 0.01
   _tempNormalize: 400
   _stride: 1
