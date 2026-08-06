@@ -6,7 +6,7 @@ Shader "Custom/FireHeatVolume" {
     SubShader {
         Tags { "RenderPipeline" =
                    "UniversalPipeline" "Queue" =
-                       "Transparent" "RenderType" = "Transparent" }
+                       "Transparent+1" "RenderType" = "Transparent" }
 
         Blend SrcAlpha OneMinusSrcAlpha Cull Front ZWrite Off ZTest Always
 
