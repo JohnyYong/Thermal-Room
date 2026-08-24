@@ -1,6 +1,11 @@
 Shader "Custom/SmokeVolume" {
-    Properties { _SmokeTex("Smoke", 3D) = "" {} _Density("Density", Float) =
-                     1 _FireGlow("Fire Glow", Float) = 0.4 }
+    Properties {
+        _SmokeTex("Smoke", 3D) = "" {}
+        _Density("Density", Float) = 1
+        _FireGlow("Fire Glow", Float) = 0.15
+        _SmokeColorLow("Smoke Color (Thin)", Color) = (0.12, 0.12, 0.12, 1)
+        _SmokeColorHigh("Smoke Color (Thick)", Color) = (0.35, 0.35, 0.35, 1)
+    }
 
     SubShader {
         Tags { "RenderPipeline" =
@@ -29,6 +34,9 @@ Shader "Custom/SmokeVolume" {
             float _Density;
 
             float _FireGlow;
+
+            float4 _SmokeColorLow;
+            float4 _SmokeColorHigh;
 
             float2 RayBoxIntersection(
                 float3 rayOrigin,
@@ -185,18 +193,21 @@ Shader "Custom/SmokeVolume" {
 
                     float density = saturate(smoke);
 
-                    float3 smokeColor = lerp(float3(0.00, 0.00, 0.00),
-                                             float3(0.01, 0.01, 0.01), density);
+                    // Dark greyish smoke -- actually visible, not near-black.
+                    float3 smokeColor =
+                        lerp(_SmokeColorLow.rgb, _SmokeColorHigh.rgb, density);
 
+                    // Only real flame lights the smoke up (backlit look).
+                    // Ambient warm air no longer makes smoke glow white --
                     float heatGlow = saturate(temp / 1162.34);
 
-                    float glow = heatGlow * density * _FireGlow;
+                    float glow = flame * density * _FireGlow;
 
                     float3 glowColor = BlackbodyPalette(heatGlow) * glow;
 
                     float3 color = smokeColor + glowColor;
 
-                    float alpha = pow(density, 0.7) * 0.15 * _Density;
+                    float alpha = pow(density, 0.6) * 0.35 * _Density;
 
                     accumColor += color * alpha * (1 - accumAlpha);
 

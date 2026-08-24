@@ -64,6 +64,12 @@ RWTexture3D<float> FlameOut;
 
 RWTexture3D<float> FlameHeatOut;
 
+Texture3D<float> OpeningVolume;
+float OpeningVentRate;
+float SmokeBuoyancyStrength;
+float SmokeBuoyancyCutoff;
+float SmokeSettleStrength;
+
 float BuoyancyStrength;
 
 int GridX;
@@ -377,6 +383,14 @@ void HeatStep(uint3 id : SV_DispatchThreadID)
 
     temp += (AmbientTemp - temp) * CoolingRate * DeltaTime;
 
+    // Openings vent to open air: pull temperature toward ambient much
+    // faster than the room's normal cooling, standing in for the
+    // (unsimulated) infinite outside atmosphere.
+    if (OpeningVolume[id] > 0.5)
+    {
+        temp += (AmbientTemp - temp) * saturate(OpeningVentRate * DeltaTime);
+    }
+
     TemperatureOut[id] = temp;
 }
 
@@ -393,12 +407,31 @@ void BuoyancyStep(uint3 id : SV_DispatchThreadID)
     }
 
     float temp = TemperatureIn[id];
+    float smoke = SmokeIn[id];
 
     float4 velocity = VelocityIn[id];
 
-    float buoyancy = max(temp - AmbientTemp, 0);
+    float thermalBuoyancy = max(temp - AmbientTemp, 0);
 
-    velocity.y += buoyancy * BuoyancyStrength * DeltaTime;
+    // Smoke only keeps its own lift while the gas carrying it is still
+    // meaningfully hotter than ambient (0 = fully cooled, 1 = as hot as
+    // SmokeBuoyancyCutoff or more). Real smoke rises because it's hot --
+    // once it cools back toward ambient it should stop climbing and settle
+    // into the accumulating layer instead of spreading into an infinitely
+    // thin sheet under the ceiling forever.
+    float smokeWarmth = saturate(thermalBuoyancy / max(SmokeBuoyancyCutoff, 0.0001));
+
+    float smokeLift = smoke * SmokeBuoyancyStrength * smokeWarmth;
+
+    // Cooled, dense smoke is heavier soot/particulate -- give it a gentle
+    // sink once it's lost its warmth. This is what makes the settled layer
+    // actually thicken and creep downward over time: fresh hot smoke keeps
+    // rising from below and displacing the older, cooled smoke that's now
+    // sinking instead of endlessly climbing.
+    float smokeSettle = smoke * (1.0 - smokeWarmth) * SmokeSettleStrength;
+
+    velocity.y += (thermalBuoyancy * BuoyancyStrength +
+                   smokeLift - smokeSettle) * DeltaTime;
 
     // TURBULENCE IS 0 NOW
     //  Turbulence from temperature gradients
@@ -584,6 +617,16 @@ void SolvePressure(uint3 id : SV_DispatchThreadID)
         return;
     }
 
+    // Openings are vents to the outside atmosphere: pin pressure to 0
+    // (ambient) instead of solving it. Everything else in the room solves
+    // relative to this, so hot expanding gas naturally builds a pressure
+    // gradient that pushes flow toward the nearest opening.
+    if (OpeningVolume[id] > 0.5)
+    {
+        PressureOut[id] = 0;
+        return;
+    }
+
     float pCenter = PressureIn[id];
 
     float pL = Obstacle[int3(id.x - 1, id.y, id.z)] > 0.5
@@ -656,14 +699,18 @@ void ProjectVelocity(uint3 id : SV_DispatchThreadID)
 
     float4 velocity = VelocityIn[id];
 
-    bool leftWall = id.x <= 1;
-    bool rightWall = id.x >= GridX - 2;
+    // An opening right at the grid boundary (e.g. a perimeter window)
+    // should actually vent instead of being clamped like a sealed wall.
+    bool isOpening = OpeningVolume[id] > 0.5;
 
-    bool bottomWall = id.y <= 1;
-    bool topWall = id.y >= GridY - 2;
+    bool leftWall = id.x <= 1 && !isOpening;
+    bool rightWall = id.x >= GridX - 2 && !isOpening;
 
-    bool backWall = id.z <= 1;
-    bool frontWall = id.z >= GridZ - 2;
+    bool bottomWall = id.y <= 1 && !isOpening;
+    bool topWall = id.y >= GridY - 2 && !isOpening;
+
+    bool backWall = id.z <= 1 && !isOpening;
+    bool frontWall = id.z >= GridZ - 2 && !isOpening;
 
     if (leftWall)
         velocity.x = max(velocity.x, 0);
@@ -1171,7 +1218,12 @@ void SmokeGenerationStep(uint3 id : SV_DispatchThreadID)
         smoke += SmokeGenerationRate * DeltaTime;
     }
 
-    SmokeOut[id] = smoke;
+    if (OpeningVolume[id] > 0.5)
+    {
+        smoke *= saturate(1.0 - OpeningVentRate * DeltaTime);
+    }
+
+    SmokeOut[id] = saturate(smoke);
 }
 
 float SampleSmoke(float3 pos)
@@ -1296,7 +1348,12 @@ void AdvectSmokeStep(uint3 id : SV_DispatchThreadID)
 
     smoke *= (1.0 - SmokeDecayRate * DeltaTime);
 
-    SmokeOut[id] = max(0, smoke);
+    if (OpeningVolume[id] > 0.5)
+    {
+        smoke *= saturate(1.0 - OpeningVentRate * DeltaTime);
+    }
+
+    SmokeOut[id] = saturate(smoke);
 }
 
 [numthreads(8, 8, 8)]

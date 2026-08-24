@@ -10,6 +10,7 @@ using UnityEngine.SceneManagement;
 
 public class ThermalSimulation : MonoBehaviour
 {
+    #region Parameters and Variables
     private static ThermalSimulation _instance;
     public static ThermalSimulation Instance
     {
@@ -36,21 +37,12 @@ public class ThermalSimulation : MonoBehaviour
 
     public Transform fireSource;
 
-    // Runtime-spawned, moving heat sources (fireballs, torches, etc).
-    // Unlike `fireSource` above (one fixed Inspector-assigned Transform) or
-    // RegisterRuntimeBurningObject (ignites a fixed set of voxels once, at
-    // whatever position the object was at that instant), any number of
-    // these can be added/removed freely while playing, and each reports
-    // its LIVE position every FixedUpdate -- so heat genuinely follows a
-    // moving source instead of staying behind at its spawn point.
     const int MaxFireSources = 32;
     readonly List<IMobileFireSource> _fireSources = new();
     ComputeBuffer fireSourceBuffer;
     FireSourceGPU[] _fireSourceCPUBuffer;
     bool _loggedFireSourceOverflow;
 
-    // Must match FireSourceData in ThermalSimulation.compute field-for-field
-    // (same order, no gaps) -- StructuredBuffer layout is purely positional.
     struct FireSourceGPU
     {
         public Vector3 position;
@@ -108,10 +100,6 @@ public class ThermalSimulation : MonoBehaviour
 
     RenderTexture charVolume;
 
-    // AsyncGPUReadback.Request() does not reliably read the full depth of a
-    // Tex3D RenderTexture on all backends -- it can silently return only the
-    // z=0 slice. To read volumes back correctly we copy them into a linear
-    // ComputeBuffer first (buffers don't have this problem) and read that.
     int copyVolumeKernel;
     ComputeBuffer volumeReadBuffer;
 
@@ -147,9 +135,14 @@ public class ThermalSimulation : MonoBehaviour
 
     ComputeBuffer runtimeVoxelBuffer;
 
+
     public float firePower = 0;
     public float diffusionRate = 1.0f;
     public float buoyancyStrength = 0.01f;
+    public float smokeBuoyancyStrength = 0.02f;
+    public float smokeBuoyancyCutoff = 40f;   // °C above ambient -- smoke keeps its own lift above this, loses it below
+    public float smokeSettleStrength = 0.15f; // gentle sink applied once smoke has cooled past the cutoff
+
     public float coolingRate = 0.0f;
 
     public float solidHeatTransferRate = 0.1f;  // unused
@@ -221,6 +214,20 @@ public class ThermalSimulation : MonoBehaviour
     // Set true if you ever want fire to keep spreading in the background.
     public bool simulationActive = true;
 
+    [Header("Room Shape & Openings")]
+    public Collider volumeCollider; //The room shape
+
+    [Tooltip("How fast openings vent heat and smoke to ambient")]
+    public float openingVentRate = 1.0f;
+
+    RenderTexture openingVolume;
+    float[] openingData;
+    Collider[] openingColliders;
+
+    public RenderTexture GetOpeningVolume() => openingVolume;
+    #endregion
+
+
     public void SetSimulationActive(bool active)
     {
         simulationActive = active;
@@ -231,6 +238,7 @@ public class ThermalSimulation : MonoBehaviour
         _instance = this;
     }
 
+    //Initialisation of most data
     void Start()
     {
         CalculateGridSize();
@@ -307,6 +315,7 @@ public class ThermalSimulation : MonoBehaviour
         pressureB = CreateVolume();
         obstacleVolume = CreateVolume();
         materialVolume = CreateVolume();
+        openingVolume = CreateVolume();
 
         solidTemperatureA = CreateVolume();
         solidTemperatureB = CreateVolume();
@@ -339,10 +348,13 @@ public class ThermalSimulation : MonoBehaviour
 
         burningData = new float[gridX * gridY * gridZ];
 
-        // Cache thermal objects once for both the collider gather and the clones.
+        openingData = new float[gridX * gridY * gridZ];
+
+        // Cached once in Start so we don't call FindObjectsOfType twice.
         _thermalObjects = GameObject.FindObjectsByType<ThermalMaterial>(FindObjectsSortMode.None);
 
         FindObstacleColliders();
+        FindOpenings();
         BuildObstacleVolume();
         InitializeSolidTemperature();
         CreateThermalClones();
@@ -350,9 +362,9 @@ public class ThermalSimulation : MonoBehaviour
         IsInitialized = true;
 
         ResetChar();
-}
+    }
 
-void CalculateGridSize()
+    void CalculateGridSize()
     {
         Bounds bounds = GetSimulationBounds();
 
@@ -509,6 +521,10 @@ void CalculateGridSize()
 
         simulation.SetTexture(heatKernel, "Obstacle", obstacleVolume);
 
+        simulation.SetTexture(heatKernel, "OpeningVolume", openingVolume);
+
+        simulation.SetFloat("OpeningVentRate", openingVentRate);
+
         simulation.Dispatch(heatKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
                             Mathf.CeilToInt(gridZ / 8f));
@@ -519,11 +535,19 @@ void CalculateGridSize()
 
         simulation.SetTexture(buoyancyKernel, "TemperatureIn", temperatureA);
 
+        simulation.SetTexture(buoyancyKernel, "SmokeIn", smokeA);
+
         simulation.SetTexture(buoyancyKernel, "VelocityIn", velocityA);
 
         simulation.SetTexture(buoyancyKernel, "VelocityOut", velocityB);
 
         simulation.SetFloat("BuoyancyStrength", buoyancyStrength);
+
+        simulation.SetFloat("SmokeBuoyancyStrength", smokeBuoyancyStrength);
+
+        simulation.SetFloat("SmokeBuoyancyCutoff", smokeBuoyancyCutoff);
+
+        simulation.SetFloat("SmokeSettleStrength", smokeSettleStrength);
 
         simulation.SetFloat("TurbulenceStrength", turbulenceStrength);
 
@@ -620,6 +644,7 @@ void CalculateGridSize()
 
         simulation.SetTexture(pressureKernel, "Divergence", divergence);
         simulation.SetTexture(pressureKernel, "Obstacle", obstacleVolume);
+        simulation.SetTexture(pressureKernel, "OpeningVolume", openingVolume);
 
         for (int i = 0; i < pressureIterations; i++)
         {
@@ -643,6 +668,8 @@ void CalculateGridSize()
         simulation.SetTexture(projectKernel, "VelocityOut", velocityB);
 
         simulation.SetTexture(projectKernel, "Obstacle", obstacleVolume);
+
+        simulation.SetTexture(projectKernel, "OpeningVolume", openingVolume);
 
         simulation.Dispatch(projectKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -857,7 +884,11 @@ void CalculateGridSize()
 
         simulation.SetTexture(smokeGenerationKernel, "BurningIn", burningA);
 
+        simulation.SetTexture(smokeGenerationKernel, "OpeningVolume", openingVolume);
+
         simulation.SetFloat("SmokeGenerationRate", smokeGenerationRate);
+
+        simulation.SetFloat("OpeningVentRate", openingVentRate);
 
         simulation.Dispatch(smokeGenerationKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -877,11 +908,15 @@ void CalculateGridSize()
 
         simulation.SetTexture(advectSmokeKernel, "Obstacle", obstacleVolume);
 
+        simulation.SetTexture(advectSmokeKernel, "OpeningVolume", openingVolume);
+
         simulation.SetFloat("SmokeDecayRate", 0.01f);
 
         simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
 
         simulation.SetFloat("SmokeDiffusionRate", smokeDiffusionRate);
+
+        simulation.SetFloat("OpeningVentRate", openingVentRate);
 
         simulation.Dispatch(advectSmokeKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -1114,6 +1149,10 @@ void CalculateGridSize()
         Bounds simBounds = GetSimulationBounds();
         Vector3 simMin = simBounds.min;
 
+        // Non-rectangular rooms: anything outside the room-shape mesh is
+        // exterior, mark it solid before the per-object obstacle pass below.
+        MarkExteriorAsObstacle(simMin);
+
         for (int c = 0; c < obstacleColliders.Length; c++)
         {
             Collider collider = obstacleColliders[c];
@@ -1204,22 +1243,114 @@ void CalculateGridSize()
                         fuelData[index] = fuel;
                         burningData[index] = burning;
                         assigned[index] = true;
-
-                        //if (obstacleVolumeDebug)
-                        //{
-                        //    Debug.DrawLine(voxelPos,
-                        //                   voxelPos + Vector3.up * 0.1f,
-                        //                   Color.red, 30f);
-                        //}
                     }
                 }
             }
         }
 
+        // Doors/windows punch holes through whatever was marked solid above --
+        // always wins, so an opening collider on top of a wall still opens it.
+        CarveOpenings(simMin);
+
         UploadObstacleVolume();
         UploadMaterialVolume();
         UploadFuelVolume();
         UploadBurningVolume();
+        UploadOpeningVolume();
+    }
+
+   void MarkExteriorAsObstacle(Vector3 simMin)
+    {
+        if (volumeCollider == null)
+            return;
+
+        MeshCollider meshCollider = volumeCollider as MeshCollider;
+
+        if (meshCollider == null || meshCollider.convex)
+            return;
+
+        for (int z = 0; z < gridZ; z++)
+        {
+            for (int y = 0; y < gridY; y++)
+            {
+                for (int x = 0; x < gridX; x++)
+                {
+                    int index = x + gridX * (y + gridY * z);
+
+                    Vector3 voxelPos = simMin +
+                        new Vector3(x + 0.5f, y + 0.5f, z + 0.5f) * cellSize;
+
+                    if (!PointInsideMeshCollider(meshCollider, voxelPos))
+                    {
+                        obstacleData[index] = 1f;
+                    }
+                }
+            }
+        }
+    }
+
+    void CarveOpenings(Vector3 simMin)
+    {
+        System.Array.Clear(openingData, 0, openingData.Length);
+
+        if (openingColliders == null)
+            return;
+
+        for (int c = 0; c < openingColliders.Length; c++)
+        {
+            Collider opening = openingColliders[c];
+            if (opening == null) continue;
+
+            Bounds b = opening.bounds;
+            Vector3 minV = (b.min - simMin) / cellSize;
+            Vector3 maxV = (b.max - simMin) / cellSize;
+
+            int minX = Mathf.Clamp(Mathf.FloorToInt(minV.x), 0, gridX - 1);
+            int minY = Mathf.Clamp(Mathf.FloorToInt(minV.y), 0, gridY - 1);
+            int minZ = Mathf.Clamp(Mathf.FloorToInt(minV.z), 0, gridZ - 1);
+            int maxX = Mathf.Clamp(Mathf.CeilToInt(maxV.x), 0, gridX - 1);
+            int maxY = Mathf.Clamp(Mathf.CeilToInt(maxV.y), 0, gridY - 1);
+            int maxZ = Mathf.Clamp(Mathf.CeilToInt(maxV.z), 0, gridZ - 1);
+
+            for (int z = minZ; z <= maxZ; z++)
+            {
+                for (int y = minY; y <= maxY; y++)
+                {
+                    for (int x = minX; x <= maxX; x++)
+                    {
+                        Vector3 voxelPos = simMin +
+                            new Vector3(x + 0.5f, y + 0.5f, z + 0.5f) * cellSize;
+
+                        if (!IsVoxelInsideCollider(opening, voxelPos))
+                            continue;
+
+                        int index = x + gridX * (y + gridY * z);
+
+                        obstacleData[index] = 0f;
+                        openingData[index] = 1f;
+                    }
+                }
+            }
+        }
+    }
+
+    void UploadOpeningVolume()
+    {
+        Color[] pixels = new Color[openingData.Length];
+
+        for (int i = 0; i < openingData.Length; i++)
+        {
+            float v = openingData[i];
+            pixels[i] = new Color(v, v, v, v);
+        }
+
+        Texture3D temp =
+            new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+
+        temp.SetPixels(pixels);
+        temp.Apply();
+
+        Graphics.CopyTexture(temp, openingVolume);
     }
 
     void UploadObstacleVolume()
@@ -1371,11 +1502,10 @@ void CalculateGridSize()
             GameObject.FindObjectsByType<ThermalMaterial>(FindObjectsSortMode.None);
 
         FindObstacleColliders();
+        FindOpenings();
         BuildObstacleVolume();
         InitializeSolidTemperature();
         CreateThermalClones();
-
-        Debug.Log($"[ThermalSimulation] Rebaked with {_thermalObjects.Length} thermal objects.");
     }
 
     void CreateThermalClones()
@@ -1448,7 +1578,26 @@ void CalculateGridSize()
             thermalSurfaceRenderers[i] = cloneRenderer;
         }
     }
+    void FindOpenings()
+    {
+        ThermalOpening[] openings = GameObject.FindObjectsByType<ThermalOpening>(FindObjectsSortMode.None);
 
+        List<Collider> colliders = new List<Collider>();
+
+        Bounds volumeBounds = GetSimulationBounds();
+
+        foreach(var opening in openings)
+        {
+            Collider col = opening.Collider;
+            if (!col) continue;
+
+            colliders.Add(col);
+        }
+
+        openingColliders = colliders.ToArray();
+
+        Debug.Log($"Found {openingColliders.Length} thermal openings");
+    }
     void FindObstacleColliders()
     {
         List<Collider> colliders = new List<Collider>();
@@ -1481,6 +1630,9 @@ void CalculateGridSize()
 
     Bounds GetSimulationBounds()
     {
+        if (volumeCollider != null)
+            return volumeCollider.bounds; //Based on the shape of the collider
+
         return new Bounds(thermalVolume.position, thermalVolume.lossyScale);
     }
 
