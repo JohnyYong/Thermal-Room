@@ -411,30 +411,29 @@ void BuoyancyStep(uint3 id : SV_DispatchThreadID)
 
     float4 velocity = VelocityIn[id];
 
+    // Hot air rises. This is what actually drives the plume -- smoke gets
+    // carried along by the ambient upflow, it doesn't lift itself.
     float thermalBuoyancy = max(temp - AmbientTemp, 0);
 
-    // Smoke only keeps its own lift while the gas carrying it is still
-    // meaningfully hotter than ambient (0 = fully cooled, 1 = as hot as
-    // SmokeBuoyancyCutoff or more). Real smoke rises because it's hot --
-    // once it cools back toward ambient it should stop climbing and settle
-    // into the accumulating layer instead of spreading into an infinitely
-    // thin sheet under the ceiling forever.
+    // Extra lift the smoke gets while it's still in a very hot pocket.
+    // Smooths the transition at the edge of the plume rather than
+    // switching on/off. Optional -- keep SmokeBuoyancyStrength small.
     float smokeWarmth = saturate(thermalBuoyancy / max(SmokeBuoyancyCutoff, 0.0001));
-
     float smokeLift = smoke * SmokeBuoyancyStrength * smokeWarmth;
 
-    // Cooled, dense smoke is heavier soot/particulate -- give it a gentle
-    // sink once it's lost its warmth. This is what makes the settled layer
-    // actually thicken and creep downward over time: fresh hot smoke keeps
-    // rising from below and displacing the older, cooled smoke that's now
-    // sinking instead of endlessly climbing.
-    float smokeSettle = smoke * (1.0 - smokeWarmth) * SmokeSettleStrength;
+    // Soot is heavier than air -- gravity is ALWAYS pulling smoke down,
+    // independent of local temperature. In the hot fire column, thermal
+    // buoyancy overwhelms it and smoke rises anyway. Once smoke drifts
+    // sideways out of the plume, only settle remains and the smoke slowly
+    // descends. This is what causes the ceiling layer to visibly thicken
+    // and creep downward over time -- and crucially, it works regardless
+    // of whether cooling is turned on, because it doesn't depend on the
+    // air ever getting cold.
+    float smokeSettle = smoke * SmokeSettleStrength;
 
     velocity.y += (thermalBuoyancy * BuoyancyStrength +
                    smokeLift - smokeSettle) * DeltaTime;
 
-    // TURBULENCE IS 0 NOW
-    //  Turbulence from temperature gradients
     if (id.x > 0 && id.x < GridX - 1 && id.y > 0 && id.y < GridY - 1 &&
         id.z > 0 && id.z < GridZ - 1)
     {

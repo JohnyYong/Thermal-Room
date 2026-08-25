@@ -1,0 +1,172 @@
+#pragma kernel Emit
+#pragma kernel Step
+#pragma kernel Clear
+
+// Density [0,1]. Fresh smoke is added at the emitter, moves per tick.
+Texture3D<float>    SmokeIn;
+RWTexture3D<float>  SmokeOut;
+
+// 1 = solid wall, 0 = open air. Baked from scene colliders at Start.
+Texture3D<float>    Obstacle;
+
+int3   GridSize;
+float  DeltaTime;
+
+// Emission ball -- world converted to voxel space by C#.
+float3 EmitCenter;
+float  EmitRadius;
+float  EmitRate;      // density added per second at ball center
+
+// Physics tunables.
+float  RiseSpeed;         // voxels/sec upward when smoke is dense
+float  SettleSpeed;       // voxels/sec downward once smoke has stopped rising
+float  CeilingSpread;     // horizontal spread rate when smoke is against a ceiling
+float  DecayRate;         // slow global fade
+
+// -------------------------------------------------------------------
+
+bool InBounds(int3 p)
+{
+    return all(p >= int3(0,0,0)) && all(p < GridSize);
+}
+
+bool IsSolid(int3 p)
+{
+    if (!InBounds(p)) return true;
+    return Obstacle[p] > 0.5;
+}
+
+float ReadSmoke(int3 p)
+{
+    if (!InBounds(p) || IsSolid(p)) return 0.0;
+    return SmokeIn[p];
+}
+
+// -------------------------------------------------------------------
+
+// Clear the entire volume to 0. Called once at start.
+[numthreads(8,8,8)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)GridSize)) return;
+    SmokeOut[id] = 0.0;
+}
+
+// Add smoke inside the emitter ball each tick. This kernel ONLY adds --
+// the Step kernel below handles all movement/decay.
+[numthreads(8,8,8)]
+void Emit(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)GridSize)) return;
+
+    float current = SmokeIn[id];
+
+    if (IsSolid(int3(id)))
+    {
+        SmokeOut[id] = current;
+        return;
+    }
+
+    float3 p = float3(id) + 0.5;
+    float d = distance(p, EmitCenter);
+    float w = saturate(1.0 - d / max(EmitRadius, 0.0001));
+
+    if (w > 0)
+    {
+        current += EmitRate * DeltaTime * w;
+    }
+
+    SmokeOut[id] = saturate(current);
+}
+
+// One physics step: each voxel pulls smoke from the voxel below (rise)
+// and from the voxel above (settle), plus horizontal exchange when it's
+// pressed against a ceiling.
+//
+// This isn't a real fluid solver -- it's a directional diffusion model
+// tailored to the specific behaviour we want:
+//   - dense smoke rises fast
+//   - cooled/spent smoke slowly falls
+//   - smoke that hits a ceiling spreads sideways instead of piling up
+//
+// The advantage over the pressure-solver approach: predictable, cheap,
+// no oscillation, no tuning nightmares. The trade-off: not physically
+// accurate. For "smoke fills the room over time" this is more than enough.
+[numthreads(8,8,8)]
+void Step(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)GridSize)) return;
+
+    if (IsSolid(int3(id)))
+    {
+        SmokeOut[id] = 0.0;
+        return;
+    }
+
+    int3 c = int3(id);
+
+    float here  = SmokeIn[id];
+    float below = ReadSmoke(c + int3(0, -1, 0));
+    float above = ReadSmoke(c + int3(0,  1, 0));
+
+    bool ceilingAbove = IsSolid(c + int3(0,  1, 0));
+    bool floorBelow   = IsSolid(c + int3(0, -1, 0));
+
+    // ----- rise -----
+    // Smoke below flows up into us. Strong.
+    float riseIn = below * RiseSpeed * DeltaTime;
+
+    // We lose smoke upward (unless a ceiling blocks it).
+    float riseOut = ceilingAbove ? 0.0 : here * RiseSpeed * DeltaTime;
+
+    // ----- settle (SELECTIVE) -----
+    // Settle ONLY applies to smoke that has stopped rising -- i.e., smoke
+    // that is against a ceiling above or has cooler air below.
+    //
+    // "Cooler air below" here = below cell has less smoke than we do.
+    // That distinguishes "middle of an active rising column" (below is
+    // dense, don't settle) from "smoke spreading sideways at the ceiling
+    // above emptier space" (below is empty, DO settle).
+    bool activeRisingColumn = (below > here * 0.5);
+
+    float settleIn = 0.0;
+    float settleOut = 0.0;
+
+    if (!activeRisingColumn)
+    {
+        // Smoke from above drops into us.
+        settleIn = above * SettleSpeed * DeltaTime;
+
+        // We drop downward (unless a floor blocks it).
+        settleOut = floorBelow ? 0.0 : here * SettleSpeed * DeltaTime;
+    }
+
+    // ----- horizontal ceiling spread -----
+    // When under a ceiling, smoke wants to spread sideways.
+    float horizontal = 0.0;
+    bool inLayer = ceilingAbove || (above > 0.1);
+
+    if (inLayer)
+    {
+        int3 xpP = c + int3( 1, 0, 0);
+        int3 xnP = c + int3(-1, 0, 0);
+        int3 zpP = c + int3( 0, 0, 1);
+        int3 znP = c + int3( 0, 0,-1);
+
+        float xp = IsSolid(xpP) ? here : SmokeIn[xpP];
+        float xn = IsSolid(xnP) ? here : SmokeIn[xnP];
+        float zp = IsSolid(zpP) ? here : SmokeIn[zpP];
+        float zn = IsSolid(znP) ? here : SmokeIn[znP];
+
+        float laplacian = (xp + xn + zp + zn) - 4.0 * here;
+        horizontal = laplacian * CeilingSpread * DeltaTime;
+    }
+
+    float result = here
+                 + riseIn - riseOut
+                 + settleIn - settleOut
+                 + horizontal;
+
+    result *= (1.0 - DecayRate * DeltaTime);
+    SmokeOut[id] = saturate(max(result, 0.0));
+}

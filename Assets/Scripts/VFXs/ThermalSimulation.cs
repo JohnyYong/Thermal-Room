@@ -460,8 +460,8 @@ public class ThermalSimulation : MonoBehaviour
         // Char globals bound before the gate so char stays visible in normal
         // view even while the sim is paused.
 
-        Debug.Log($"[ThermalSimulation] Created {thermalSurfaceRenderers.Length} thermal clones. " +
-           $"Total '_Thermal' objects in scene: {GameObject.FindObjectsByType<Renderer>(FindObjectsSortMode.None).Count(r => r.name.EndsWith("_Thermal"))}");
+        //Debug.Log($"[ThermalSimulation] Created {thermalSurfaceRenderers.Length} thermal clones. " +
+        //   $"Total '_Thermal' objects in scene: {GameObject.FindObjectsByType<Renderer>(FindObjectsSortMode.None).Count(r => r.name.EndsWith("_Thermal"))}");
 
         Bounds bounds = GetSimulationBounds();
 
@@ -910,7 +910,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(advectSmokeKernel, "OpeningVolume", openingVolume);
 
-        simulation.SetFloat("SmokeDecayRate", 0.01f);
+        simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
 
         simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
 
