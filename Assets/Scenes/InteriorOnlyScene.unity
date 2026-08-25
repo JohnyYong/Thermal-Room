@@ -153,18 +153,29 @@ MonoBehaviour:
   compute: {fileID: 7200000, guid: b90fe94c810075d42a66eaa1f5492951, type: 3}
   volumeCenter: {x: 0, y: 2.43, z: 1.87}
   volumeSize: {x: 10, y: 5, z: 13.7}
-  cellSize: 0.25
+  cellSize: 0.1
   obstacleLayers:
     serializedVersion: 2
     m_Bits: 4294967295
   ignoreTriggers: 1
   emitter: {fileID: 1226026637}
-  emitRadius: 0.6
-  emitRate: 8
+  emitRadius: 1.2
+  emitRate: 2
   riseSpeed: 1
   settleSpeed: 0.5
   ceilingSpread: 3
-  decayRate: -0.5
+  decayRate: 0
+  smokeNoiseScale: 0.1
+  smokeNoiseStrength: 0.6
+  smokeNoiseSpeed: 0.8
+  fireEmitRate: 2
+  fireRiseSpeed: 2
+  fireDecayRate: 2
+  fireToSmokeRate: 0.25
+  fireCeilingSpread: 4
+  fireNoiseScale: 0.15
+  fireNoiseStrength: 3
+  fireNoiseSpeed: 3
   smokeMaterial: {fileID: 2100000, guid: 3852d5442683bbc4982d840fae93b82f, type: 2}
 --- !u!23 &55338655
 MeshRenderer:
@@ -379,7 +390,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 305708938067725405, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 520777788656620962, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: fuelAmount
@@ -391,7 +402,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 570205589806381871, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 582945031206207901, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Layer
@@ -399,7 +410,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 582945031206207901, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 1410498982456129987, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalScale.x
@@ -483,7 +494,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 2985254480575735131, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 3428859211252892875, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalScale.x
@@ -531,7 +542,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 4116333172044847227, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 4252123037961756325, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Name
@@ -559,7 +570,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5314266751853465765, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 5491009674151376557, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalScale.x
@@ -587,7 +598,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5866523826671666621, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 6047127601381675359, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Layer
@@ -595,7 +606,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 6047127601381675359, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 6072710516275611484, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalScale.x
@@ -735,7 +746,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8462933473745385056, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 8538325369398785047, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Layer
@@ -743,7 +754,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8538325369398785047, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 8750811429352361384, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Size.x
@@ -775,7 +786,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 9073546325745761667, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 9199216303493951653, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_Layer
@@ -1234,7 +1245,7 @@ Transform:
   m_GameObject: {fileID: 1226026636}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: -1.992, z: 2.41}
+  m_LocalPosition: {x: 0, y: 0.55, z: 0.27}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -2865,5 +2876,5 @@ SceneRoots:
   - {fileID: 1914805908}
   - {fileID: 1017159709}
   - {fileID: 1919553089}
-  - {fileID: 1349933238}
   - {fileID: 55338657}
+  - {fileID: 1349933238}

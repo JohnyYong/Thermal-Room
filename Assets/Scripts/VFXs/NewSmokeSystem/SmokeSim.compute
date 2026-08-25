@@ -1,27 +1,49 @@
 #pragma kernel Emit
 #pragma kernel Step
+#pragma kernel EmitFire
+#pragma kernel StepFire
 #pragma kernel Clear
 
-// Density [0,1]. Fresh smoke is added at the emitter, moves per tick.
+// --- Smoke field ---
 Texture3D<float>    SmokeIn;
 RWTexture3D<float>  SmokeOut;
 
-// 1 = solid wall, 0 = open air. Baked from scene colliders at Start.
+// --- Fire field ---
+Texture3D<float>    FireIn;
+RWTexture3D<float>  FireOut;
+
+// Solid geometry.
 Texture3D<float>    Obstacle;
 
 int3   GridSize;
 float  DeltaTime;
+float  Time_;
 
-// Emission ball -- world converted to voxel space by C#.
+// Emission (shared position for smoke and fire).
 float3 EmitCenter;
 float  EmitRadius;
-float  EmitRate;      // density added per second at ball center
+float  EmitRate;
 
-// Physics tunables.
-float  RiseSpeed;         // voxels/sec upward when smoke is dense
-float  SettleSpeed;       // voxels/sec downward once smoke has stopped rising
-float  CeilingSpread;     // horizontal spread rate when smoke is against a ceiling
-float  DecayRate;         // slow global fade
+// Smoke physics.
+float  RiseSpeed;
+float  SettleSpeed;
+float  CeilingSpread;
+float  DecayRate;
+
+// Fire physics.
+float  FireEmitRate;
+float  FireRiseSpeed;
+float  FireDecayRate;
+float  FireToSmokeRate;
+float  FireCeilingSpread;
+
+// Noise turbulence.
+float FireNoiseScale;      // how "fine" the noise is (higher = smaller swirls)
+float FireNoiseStrength;   // how far the sample can be offset in voxels
+float FireNoiseSpeed;      // how fast the pattern flows over time
+float SmokeNoiseScale;
+float SmokeNoiseStrength;
+float SmokeNoiseSpeed;
 
 // -------------------------------------------------------------------
 
@@ -42,9 +64,88 @@ float ReadSmoke(int3 p)
     return SmokeIn[p];
 }
 
+float ReadFire(int3 p)
+{
+    if (!InBounds(p) || IsSolid(p)) return 0.0;
+    return FireIn[p];
+}
+
+// Cheap pseudo-random per voxel + time. Used for flicker & turbulence.
+float Hash3(float3 p)
+{
+    return frac(sin(dot(p, float3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+// -------------------------------------------------------------------
+// Value noise + fractal Brownian motion. This gives smoothly-varying
+// per-voxel turbulence with coherent swirls, unlike the raw Hash3 which
+// just jitters each voxel independently (looks like TV static).
+//
+// We animate it by shifting the sample position with Time_, so the
+// noise "flows" through the volume -- a much more organic feel than
+// randomizing each frame independently.
+
+float ValueNoise(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    // Smoothstep-style interpolation curve for softer transitions.
+    f = f * f * (3.0 - 2.0 * f);
+
+    float n000 = Hash3(i + float3(0, 0, 0));
+    float n100 = Hash3(i + float3(1, 0, 0));
+    float n010 = Hash3(i + float3(0, 1, 0));
+    float n110 = Hash3(i + float3(1, 1, 0));
+    float n001 = Hash3(i + float3(0, 0, 1));
+    float n101 = Hash3(i + float3(1, 0, 1));
+    float n011 = Hash3(i + float3(0, 1, 1));
+    float n111 = Hash3(i + float3(1, 1, 1));
+
+    float x00 = lerp(n000, n100, f.x);
+    float x10 = lerp(n010, n110, f.x);
+    float x01 = lerp(n001, n101, f.x);
+    float x11 = lerp(n011, n111, f.x);
+    float y0  = lerp(x00, x10, f.y);
+    float y1  = lerp(x01, x11, f.y);
+    return lerp(y0, y1, f.z);
+}
+
+// Fractal Brownian motion: sum multiple octaves of noise at increasing
+// frequencies and decreasing amplitudes. Gives us both big slow swirls
+// AND fine wispy details in the same field.
+float FBM(float3 p)
+{
+    float total = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    for (int i = 0; i < 3; i++)
+    {
+        total += ValueNoise(p * freq) * amp;
+        freq *= 2.1;
+        amp  *= 0.5;
+    }
+    return total; // approx [0, 1]
+}
+
+// A 3D noise-based velocity offset. Returns a value in roughly [-1, 1]
+// per axis. Different seeds per axis so the offset isn't the same in
+// all directions. Animated over time so the pattern flows.
+float3 NoiseVelocity(float3 p, float scale, float speed)
+{
+    float3 q = p * scale + float3(Time_ * speed * 0.7,
+                                  Time_ * speed,
+                                  Time_ * speed * 0.9);
+
+    // Differencing two independent FBM samples guarantees zero mean --
+    // any constant bias cancels out. Also gives more organic swirls
+    // than single-sample noise.
+    float ax = FBM(q + float3(  0.0,   0.0,   0.0)) - FBM(q + float3( 47.3,  91.7,  13.1));
+    float ay = FBM(q + float3(101.9,  17.3,  61.5)) - FBM(q + float3(-33.7,  55.9, -22.1));
+    float az = FBM(q + float3( 71.1,  29.4, 143.2)) - FBM(q + float3( 12.5, -87.3,  99.4));
+
+    return float3(ax, ay, az) * 2.0;  // scale to roughly [-1, 1] range
+}
 // -------------------------------------------------------------------
 
-// Clear the entire volume to 0. Called once at start.
 [numthreads(8,8,8)]
 void Clear(uint3 id : SV_DispatchThreadID)
 {
@@ -52,8 +153,9 @@ void Clear(uint3 id : SV_DispatchThreadID)
     SmokeOut[id] = 0.0;
 }
 
-// Add smoke inside the emitter ball each tick. This kernel ONLY adds --
-// the Step kernel below handles all movement/decay.
+// -------------------------------------------------------------------
+// SMOKE PIPELINE
+
 [numthreads(8,8,8)]
 void Emit(uint3 id : SV_DispatchThreadID)
 {
@@ -67,6 +169,7 @@ void Emit(uint3 id : SV_DispatchThreadID)
         return;
     }
 
+    // Base emission at the source ball.
     float3 p = float3(id) + 0.5;
     float d = distance(p, EmitCenter);
     float w = saturate(1.0 - d / max(EmitRadius, 0.0001));
@@ -76,22 +179,17 @@ void Emit(uint3 id : SV_DispatchThreadID)
         current += EmitRate * DeltaTime * w;
     }
 
+    // Any voxel that's actively on fire also produces smoke, so smoke
+    // follows the fire's shape naturally.
+    float fireHere = FireIn[id];
+    if (fireHere > 0.01)
+    {
+        current += fireHere * FireToSmokeRate * DeltaTime;
+    }
+
     SmokeOut[id] = saturate(current);
 }
 
-// One physics step: each voxel pulls smoke from the voxel below (rise)
-// and from the voxel above (settle), plus horizontal exchange when it's
-// pressed against a ceiling.
-//
-// This isn't a real fluid solver -- it's a directional diffusion model
-// tailored to the specific behaviour we want:
-//   - dense smoke rises fast
-//   - cooled/spent smoke slowly falls
-//   - smoke that hits a ceiling spreads sideways instead of piling up
-//
-// The advantage over the pressure-solver approach: predictable, cheap,
-// no oscillation, no tuning nightmares. The trade-off: not physically
-// accurate. For "smoke fills the room over time" this is more than enough.
 [numthreads(8,8,8)]
 void Step(uint3 id : SV_DispatchThreadID)
 {
@@ -105,47 +203,46 @@ void Step(uint3 id : SV_DispatchThreadID)
 
     int3 c = int3(id);
 
-    float here  = SmokeIn[id];
-    float below = ReadSmoke(c + int3(0, -1, 0));
-    float above = ReadSmoke(c + int3(0,  1, 0));
+    float here = SmokeIn[id];
+
+    float3 pp = float3(id) + 0.5;
+    float3 noise = NoiseVelocity(pp, SmokeNoiseScale, SmokeNoiseSpeed);
+
+    float offX = clamp(noise.x * SmokeNoiseStrength, -1.5, 1.5);
+    float offZ = clamp(noise.z * SmokeNoiseStrength, -1.5, 1.5);
+
+    int3 sampleVoxel = c + int3((int)round(offX), -1, (int)round(offZ));
+    float noiseBelow = ReadSmoke(sampleVoxel);
+    float straightBelow = ReadSmoke(c + int3(0, -1, 0));
+
+    float below = noiseBelow * 0.5 + straightBelow * 0.5;
+    float above = ReadSmoke(c + int3(0, 1, 0));
 
     bool ceilingAbove = IsSolid(c + int3(0,  1, 0));
     bool floorBelow   = IsSolid(c + int3(0, -1, 0));
 
-    // ----- rise -----
-    // Smoke below flows up into us. Strong.
-    float riseIn = below * RiseSpeed * DeltaTime;
-
-    // We lose smoke upward (unless a ceiling blocks it).
+    // Rise: smoke below flows up into us; we lose smoke upward (unless a
+    // ceiling blocks it).
+    float riseIn  = below * RiseSpeed * DeltaTime;
     float riseOut = ceilingAbove ? 0.0 : here * RiseSpeed * DeltaTime;
 
-    // ----- settle (SELECTIVE) -----
-    // Settle ONLY applies to smoke that has stopped rising -- i.e., smoke
-    // that is against a ceiling above or has cooler air below.
-    //
-    // "Cooler air below" here = below cell has less smoke than we do.
-    // That distinguishes "middle of an active rising column" (below is
-    // dense, don't settle) from "smoke spreading sideways at the ceiling
-    // above emptier space" (below is empty, DO settle).
+    // Settle: only applies to smoke that ISN'T in an active rising column.
+    // Distinguishes "middle of plume" (don't settle) from "outer edges of
+    // ceiling layer" (do settle -> layer thickens downward over time).
     bool activeRisingColumn = (below > here * 0.5);
-
     float settleIn = 0.0;
     float settleOut = 0.0;
-
     if (!activeRisingColumn)
     {
-        // Smoke from above drops into us.
-        settleIn = above * SettleSpeed * DeltaTime;
-
-        // We drop downward (unless a floor blocks it).
+        settleIn  = above * SettleSpeed * DeltaTime;
         settleOut = floorBelow ? 0.0 : here * SettleSpeed * DeltaTime;
     }
 
-    // ----- horizontal ceiling spread -----
-    // When under a ceiling, smoke wants to spread sideways.
+    // Horizontal ceiling spread: applies to the row just under a ceiling
+    // AND rows below it that have smoke overhead. This is what lets the
+    // ceiling layer THICKEN downward rather than being a single sheet.
     float horizontal = 0.0;
     bool inLayer = ceilingAbove || (above > 0.1);
-
     if (inLayer)
     {
         int3 xpP = c + int3( 1, 0, 0);
@@ -169,4 +266,105 @@ void Step(uint3 id : SV_DispatchThreadID)
 
     result *= (1.0 - DecayRate * DeltaTime);
     SmokeOut[id] = saturate(max(result, 0.0));
+}
+
+// -------------------------------------------------------------------
+// FIRE PIPELINE
+
+[numthreads(8,8,8)]
+void EmitFire(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)GridSize)) return;
+
+    float current = FireIn[id];
+
+    if (IsSolid(int3(id)))
+    {
+        FireOut[id] = current;
+        return;
+    }
+
+    float3 p = float3(id) + 0.5;
+    float d = distance(p, EmitCenter);
+    float w = saturate(1.0 - d / max(EmitRadius, 0.0001));
+
+    if (w > 0)
+    {
+        // Flicker: emit intensity varies over time with per-voxel randomness,
+        // so the fire base pulses irregularly instead of being a steady blob.
+        // This is what makes it read as "fire" rather than orange gas.
+        float flickerA = sin(Time_ * 12.0 + Hash3(p) * 6.28) * 0.5 + 0.5;
+        float flickerB = sin(Time_ * 7.3 + Hash3(p + 100) * 6.28) * 0.5 + 0.5;
+        float flicker = 0.6 + 0.4 * flickerA * flickerB;
+
+        current = max(current, w * flicker);
+    }
+
+    FireOut[id] = saturate(current);
+}
+
+[numthreads(8,8,8)]
+void StepFire(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)GridSize)) return;
+
+    if (IsSolid(int3(id)))
+    {
+        FireOut[id] = 0.0;
+        return;
+    }
+
+    int3 c = int3(id);
+
+    // Sample noise for THIS voxel's turbulence direction.
+    float3 p = float3(id) + 0.5;
+    float3 noise = NoiseVelocity(p, FireNoiseScale, FireNoiseSpeed);
+
+    // Instead of only offsetting the "pull from below" sample, we compute
+    // this voxel's density by sampling fire from a NOISE-DISPLACED position
+    // and treating that as "what would be here if turbulence advected the
+    // fire pattern by this offset". This makes the visible fire outline
+    // itself wobble, not just the interior.
+    float offX = clamp(noise.x * FireNoiseStrength, -2.0, 2.0);
+    float offY = clamp(noise.y * FireNoiseStrength * 0.5, -1.0, 1.0);
+    float offZ = clamp(noise.z * FireNoiseStrength, -2.0, 2.0);
+
+    // "Here after noise displacement" -- this is the shell wobble.
+    int3 herePos = c + int3((int)round(offX), (int)round(offY), (int)round(offZ));
+    float here = ReadFire(herePos);
+
+    // Standard rise: pull from below, also noise-perturbed.
+    int3 belowPos = c + int3((int)round(offX * 0.7), -1, (int)round(offZ * 0.7));
+    float below = ReadFire(belowPos);
+    float straightBelow = ReadFire(c + int3(0, -1, 0));
+    below = below * 0.6 + straightBelow * 0.4;
+
+    bool ceilingAbove = IsSolid(c + int3(0, 1, 0));
+
+    float riseIn  = below * FireRiseSpeed * DeltaTime;
+    float riseOut = ceilingAbove ? 0.0 : here * FireRiseSpeed * DeltaTime;
+
+    // Ceiling rollover.
+    float horizontal = 0.0;
+    if (ceilingAbove)
+    {
+        int3 xpP = c + int3( 1, 0, 0);
+        int3 xnP = c + int3(-1, 0, 0);
+        int3 zpP = c + int3( 0, 0, 1);
+        int3 znP = c + int3( 0, 0,-1);
+
+        float xp = IsSolid(xpP) ? here : FireIn[xpP];
+        float xn = IsSolid(xnP) ? here : FireIn[xnP];
+        float zp = IsSolid(zpP) ? here : FireIn[zpP];
+        float zn = IsSolid(znP) ? here : FireIn[znP];
+
+        float laplacian = (xp + xn + zp + zn) - 4.0 * here;
+        horizontal = laplacian * FireCeilingSpread * DeltaTime;
+    }
+
+    float result = here + riseIn - riseOut + horizontal;
+
+    result *= (1.0 - FireDecayRate * DeltaTime);
+
+    FireOut[id] = saturate(max(result, 0.0));
 }
