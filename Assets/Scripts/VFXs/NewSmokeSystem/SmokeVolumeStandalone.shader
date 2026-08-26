@@ -31,6 +31,7 @@ Shader "Custom/SmokeVolumeStandalone"
             #pragma vertex vert
             #pragma fragment frag
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
 
             sampler3D _SmokeTex;
             sampler3D _FireTex;
@@ -51,6 +52,7 @@ Shader "Custom/SmokeVolumeStandalone"
             {
                 float4 pos      : SV_POSITION;
                 float3 localPos : TEXCOORD0;
+                float4 screenPos: TEXCOORD1;
             };
 
             v2f vert(appdata v)
@@ -58,6 +60,7 @@ Shader "Custom/SmokeVolumeStandalone"
                 v2f o;
                 o.pos = TransformObjectToHClip(v.vertex.xyz);
                 o.localPos = v.vertex.xyz + 0.5;
+                o.screenPos = ComputeScreenPos(o.pos);
                 return o;
             }
 
@@ -72,8 +75,6 @@ Shader "Custom/SmokeVolumeStandalone"
                               min(min(tmax.x, tmax.y), tmax.z));
             }
 
-            // Blackbody-ish palette based on fire density [0,1].
-            // Low density = red (cool flame edges), mid = orange, high = white-yellow (core).
             float3 FireColor(float f)
             {
                 if (f < 0.5)
@@ -94,6 +95,11 @@ Shader "Custom/SmokeVolumeStandalone"
                 int   steps  = (int)_StepCount;
                 float step   = travel / steps;
 
+                // Scene depth for per-step occlusion check.
+                float2 sceneUV = i.screenPos.xy / i.screenPos.w;
+                float rawSceneDepth = SampleSceneDepth(sceneUV);
+                float sceneEyeDepth = LinearEyeDepth(rawSceneDepth, _ZBufferParams);
+
                 float3 pos = ro + rd * entry;
                 float3 accum = 0;
                 float  alpha = 0;
@@ -101,21 +107,32 @@ Shader "Custom/SmokeVolumeStandalone"
                 [loop]
                 for (int s = 0; s < steps; s++)
                 {
+                    // Per-step depth check: convert this sample's world
+                    // position to eye depth and skip if it's behind a wall.
+                    // This handles all camera positions correctly (inside
+                    // the volume, outside, near walls) without upfront math.
+                    float3 sampleLocal = pos - 0.5;
+                    float3 sampleWorld = mul(unity_ObjectToWorld, float4(sampleLocal, 1)).xyz;
+                    float sampleEyeDepth = -TransformWorldToView(sampleWorld).z;
+
+                    // 0.02 tolerance avoids z-fighting artifacts right at
+                    // the wall surface.
+                    if (sampleEyeDepth > sceneEyeDepth + 0.02)
+                    {
+                        pos += rd * step;
+                        continue;
+                    }
+
                     float smokeD = tex3D(_SmokeTex, pos).r;
                     float fireD  = tex3D(_FireTex,  pos).r;
 
-                    // Fire contributes emissive color -- it ADDS light along
-                    // the ray. Attenuated by (1 - alpha) so smoke in front
-                    // blocks the flame behind it naturally.
                     if (fireD > 0.001)
                     {
-                        // Boost low-density voxels a bit so the wispy edges pulse visibly.
                         float edgeBoost = smoothstep(0.0, 0.15, fireD);
                         float3 fc = FireColor(fireD) * fireD * _FireBrightness * step * edgeBoost;
                         accum += fc * (1 - alpha);
                     }
 
-                    // Smoke contributes opacity and dark color.
                     if (smokeD > 0.005)
                     {
                         float3 sc = lerp(_SmokeColorLow.rgb, _SmokeColorHigh.rgb, saturate(smokeD));

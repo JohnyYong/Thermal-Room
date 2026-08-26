@@ -1,12 +1,32 @@
 using UnityEngine;
 
-// Volumetric smoke + fire. Fire is a hot, fast-rising field generated at
-// the emitter that also produces smoke as it burns. Smoke is the standard
-// long-lived field that rises, spreads, and settles. Both share the same
-// voxel grid and are composited in a single raymarch shader pass.
+// Volumetric smoke + fire simulation with support for multiple emitters
+// sharing one voxel grid. Fire produces smoke as it burns. Both fields
+// are composited in a single raymarch shader pass.
 [ExecuteAlways]
 public class SmokeSim : MonoBehaviour
 {
+    [System.Serializable]
+    public class Emitter
+    {
+        [Tooltip("Where smoke/fire is generated. Move to move the source.")]
+        public Transform transform;
+
+        [Tooltip("World-space radius of the emit ball.")]
+        public float radius = 0.6f;
+
+        [Range(0f, 20f)]
+        [Tooltip("Smoke density added per second at this emitter's center.")]
+        public float smokeRate = 2.0f;
+
+        [Range(0f, 5f)]
+        [Tooltip("Fire density this emitter sets per tick. 0 = smoke only, no flame.")]
+        public float fireRate = 1.0f;
+
+        [Tooltip("Uncheck to disable without removing from the list.")]
+        public bool enabled = true;
+    }
+
     [Header("Compute")]
     public ComputeShader compute;
 
@@ -19,42 +39,31 @@ public class SmokeSim : MonoBehaviour
     public LayerMask obstacleLayers = ~0;
     public bool ignoreTriggers = true;
 
-    [Header("Emitter")]
-    public Transform emitter;
-    public float emitRadius = 0.6f;
+    [Header("Emitters")]
+    [Tooltip("One or more fire/smoke sources. Add as many as you need.")]
+    public Emitter[] emitters = new Emitter[] { new Emitter() };
 
     [Header("Smoke")]
-    [Tooltip("Density added per second at the emitter center (base source).")]
-    public float emitRate = 2.0f;
     public float riseSpeed = 4.0f;
     public float settleSpeed = 1.0f;
     public float ceilingSpread = 3.0f;
     public float decayRate = 0.005f;
 
     [Header("Smoke Noise")]
-    public float smokeNoiseScale = 0.1f;
-    public float smokeNoiseStrength = 1.5f;
-    public float smokeNoiseSpeed = 0.8f;
+    public float smokeNoiseScale = 0.08f;
+    public float smokeNoiseStrength = 1.0f;
+    public float smokeNoiseSpeed = 0.6f;
 
     [Header("Fire")]
-    [Tooltip("Fire density set at source each tick (weighted by ball falloff, max'd with existing).")]
-    public float fireEmitRate = 1.0f;
-    [Tooltip("How fast fire rises. Voxels/sec.")]
-    public float fireRiseSpeed = 10.0f;
-    [Tooltip("Fire per-second decay. High = short flame; low = flame reaches ceiling.")]
-    public float fireDecayRate = 4.0f;
-    [Tooltip("Smoke produced per unit of burning fire per second.")]
+    public float fireRiseSpeed = 6.0f;
+    public float fireDecayRate = 2.0f;
     public float fireToSmokeRate = 0.5f;
-    [Tooltip("How fast fire spreads sideways once it hits a ceiling (ceiling rollover). 0 = disabled.")]
     public float fireCeilingSpread = 2.0f;
 
     [Header("Fire Noise")]
-    [Tooltip("Scale of the noise pattern. Higher = smaller swirls, more chaos.")]
     public float fireNoiseScale = 0.15f;
-    [Tooltip("How far turbulence can offset the sample, in voxels. Higher = wilder motion.")]
-    public float fireNoiseStrength = 2.5f;
-    [Tooltip("Speed at which the noise pattern flows over time.")]
-    public float fireNoiseSpeed = 1.5f;
+    public float fireNoiseStrength = 1.2f;
+    public float fireNoiseSpeed = 2.0f;
 
     [Header("Rendering")]
     public Material smokeMaterial;
@@ -69,6 +78,23 @@ public class SmokeSim : MonoBehaviour
 
     int kEmit, kStep, kEmitFire, kStepFire, kClear;
     bool initialized;
+
+    ComputeBuffer emitterBuffer;
+    EmitterGPU[] emitterCPUCache;
+    bool loggedOverflowOnce;
+
+    // Must match EmitterData in SmokeSim.compute exactly (field order and
+    // size). StructuredBuffer layout is positional; any mismatch corrupts
+    // every field silently.
+    struct EmitterGPU
+    {
+        public Vector3 center;
+        public float radius;
+        public float emitRate;
+        public float fireRate;
+    }
+
+    const int MaxEmitters = 32;
 
     void Start()
     {
@@ -103,6 +129,10 @@ public class SmokeSim : MonoBehaviour
         ClearVolume(fireA);
         ClearVolume(fireB);
 
+        // 6 floats per emitter: center(3) + radius(1) + emitRate(1) + fireRate(1)
+        emitterBuffer = new ComputeBuffer(MaxEmitters, sizeof(float) * 6);
+        emitterCPUCache = new EmitterGPU[MaxEmitters];
+
         BakeObstacleFromScene();
 
         transform.position = volumeCenter;
@@ -120,7 +150,7 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("DeltaTime", dt);
         compute.SetFloat("Time_", Time.time);
 
-        SetEmitCommon();
+        BuildEmitterBuffer();
 
         DispatchEmitFire();
         DispatchStepFire();
@@ -130,20 +160,54 @@ public class SmokeSim : MonoBehaviour
         BindRenderTextures();
     }
 
-    void SetEmitCommon()
+    // Rebuilds the GPU emitter buffer from the Inspector list each tick.
+    // Skips disabled/null entries. Uploads the full fixed-size array
+    // (~768 bytes) rather than a partial range -- trivial cost, and it
+    // means the compute shader only ever reads the first `count` slots.
+    void BuildEmitterBuffer()
     {
-        if (emitter == null) return;
+        int count = 0;
+        int totalCandidates = 0;
 
-        Vector3 emitVoxel = (emitter.position - origin) / cellSize;
-        compute.SetFloats("EmitCenter", emitVoxel.x, emitVoxel.y, emitVoxel.z);
-        compute.SetFloat("EmitRadius", emitRadius / cellSize);
+        if (emitters != null)
+        {
+            for (int i = 0; i < emitters.Length; i++)
+            {
+                Emitter e = emitters[i];
+                if (e == null || !e.enabled || e.transform == null) continue;
+
+                totalCandidates++;
+                if (count >= MaxEmitters) continue;
+
+                emitterCPUCache[count] = new EmitterGPU
+                {
+                    center = (e.transform.position - origin) / cellSize,
+                    radius = e.radius / cellSize,
+                    emitRate = e.smokeRate,
+                    fireRate = e.fireRate,
+                };
+                count++;
+            }
+        }
+
+        if (totalCandidates > MaxEmitters && !loggedOverflowOnce)
+        {
+            Debug.LogWarning($"[SmokeSim] More than {MaxEmitters} active emitters -- extras ignored.");
+            loggedOverflowOnce = true;
+        }
+        else if (totalCandidates <= MaxEmitters)
+        {
+            loggedOverflowOnce = false;
+        }
+
+        emitterBuffer.SetData(emitterCPUCache);
+        compute.SetBuffer(kEmit, "Emitters", emitterBuffer);
+        compute.SetBuffer(kEmitFire, "Emitters", emitterBuffer);
+        compute.SetInt("EmitterCount", count);
     }
 
     void DispatchEmit()
     {
-        if (emitter == null) return;
-
-        compute.SetFloat("EmitRate", emitRate);
         compute.SetFloat("FireToSmokeRate", fireToSmokeRate);
 
         compute.SetTexture(kEmit, "SmokeIn", smokeA);
@@ -160,23 +224,19 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("SettleSpeed", settleSpeed);
         compute.SetFloat("CeilingSpread", ceilingSpread);
         compute.SetFloat("DecayRate", decayRate);
+        compute.SetFloat("SmokeNoiseScale", smokeNoiseScale);
+        compute.SetFloat("SmokeNoiseStrength", smokeNoiseStrength);
+        compute.SetFloat("SmokeNoiseSpeed", smokeNoiseSpeed);
 
         compute.SetTexture(kStep, "SmokeIn", smokeA);
         compute.SetTexture(kStep, "SmokeOut", smokeB);
         compute.SetTexture(kStep, "Obstacle", obstacle);
-        compute.SetFloat("SmokeNoiseScale", smokeNoiseScale);
-        compute.SetFloat("SmokeNoiseStrength", smokeNoiseStrength);
-        compute.SetFloat("SmokeNoiseSpeed", smokeNoiseSpeed);
         Dispatch(kStep);
         Swap(ref smokeA, ref smokeB);
     }
 
     void DispatchEmitFire()
     {
-        if (emitter == null) return;
-
-        compute.SetFloat("FireEmitRate", fireEmitRate);
-
         compute.SetTexture(kEmitFire, "FireIn", fireA);
         compute.SetTexture(kEmitFire, "FireOut", fireB);
         compute.SetTexture(kEmitFire, "Obstacle", obstacle);
@@ -189,15 +249,13 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("FireRiseSpeed", fireRiseSpeed);
         compute.SetFloat("FireDecayRate", fireDecayRate);
         compute.SetFloat("FireCeilingSpread", fireCeilingSpread);
-
-        compute.SetTexture(kStepFire, "FireIn", fireA);
-        compute.SetTexture(kStepFire, "FireOut", fireB);
-        compute.SetTexture(kStepFire, "Obstacle", obstacle);
-
         compute.SetFloat("FireNoiseScale", fireNoiseScale);
         compute.SetFloat("FireNoiseStrength", fireNoiseStrength);
         compute.SetFloat("FireNoiseSpeed", fireNoiseSpeed);
 
+        compute.SetTexture(kStepFire, "FireIn", fireA);
+        compute.SetTexture(kStepFire, "FireOut", fireB);
+        compute.SetTexture(kStepFire, "Obstacle", obstacle);
         Dispatch(kStepFire);
         Swap(ref fireA, ref fireB);
     }
@@ -292,16 +350,22 @@ public class SmokeSim : MonoBehaviour
         if (fireA != null) fireA.Release();
         if (fireB != null) fireB.Release();
         if (obstacle != null) obstacle.Release();
+        if (emitterBuffer != null) emitterBuffer.Release();
     }
 
     void OnDrawGizmos()
     {
         Gizmos.color = new Color(0f, 1f, 1f, 0.4f);
         Gizmos.DrawWireCube(volumeCenter, volumeSize);
-        if (emitter != null)
+
+        if (emitters == null) return;
+        foreach (var e in emitters)
         {
-            Gizmos.color = new Color(1f, 0.3f, 0f, 1f);
-            Gizmos.DrawWireSphere(emitter.position, emitRadius);
+            if (e == null || e.transform == null) continue;
+            Gizmos.color = e.enabled
+                ? new Color(1f, 0.3f, 0f, 1f)
+                : new Color(0.4f, 0.4f, 0.4f, 0.5f);
+            Gizmos.DrawWireSphere(e.transform.position, e.radius);
         }
     }
 }

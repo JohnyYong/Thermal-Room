@@ -19,10 +19,18 @@ int3   GridSize;
 float  DeltaTime;
 float  Time_;
 
-// Emission (shared position for smoke and fire).
-float3 EmitCenter;
-float  EmitRadius;
-float  EmitRate;
+// Per-emitter data uploaded as a StructuredBuffer -- supports any number
+// of active fire sources sharing the same sim grid.
+struct EmitterData
+{
+    float3 center;      // voxel space
+    float  radius;      // voxel space
+    float  emitRate;    // smoke density added per second at center
+    float  fireRate;    // fire density set per tick (max'd, not added)
+};
+
+StructuredBuffer<EmitterData> Emitters;
+int EmitterCount;
 
 // Smoke physics.
 float  RiseSpeed;
@@ -31,16 +39,15 @@ float  CeilingSpread;
 float  DecayRate;
 
 // Fire physics.
-float  FireEmitRate;
 float  FireRiseSpeed;
 float  FireDecayRate;
 float  FireToSmokeRate;
 float  FireCeilingSpread;
 
 // Noise turbulence.
-float FireNoiseScale;      // how "fine" the noise is (higher = smaller swirls)
-float FireNoiseStrength;   // how far the sample can be offset in voxels
-float FireNoiseSpeed;      // how fast the pattern flows over time
+float FireNoiseScale;
+float FireNoiseStrength;
+float FireNoiseSpeed;
 float SmokeNoiseScale;
 float SmokeNoiseStrength;
 float SmokeNoiseSpeed;
@@ -70,25 +77,16 @@ float ReadFire(int3 p)
     return FireIn[p];
 }
 
-// Cheap pseudo-random per voxel + time. Used for flicker & turbulence.
 float Hash3(float3 p)
 {
     return frac(sin(dot(p, float3(12.9898, 78.233, 37.719))) * 43758.5453);
 }
-// -------------------------------------------------------------------
-// Value noise + fractal Brownian motion. This gives smoothly-varying
-// per-voxel turbulence with coherent swirls, unlike the raw Hash3 which
-// just jitters each voxel independently (looks like TV static).
-//
-// We animate it by shifting the sample position with Time_, so the
-// noise "flows" through the volume -- a much more organic feel than
-// randomizing each frame independently.
 
+// Value noise + fractal Brownian motion.
 float ValueNoise(float3 p)
 {
     float3 i = floor(p);
     float3 f = frac(p);
-    // Smoothstep-style interpolation curve for softer transitions.
     f = f * f * (3.0 - 2.0 * f);
 
     float n000 = Hash3(i + float3(0, 0, 0));
@@ -109,9 +107,6 @@ float ValueNoise(float3 p)
     return lerp(y0, y1, f.z);
 }
 
-// Fractal Brownian motion: sum multiple octaves of noise at increasing
-// frequencies and decreasing amplitudes. Gives us both big slow swirls
-// AND fine wispy details in the same field.
 float FBM(float3 p)
 {
     float total = 0.0;
@@ -123,27 +118,26 @@ float FBM(float3 p)
         freq *= 2.1;
         amp  *= 0.5;
     }
-    return total; // approx [0, 1]
+    return total;
 }
 
-// A 3D noise-based velocity offset. Returns a value in roughly [-1, 1]
-// per axis. Different seeds per axis so the offset isn't the same in
-// all directions. Animated over time so the pattern flows.
+// Noise-based velocity offset. Biased upward and vertically stretched so
+// eddies look like rising flame streaks rather than round spinning blobs.
 float3 NoiseVelocity(float3 p, float scale, float speed)
 {
-    float3 q = p * scale + float3(Time_ * speed * 0.7,
-                                  Time_ * speed,
-                                  Time_ * speed * 0.9);
+    float3 stretchedP = float3(p.x, p.y * 0.4, p.z);
 
-    // Differencing two independent FBM samples guarantees zero mean --
-    // any constant bias cancels out. Also gives more organic swirls
-    // than single-sample noise.
+    float3 q = stretchedP * scale + float3(Time_ * speed *  0.3,
+                                            Time_ * speed * -2.0,
+                                            Time_ * speed *  0.3);
+
     float ax = FBM(q + float3(  0.0,   0.0,   0.0)) - FBM(q + float3( 47.3,  91.7,  13.1));
     float ay = FBM(q + float3(101.9,  17.3,  61.5)) - FBM(q + float3(-33.7,  55.9, -22.1));
     float az = FBM(q + float3( 71.1,  29.4, 143.2)) - FBM(q + float3( 12.5, -87.3,  99.4));
 
-    return float3(ax, ay, az) * 2.0;  // scale to roughly [-1, 1] range
+    return float3(ax, ay, az) * 2.0;
 }
+
 // -------------------------------------------------------------------
 
 [numthreads(8,8,8)]
@@ -169,18 +163,25 @@ void Emit(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    // Base emission at the source ball.
     float3 p = float3(id) + 0.5;
-    float d = distance(p, EmitCenter);
-    float w = saturate(1.0 - d / max(EmitRadius, 0.0001));
 
-    if (w > 0)
+    // Contributions from every active emitter. Squared-distance early-out
+    // skips the sqrt when clearly outside the ball -- cheap perf win when
+    // you have many emitters and most voxels are far from all of them.
+    for (int i = 0; i < EmitterCount; i++)
     {
-        current += EmitRate * DeltaTime * w;
+        EmitterData e = Emitters[i];
+        float3 diff = p - e.center;
+        float distSq = dot(diff, diff);
+        float rSq = e.radius * e.radius;
+        if (distSq >= rSq) continue;
+
+        float d = sqrt(distSq);
+        float w = 1.0 - d / max(e.radius, 0.0001);
+        current += e.emitRate * DeltaTime * w;
     }
 
-    // Any voxel that's actively on fire also produces smoke, so smoke
-    // follows the fire's shape naturally.
+    // Burning voxels also produce smoke, regardless of source.
     float fireHere = FireIn[id];
     if (fireHere > 0.01)
     {
@@ -203,32 +204,37 @@ void Step(uint3 id : SV_DispatchThreadID)
 
     int3 c = int3(id);
 
-    float here = SmokeIn[id];
-
+    // Sample noise for this voxel's turbulence direction.
     float3 pp = float3(id) + 0.5;
     float3 noise = NoiseVelocity(pp, SmokeNoiseScale, SmokeNoiseSpeed);
 
-    float offX = clamp(noise.x * SmokeNoiseStrength, -1.5, 1.5);
-    float offZ = clamp(noise.z * SmokeNoiseStrength, -1.5, 1.5);
+    // Shell warp: read `here` from a noise-displaced position so smoke's
+    // outline wobbles, matching Kelvin-Helmholtz billowing behaviour.
+    float offX = clamp(noise.x * SmokeNoiseStrength, -2.0, 2.0);
+    float offY = clamp(noise.y * SmokeNoiseStrength * 0.5, -1.0, 1.0);
+    float offZ = clamp(noise.z * SmokeNoiseStrength, -2.0, 2.0);
 
-    int3 sampleVoxel = c + int3((int)round(offX), -1, (int)round(offZ));
-    float noiseBelow = ReadSmoke(sampleVoxel);
+    int3 herePos = c + int3((int)round(offX), (int)round(offY), (int)round(offZ));
+    float here = ReadSmoke(herePos);
+
+    // Rise sample: pull from below with lighter noise offset, blended with
+    // straight-below so we always have some vertical component regardless
+    // of what the noise says this frame.
+    int3 belowPos = c + int3((int)round(offX * 0.7), -1, (int)round(offZ * 0.7));
+    float noiseBelow = ReadSmoke(belowPos);
     float straightBelow = ReadSmoke(c + int3(0, -1, 0));
-
     float below = noiseBelow * 0.5 + straightBelow * 0.5;
+
     float above = ReadSmoke(c + int3(0, 1, 0));
 
     bool ceilingAbove = IsSolid(c + int3(0,  1, 0));
     bool floorBelow   = IsSolid(c + int3(0, -1, 0));
 
-    // Rise: smoke below flows up into us; we lose smoke upward (unless a
-    // ceiling blocks it).
     float riseIn  = below * RiseSpeed * DeltaTime;
     float riseOut = ceilingAbove ? 0.0 : here * RiseSpeed * DeltaTime;
 
-    // Settle: only applies to smoke that ISN'T in an active rising column.
-    // Distinguishes "middle of plume" (don't settle) from "outer edges of
-    // ceiling layer" (do settle -> layer thickens downward over time).
+    // Settle only where we're NOT in an active rising column, so the plume
+    // rises cleanly while outer edges of the ceiling layer drift down.
     bool activeRisingColumn = (below > here * 0.5);
     float settleIn = 0.0;
     float settleOut = 0.0;
@@ -238,9 +244,8 @@ void Step(uint3 id : SV_DispatchThreadID)
         settleOut = floorBelow ? 0.0 : here * SettleSpeed * DeltaTime;
     }
 
-    // Horizontal ceiling spread: applies to the row just under a ceiling
-    // AND rows below it that have smoke overhead. This is what lets the
-    // ceiling layer THICKEN downward rather than being a single sheet.
+    // Horizontal ceiling spread: applies to the row under a ceiling AND
+    // rows below with smoke above -- lets the layer thicken downward.
     float horizontal = 0.0;
     bool inLayer = ceilingAbove || (above > 0.1);
     if (inLayer)
@@ -285,19 +290,27 @@ void EmitFire(uint3 id : SV_DispatchThreadID)
     }
 
     float3 p = float3(id) + 0.5;
-    float d = distance(p, EmitCenter);
-    float w = saturate(1.0 - d / max(EmitRadius, 0.0001));
 
-    if (w > 0)
+    // Contributions from every emitter -- taking the MAX rather than sum
+    // so overlapping fires don't create abnormally bright cores. Per-emitter
+    // phase offset makes multiple fires flicker independently.
+    for (int i = 0; i < EmitterCount; i++)
     {
-        // Flicker: emit intensity varies over time with per-voxel randomness,
-        // so the fire base pulses irregularly instead of being a steady blob.
-        // This is what makes it read as "fire" rather than orange gas.
-        float flickerA = sin(Time_ * 12.0 + Hash3(p) * 6.28) * 0.5 + 0.5;
-        float flickerB = sin(Time_ * 7.3 + Hash3(p + 100) * 6.28) * 0.5 + 0.5;
+        EmitterData e = Emitters[i];
+        float3 diff = p - e.center;
+        float distSq = dot(diff, diff);
+        float rSq = e.radius * e.radius;
+        if (distSq >= rSq) continue;
+
+        float d = sqrt(distSq);
+        float w = 1.0 - d / max(e.radius, 0.0001);
+
+        float phase = float(i) * 1.7;
+        float flickerA = sin(Time_ * 12.0 + Hash3(p) * 6.28 + phase) * 0.5 + 0.5;
+        float flickerB = sin(Time_ * 7.3  + Hash3(p + 100) * 6.28 + phase) * 0.5 + 0.5;
         float flicker = 0.6 + 0.4 * flickerA * flickerB;
 
-        current = max(current, w * flicker);
+        current = max(current, w * flicker * e.fireRate);
     }
 
     FireOut[id] = saturate(current);
@@ -316,28 +329,21 @@ void StepFire(uint3 id : SV_DispatchThreadID)
 
     int3 c = int3(id);
 
-    // Sample noise for THIS voxel's turbulence direction.
     float3 p = float3(id) + 0.5;
     float3 noise = NoiseVelocity(p, FireNoiseScale, FireNoiseSpeed);
 
-    // Instead of only offsetting the "pull from below" sample, we compute
-    // this voxel's density by sampling fire from a NOISE-DISPLACED position
-    // and treating that as "what would be here if turbulence advected the
-    // fire pattern by this offset". This makes the visible fire outline
-    // itself wobble, not just the interior.
+    // Shell warp for fire outline wobble.
     float offX = clamp(noise.x * FireNoiseStrength, -2.0, 2.0);
     float offY = clamp(noise.y * FireNoiseStrength * 0.5, -1.0, 1.0);
     float offZ = clamp(noise.z * FireNoiseStrength, -2.0, 2.0);
 
-    // "Here after noise displacement" -- this is the shell wobble.
     int3 herePos = c + int3((int)round(offX), (int)round(offY), (int)round(offZ));
     float here = ReadFire(herePos);
 
-    // Standard rise: pull from below, also noise-perturbed.
     int3 belowPos = c + int3((int)round(offX * 0.7), -1, (int)round(offZ * 0.7));
-    float below = ReadFire(belowPos);
+    float noiseBelow = ReadFire(belowPos);
     float straightBelow = ReadFire(c + int3(0, -1, 0));
-    below = below * 0.6 + straightBelow * 0.4;
+    float below = noiseBelow * 0.6 + straightBelow * 0.4;
 
     bool ceilingAbove = IsSolid(c + int3(0, 1, 0));
 
