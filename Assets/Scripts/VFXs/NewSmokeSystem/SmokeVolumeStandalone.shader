@@ -30,6 +30,13 @@ Shader "Custom/SmokeVolumeStandalone"
             HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag
+
+            // Enables stereo instancing so this shader runs once per vertex/
+            // fragment across BOTH eyes on Quest. Without this the shader
+            // renders to one eye only, leaving the other blank.
+            #pragma multi_compile_instancing
+            #pragma instancing_options renderinglayer
+
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
 
@@ -47,17 +54,30 @@ Shader "Custom/SmokeVolumeStandalone"
 
             float _StepCount;
 
-            struct appdata { float4 vertex : POSITION; };
+            struct appdata
+            {
+                float4 vertex : POSITION;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+            };
             struct v2f
             {
                 float4 pos      : SV_POSITION;
                 float3 localPos : TEXCOORD0;
                 float4 screenPos: TEXCOORD1;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+                UNITY_VERTEX_OUTPUT_STEREO
             };
 
             v2f vert(appdata v)
             {
                 v2f o;
+
+                // Required for stereo -- sets up the eye index so subsequent
+                // matrix multiplications use the correct per-eye view/proj.
+                UNITY_SETUP_INSTANCE_ID(v);
+                UNITY_TRANSFER_INSTANCE_ID(v, o);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
+
                 o.pos = TransformObjectToHClip(v.vertex.xyz);
                 o.localPos = v.vertex.xyz + 0.5;
                 o.screenPos = ComputeScreenPos(o.pos);
@@ -84,6 +104,12 @@ Shader "Custom/SmokeVolumeStandalone"
 
             float4 frag(v2f i) : SV_Target
             {
+                // Required in the fragment shader too -- otherwise camera
+                // pos and view matrices resolve to whichever eye was last
+                // set globally, breaking the second eye.
+                UNITY_SETUP_INSTANCE_ID(i);
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
+
                 float3 ro = mul(unity_WorldToObject, float4(_WorldSpaceCameraPos, 1)).xyz + 0.5;
                 float3 rd = normalize(i.localPos - ro);
 
@@ -95,7 +121,9 @@ Shader "Custom/SmokeVolumeStandalone"
                 int   steps  = (int)_StepCount;
                 float step   = travel / steps;
 
-                // Scene depth for per-step occlusion check.
+                // Per-eye scene depth sample. SampleSceneDepth already
+                // handles the stereo texture array under the hood when
+                // the shader is compiled with instancing support.
                 float2 sceneUV = i.screenPos.xy / i.screenPos.w;
                 float rawSceneDepth = SampleSceneDepth(sceneUV);
                 float sceneEyeDepth = LinearEyeDepth(rawSceneDepth, _ZBufferParams);
@@ -107,16 +135,10 @@ Shader "Custom/SmokeVolumeStandalone"
                 [loop]
                 for (int s = 0; s < steps; s++)
                 {
-                    // Per-step depth check: convert this sample's world
-                    // position to eye depth and skip if it's behind a wall.
-                    // This handles all camera positions correctly (inside
-                    // the volume, outside, near walls) without upfront math.
                     float3 sampleLocal = pos - 0.5;
                     float3 sampleWorld = mul(unity_ObjectToWorld, float4(sampleLocal, 1)).xyz;
                     float sampleEyeDepth = -TransformWorldToView(sampleWorld).z;
 
-                    // 0.02 tolerance avoids z-fighting artifacts right at
-                    // the wall surface.
                     if (sampleEyeDepth > sceneEyeDepth + 0.02)
                     {
                         pos += rd * step;
