@@ -107,7 +107,6 @@ public class ThermalPositionToggle : MonoBehaviour
             yield return null;
         }
 
-        // Snap exactly at the end to avoid float drift
         transform.position = target.position;
         if (matchRotation) transform.rotation = target.rotation;
     }

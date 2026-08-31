@@ -3,6 +3,7 @@
 #pragma kernel EmitFire
 #pragma kernel StepFire
 #pragma kernel Clear
+#pragma kernel CopyVolumeToBuffer //Mainly for debugging
 
 // --- Smoke field ---
 Texture3D<float>    SmokeIn;
@@ -14,6 +15,15 @@ RWTexture3D<float>  FireOut;
 
 // Solid geometry.
 Texture3D<float>    Obstacle;
+
+// --- Wind ---
+float3 WindDirection;
+float WindStrength;
+
+// --- Fire/Vent attraction point ---
+float3 AttractorCenter;
+float AttractorRadius;
+float AttractorStrength;
 
 int3   GridSize;
 float  DeltaTime;
@@ -190,7 +200,6 @@ void Emit(uint3 id : SV_DispatchThreadID)
 
     SmokeOut[id] = saturate(current);
 }
-
 [numthreads(8,8,8)]
 void Step(uint3 id : SV_DispatchThreadID)
 {
@@ -208,19 +217,39 @@ void Step(uint3 id : SV_DispatchThreadID)
     float3 pp = float3(id) + 0.5;
     float3 noise = NoiseVelocity(pp, SmokeNoiseScale, SmokeNoiseSpeed);
 
+    float3 windOffset = WindDirection * WindStrength;
+
+    float3 attractorOffset = 0;
+    if (AttractorStrength > 0.0)
+    {
+        float3 toAttractor = AttractorCenter - pp;
+        float distAtt = length(toAttractor);
+        if (distAtt > 0.001)
+        {
+            float pull = saturate(1.0 - distAtt / max(AttractorRadius, 0.0001));
+            attractorOffset = normalize(toAttractor) * pull * AttractorStrength;
+        }
+    }
+
+    float3 combinedOffset = noise * SmokeNoiseStrength + windOffset + attractorOffset;
+
     // Shell warp: read `here` from a noise-displaced position so smoke's
     // outline wobbles, matching Kelvin-Helmholtz billowing behaviour.
-    float offX = clamp(noise.x * SmokeNoiseStrength, -2.0, 2.0);
-    float offY = clamp(noise.y * SmokeNoiseStrength * 0.5, -1.0, 1.0);
-    float offZ = clamp(noise.z * SmokeNoiseStrength, -2.0, 2.0);
+    // NOTE: subtract the offset -- we're doing backward (semi-Lagrangian)
+    // sampling, so a voxel wanting to move by +offset must READ from -offset.
+    float offX = clamp(combinedOffset.x, -2.5, 2.5);
+    float offY = clamp(combinedOffset.y * 0.5, -1.5, 1.5);
+    float offZ = clamp(combinedOffset.z, -2.5, 2.5);
 
-    int3 herePos = c + int3((int)round(offX), (int)round(offY), (int)round(offZ));
+    int3 herePos = c - int3((int)round(offX), (int)round(offY), (int)round(offZ));
     float here = ReadSmoke(herePos);
 
     // Rise sample: pull from below with lighter noise offset, blended with
     // straight-below so we always have some vertical component regardless
-    // of what the noise says this frame.
-    int3 belowPos = c + int3((int)round(offX * 0.7), -1, (int)round(offZ * 0.7));
+    // of what the noise says this frame. Horizontal noise offset is also
+    // inverted here for the same backward-sampling reason; the vertical
+    // "-1" (straight down) is NOT flipped -- that's the rise mechanic.
+    int3 belowPos = c + int3(-(int)round(offX * 0.7), -1, -(int)round(offZ * 0.7));
     float noiseBelow = ReadSmoke(belowPos);
     float straightBelow = ReadSmoke(c + int3(0, -1, 0));
     float below = noiseBelow * 0.5 + straightBelow * 0.5;
@@ -272,7 +301,6 @@ void Step(uint3 id : SV_DispatchThreadID)
     result *= (1.0 - DecayRate * DeltaTime);
     SmokeOut[id] = saturate(max(result, 0.0));
 }
-
 // -------------------------------------------------------------------
 // FIRE PIPELINE
 
@@ -315,7 +343,6 @@ void EmitFire(uint3 id : SV_DispatchThreadID)
 
     FireOut[id] = saturate(current);
 }
-
 [numthreads(8,8,8)]
 void StepFire(uint3 id : SV_DispatchThreadID)
 {
@@ -332,15 +359,32 @@ void StepFire(uint3 id : SV_DispatchThreadID)
     float3 p = float3(id) + 0.5;
     float3 noise = NoiseVelocity(p, FireNoiseScale, FireNoiseSpeed);
 
-    // Shell warp for fire outline wobble.
-    float offX = clamp(noise.x * FireNoiseStrength, -2.0, 2.0);
-    float offY = clamp(noise.y * FireNoiseStrength * 0.5, -1.0, 1.0);
-    float offZ = clamp(noise.z * FireNoiseStrength, -2.0, 2.0);
+    float3 windOffset = WindDirection * WindStrength;
 
-    int3 herePos = c + int3((int)round(offX), (int)round(offY), (int)round(offZ));
+    float3 attractorOffset = 0;
+    if (AttractorStrength > 0.0)
+    {
+        float3 toAttractor = AttractorCenter - p;
+        float distAtt = length(toAttractor);
+        if (distAtt > 0.001)
+        {
+            float pull = saturate(1.0 - distAtt / max(AttractorRadius, 0.0001));
+            attractorOffset = normalize(toAttractor) * pull * AttractorStrength * 0.5;
+        }
+    }
+
+    float3 combinedOffset = noise * FireNoiseStrength + windOffset + attractorOffset;
+
+    // Shell warp for fire outline wobble.
+    // NOTE: same backward-sampling correction as Step -- subtract, don't add.
+    float offX = clamp(combinedOffset.x, -2.5, 2.5);
+    float offY = clamp(combinedOffset.y * 0.5, -1.5, 1.5);
+    float offZ = clamp(combinedOffset.z, -2.5, 2.5);
+
+    int3 herePos = c - int3((int)round(offX), (int)round(offY), (int)round(offZ));
     float here = ReadFire(herePos);
 
-    int3 belowPos = c + int3((int)round(offX * 0.7), -1, (int)round(offZ * 0.7));
+    int3 belowPos = c + int3(-(int)round(offX * 0.7), -1, -(int)round(offZ * 0.7));
     float noiseBelow = ReadFire(belowPos);
     float straightBelow = ReadFire(c + int3(0, -1, 0));
     float below = noiseBelow * 0.6 + straightBelow * 0.4;
@@ -373,4 +417,21 @@ void StepFire(uint3 id : SV_DispatchThreadID)
     result *= (1.0 - FireDecayRate * DeltaTime);
 
     FireOut[id] = saturate(max(result, 0.0));
+}
+
+// AsyncGPUReadback.Request on a Tex3D returns only z=0 on many backends.
+// To read a full volume reliably, copy it to a linear StructuredBuffer
+// first (buffers don't have this limitation), then read the buffer.
+Texture3D<float>          CopySource;
+RWStructuredBuffer<float> CopyDest;
+int3                      CopyDims;
+
+[numthreads(8,8,4)]
+void CopyVolumeToBuffer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)CopyDims.x || id.y >= (uint)CopyDims.y || id.z >= (uint)CopyDims.z)
+        return;
+
+    int index = id.x + CopyDims.x * (id.y + CopyDims.y * id.z);
+    CopyDest[index] = CopySource[id];
 }

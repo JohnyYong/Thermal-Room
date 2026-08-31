@@ -6,6 +6,7 @@ using UnityEngine;
 [ExecuteAlways]
 public class SmokeSim : MonoBehaviour
 {
+
     [System.Serializable]
     public class Emitter
     {
@@ -68,6 +69,52 @@ public class SmokeSim : MonoBehaviour
     [Header("Rendering")]
     public Material smokeMaterial;
 
+    //Wind Direction and flow
+    public enum WindPreset
+    {
+        None,
+        North,          // +Z
+        South,          // -Z
+        East,           // +X
+        West,           // -X
+        Up,             // +Y (rare — updraft)
+        Down,           // -Y (rare — downdraft)
+        NorthEast,
+        NorthWest,
+        SouthEast,
+        SouthWest,
+        Custom          // use windDirectionCustom instead
+    }
+
+    [Header("Wind & Attractor")]
+    [Tooltip("Which direction the wind blows. Pick a compass direction or Custom for a specific vector.")]
+    public WindPreset windDirection = WindPreset.None;
+    public float windStrength = 0f;
+    public Vector3 windDirectionCustom = Vector3.zero;
+
+    public Transform attractorPoint;
+    public float attractorRadius = 5f;
+    public float attractorStrength = 0f;
+
+    Vector3 GetWindVector()
+    {
+        switch (windDirection)
+        {
+            case WindPreset.North: return new Vector3(0, 0, 1);
+            case WindPreset.South: return new Vector3(0, 0, -1);
+            case WindPreset.East: return new Vector3(1, 0, 0);
+            case WindPreset.West: return new Vector3(-1, 0, 0);
+            case WindPreset.Up: return new Vector3(0, 1, 0);
+            case WindPreset.Down: return new Vector3(0, -1, 0);
+            case WindPreset.NorthEast: return new Vector3(1, 0, 1).normalized;
+            case WindPreset.NorthWest: return new Vector3(-1, 0, 1).normalized;
+            case WindPreset.SouthEast: return new Vector3(1, 0, -1).normalized;
+            case WindPreset.SouthWest: return new Vector3(-1, 0, -1).normalized;
+            case WindPreset.Custom: return windDirectionCustom;
+            default: return Vector3.zero;
+        }
+    }
+
     // ---- internals ----
     int gridX, gridY, gridZ;
     Vector3 origin;
@@ -80,6 +127,8 @@ public class SmokeSim : MonoBehaviour
     bool initialized;
 
     ComputeBuffer emitterBuffer;
+    int kCopyVolume = -1;
+    ComputeBuffer volumeReadBuffer;
     EmitterGPU[] emitterCPUCache;
     bool loggedOverflowOnce;
 
@@ -117,6 +166,8 @@ public class SmokeSim : MonoBehaviour
         kEmitFire = compute.FindKernel("EmitFire");
         kStepFire = compute.FindKernel("StepFire");
         kClear = compute.FindKernel("Clear");
+        kCopyVolume = compute.FindKernel("CopyVolumeToBuffer");
+        volumeReadBuffer = new ComputeBuffer(gridX * gridY * gridZ, sizeof(float));
 
         smokeA = MakeVolume();
         smokeB = MakeVolume();
@@ -150,6 +201,7 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("DeltaTime", dt);
         compute.SetFloat("Time_", Time.time);
 
+        UploadDirectionalParams();
         BuildEmitterBuffer();
 
         DispatchEmitFire();
@@ -351,6 +403,30 @@ public class SmokeSim : MonoBehaviour
         if (fireB != null) fireB.Release();
         if (obstacle != null) obstacle.Release();
         if (emitterBuffer != null) emitterBuffer.Release();
+        if (volumeReadBuffer != null) volumeReadBuffer.Release();
+    }
+
+    void UploadDirectionalParams()
+    {
+        Vector3 raw = GetWindVector();
+        Vector3 wind = raw.sqrMagnitude > 0.001f ? raw.normalized : Vector3.zero;
+
+        compute.SetFloats("WindDirection", wind.x, wind.y, wind.z);
+        compute.SetFloat("WindStrength", windStrength);
+
+        if (attractorPoint != null && attractorStrength > 0f)
+        {
+            Vector3 attVoxel = (attractorPoint.position - origin) / cellSize;
+            compute.SetFloats("AttractorCenter", attVoxel.x, attVoxel.y, attVoxel.z);
+            compute.SetFloat("AttractorRadius", attractorRadius / cellSize);
+            compute.SetFloat("AttractorStrength", attractorStrength);
+        }
+        else
+        {
+            compute.SetFloats("AttractorCenter", 0, 0, 0);
+            compute.SetFloat("AttractorRadius", 1f);
+            compute.SetFloat("AttractorStrength", 0f);
+        }
     }
 
     void OnDrawGizmos()
@@ -358,14 +434,75 @@ public class SmokeSim : MonoBehaviour
         Gizmos.color = new Color(0f, 1f, 1f, 0.4f);
         Gizmos.DrawWireCube(volumeCenter, volumeSize);
 
-        if (emitters == null) return;
-        foreach (var e in emitters)
+        if (emitters != null)
         {
-            if (e == null || e.transform == null) continue;
-            Gizmos.color = e.enabled
-                ? new Color(1f, 0.3f, 0f, 1f)
-                : new Color(0.4f, 0.4f, 0.4f, 0.5f);
-            Gizmos.DrawWireSphere(e.transform.position, e.radius);
+            foreach (var e in emitters)
+            {
+                if (e == null || e.transform == null) continue;
+                Gizmos.color = e.enabled
+                    ? new Color(1f, 0.3f, 0f, 1f)
+                    : new Color(0.4f, 0.4f, 0.4f, 0.5f);
+                Gizmos.DrawWireSphere(e.transform.position, e.radius);
+            }
+        }
+
+        if (attractorPoint != null && attractorStrength > 0f)
+        {
+            Gizmos.color = new Color(0.2f, 0.5f, 1f, 0.8f);
+            Gizmos.DrawWireSphere(attractorPoint.position, attractorRadius);
+            Gizmos.DrawLine(volumeCenter, attractorPoint.position);
+        }
+
+        if (windStrength > 0f)
+        {
+            Vector3 windDir = GetWindVector();
+            if (windDir.sqrMagnitude > 0.001f)
+            {
+                windDir = windDir.normalized;
+                Gizmos.color = new Color(0.5f, 1f, 0.5f, 0.8f);
+                Vector3 arrowStart = volumeCenter;
+                Vector3 arrowEnd = volumeCenter + windDir * (1f + windStrength * 0.5f);
+                Gizmos.DrawLine(arrowStart, arrowEnd);
+                Gizmos.DrawWireSphere(arrowEnd, 0.15f);
+            }
         }
     }
+
+
+    //For debug
+    // Reads any 3D scalar volume back to the CPU with the full depth.
+    // Avoids AsyncGPUReadback's z=0-only bug on Tex3D by copying into a
+    // linear ComputeBuffer first, then reading the buffer.
+    public void RequestVolumeReadback(RenderTexture volume, System.Action<Unity.Collections.NativeArray<float>> onComplete)
+    {
+        if (kCopyVolume < 0 || volumeReadBuffer == null)
+        {
+            Debug.LogWarning("[SmokeSim] Readback called before Init completed.");
+            return;
+        }
+
+        compute.SetTexture(kCopyVolume, "CopySource", volume);
+        compute.SetBuffer(kCopyVolume, "CopyDest", volumeReadBuffer);
+        compute.SetInts("CopyDims", gridX, gridY, gridZ);
+
+        compute.Dispatch(kCopyVolume,
+            Mathf.CeilToInt(gridX / 8f),
+            Mathf.CeilToInt(gridY / 8f),
+            Mathf.CeilToInt(gridZ / 4f));
+
+        UnityEngine.Rendering.AsyncGPUReadback.Request(volumeReadBuffer, req =>
+        {
+            if (req.hasError) { Debug.LogWarning("[SmokeSim] Readback error"); return; }
+            onComplete?.Invoke(req.GetData<float>());
+        });
+    }
+
+    // Expose grid info so debug tools don't need reflection.
+    public int GridX => gridX;
+    public int GridY => gridY;
+    public int GridZ => gridZ;
+    public Vector3 Origin => origin;
+    public RenderTexture ObstacleVolume => obstacle;
+    public RenderTexture SmokeVolume => smokeA;
+    public RenderTexture FireVolume => fireA;
 }
