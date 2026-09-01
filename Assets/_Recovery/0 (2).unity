@@ -659,62 +659,47 @@ MonoBehaviour:
   compute: {fileID: 7200000, guid: b90fe94c810075d42a66eaa1f5492951, type: 3}
   volumeCenter: {x: 0, y: 2.89, z: -3.65}
   volumeSize: {x: 10, y: 9.51, z: 13.7}
-  cellSize: 0.1
+  cellSize: 0.01
   obstacleLayers:
     serializedVersion: 2
     m_Bits: 4294967295
   ignoreTriggers: 1
-  openBoundaries: 1
   emitters:
   - transform: {fileID: 1226026637}
     radius: 1.2
-    smokeRate: 1
+    smokeRate: 3
     fireRate: 1
     enabled: 1
   - transform: {fileID: 1169297610}
     radius: 1.2
-    smokeRate: 1
+    smokeRate: 3
     fireRate: 1
     enabled: 1
   - transform: {fileID: 350887612}
     radius: 1.2
-    smokeRate: 1
+    smokeRate: 3
     fireRate: 1
     enabled: 1
   riseSpeed: 10
   settleSpeed: 1
   ceilingSpread: 12
-  decayRate: 0.03
-  smokeNoiseScale: 0.3
-  smokeNoiseStrength: 0.3
-  smokeNoiseSpeed: 0.35
-  smokeWarpClamp: 3
-  smokeShellSharpness: 2.5
+  decayRate: -1
+  smokeNoiseScale: 0.15
+  smokeNoiseStrength: 2.4
+  smokeNoiseSpeed: 1
+  smokeWarpClamp: 0.12
+  smokeShellSharpness: 4
   smokeAnchorRadius: 0.5
   smokeUseCurlNoise: 1
-  smokeDiffusion: 0.05
-  sootLuminousCutoff: 0.85
-  thermalSim: {fileID: 639519184}
-  matchThermalBounds: 1
-  velocityInfluence: 1
-  subGridBuoyancy: 0.4
-  fireCutoff: 0.15
-  flamePersistentHeight: 100
-  flameIntermittency: 3
-  useReactionSheet: 1
-  reactionSheetScale: 6
-  reactionSheetWeight: 0.5
-  flameGasTempC: 1000
-  ambientTempC: 20
   fireRiseSpeed: 8
-  fireDecayRate: 2
-  fireToSmokeRate: 0.5
+  fireDecayRate: 1
+  fireToSmokeRate: 0.25
   fireCeilingSpread: 5
-  fireNoiseScale: 0.3
-  fireNoiseStrength: 0.4
-  fireNoiseSpeed: 1.5
+  fireNoiseScale: 0.15
+  fireNoiseStrength: 2.4
+  fireNoiseSpeed: 1
   smokeMaterial: {fileID: 2100000, guid: 3852d5442683bbc4982d840fae93b82f, type: 2}
-  windDirection: 5
+  windDirection: 1
   windStrength: 1
   windDirectionCustom: {x: 0, y: 0, z: 0}
   attractorPoint: {fileID: 1036407983}
@@ -2230,7 +2215,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Unity.RenderPipelines.Core.Runtime::UnityEngine.Rendering.ProbeVolumePerSceneData
   serializedBakingSet: {fileID: 11400000, guid: 4e23f7fc6c6a9814e80754e5d8d0a45c, type: 2}
-  sceneGUID: e4c54d43c097c3349a7c1ea55cb7ef45
+  sceneGUID: 2f755e2c5a66e564aa56f9a170472509
   obsoleteAsset: {fileID: 0}
   obsoleteCellSharedDataAsset: {fileID: 0}
   obsoleteCellSupportDataAsset: {fileID: 0}
@@ -3114,16 +3099,12 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: cellSize
-      value: 0.2
+      value: 0.4
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: charRate
       value: 0.001
       objectReference: {fileID: 0}
-    - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
-      propertyPath: smokeSim
-      value: 
-      objectReference: {fileID: 55338654}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: firePower
       value: 1
@@ -3186,7 +3167,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: solidCoolingRate
-      value: 0.5
+      value: 0.015
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: vorticityStrength
@@ -3194,7 +3175,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: pressureIterations
-      value: 25
+      value: 40
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: smokeDiffusionRate
@@ -3234,7 +3215,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: smokeBuoyancyStrength
-      value: 1.5
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: solidHeatTransferRate

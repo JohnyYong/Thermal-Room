@@ -44,15 +44,25 @@ public class SmokeSim : MonoBehaviour
     public LayerMask obstacleLayers = ~0;
     public bool ignoreTriggers = true;
 
+    [Tooltip("When ON, the six faces of the sim grid are open air and smoke " +
+             "drains out of them. When OFF they act as solid walls, which " +
+             "makes the volume a sealed box that can only fill up. Turn OFF " +
+             "only if the grid is genuinely flush with real room geometry.")]
+    public bool openBoundaries = true;
+
     [Header("Emitters")]
     [Tooltip("One or more fire/smoke sources. Add as many as you need.")]
     public Emitter[] emitters = new Emitter[] { new Emitter() };
 
     [Header("Smoke")]
-    public float riseSpeed = 4.0f;
+    public float riseSpeed = 1.5f;
     public float settleSpeed = 1.0f;
     public float ceilingSpread = 3.0f;
-    public float decayRate = 0.005f;
+
+    [Tooltip("Fraction of density lost per second. This is the only thing " +
+             "removing smoke in a closed volume, so if the room fills up and " +
+             "stays full, raise this before touching anything else.")]
+    public float decayRate = 0.05f;
 
     [Header("Smoke Noise")]
     [Tooltip("Higher = smaller turbulence features. Must be small enough that " +
@@ -81,6 +91,77 @@ public class SmokeSim : MonoBehaviour
     [Tooltip("Use divergence-free curl noise for smoke. Costs ~2x the noise " +
              "evaluations but stops the plume silhouette breathing in and out.")]
     public bool smokeUseCurlNoise = true;
+
+    [Tooltip("Physical diffusion of soot. Small -- most spreading should come " +
+             "from the solver velocity field, not from this.")]
+    public float smokeDiffusion = 0.05f;
+
+    [Range(0f, 1f)]
+    [Tooltip("How strongly bright flame suppresses smoke production in its own " +
+             "cell. Soot inside the reaction zone is incandescent -- it is the " +
+             "flame's light, not an obstruction -- and only reads as opaque " +
+             "smoke once it cools downstream. Raise this if the fire is hidden " +
+             "behind its own smoke.")]
+    public float sootLuminousCutoff = 0.85f;
+
+    [Header("Thermal Coupling")]
+    [Tooltip("The ThermalSimulation whose Navier-Stokes solve drives this " +
+             "grid. Leave empty to fall back to noise-only transport.")]
+    public ThermalSimulation thermalSim;
+
+    [Tooltip("When ON, this sim adopts the thermal sim's world bounds exactly. " +
+             "The two grids MUST share a world origin or the thermal image " +
+             "will not line up with the visible fire. Leave this ON.")]
+    public bool matchThermalBounds = true;
+
+    [Range(0f, 1f)]
+    [Tooltip("How much of the solver's velocity field drives transport. " +
+             "1 = fully physics-driven. Lower it only for art direction.")]
+    public float velocityInfluence = 1.0f;
+
+    [Range(0f, 1f)]
+    [Tooltip("Buoyant acceleration added on this grid because the coarse " +
+             "solver cannot resolve a flame only a couple of its cells wide. " +
+             "0.3-0.5 is reasonable; 0 relies on the solver alone.")]
+    public float subGridBuoyancy = 0.4f;
+
+    [Header("Flame Appearance")]
+    [Tooltip("Per-second subtraction applied to the flame field. Keeps flame " +
+             "tips crisp instead of fading into haze.")]
+    public float fireCutoff = 0.15f;
+
+    [Tooltip("World-space extent of the continuously luminous zone above the " +
+             "fuel bed. Beyond this, flame survives only in intermittent " +
+             "pockets. Roughly the height at which a real flame stops being " +
+             "solid and starts flickering into detached tongues.")]
+    public float flamePersistentHeight = 0.8f;
+
+    [Tooltip("Extinction rate in the diluted region, 1/s. 0 gives a flame " +
+             "that burns continuously from the fuel to wherever it decays -- " +
+             "which looks like a gas burner. Raise it for a wood fire.")]
+    public float flameIntermittency = 3.0f;
+
+    [Tooltip("OFF renders the raw flame field, exactly as before the reaction " +
+             "sheet was added. Turn this OFF first when debugging a missing " +
+             "flame -- it takes the FireEmission kernel out of the path " +
+             "entirely, so you can tell a simulation problem from a shading one.")]
+    public bool useReactionSheet = false;
+
+    [Tooltip("How strongly the reaction-sheet weighting sharpens the flame " +
+             "into tongues. Higher = thinner sheets.")]
+    public float reactionSheetScale = 6.0f;
+
+    [Range(0f, 1f)]
+    [Tooltip("Blend between the raw flame volume (0) and pure reaction-sheet " +
+             "emission (1). 0.5 keeps a hot core with defined tongues.")]
+    public float reactionSheetWeight = 0.5f;
+
+    [Tooltip("Measured gas temperature of a hydrocarbon diffusion flame, deg C. " +
+             "Adiabatic is ~2000, but radiative loss and entrainment put the " +
+             "real measured value near 1000.")]
+    public float flameGasTempC = 1000f;
+
+    public float ambientTempC = 20f;
 
     [Header("Fire")]
     public float fireRiseSpeed = 6.0f;
@@ -150,7 +231,16 @@ public class SmokeSim : MonoBehaviour
     RenderTexture fireA, fireB;
     RenderTexture obstacle;
 
-    int kEmit, kStep, kEmitFire, kStepFire, kClear;
+    // Sheet-weighted copy of the flame field, used for rendering only.
+    // The simulation keeps stepping the physical field in fireA/fireB.
+    RenderTexture fireEmission;
+
+    // 1x1x1 float4 stand-in bound to CoarseVelocity when no ThermalSimulation
+    // is driving. Unity validates every referenced texture at dispatch time
+    // regardless of whether the shader path actually reads it.
+    RenderTexture fallbackVelocity;
+
+    int kEmit, kStep, kEmitFire, kStepFire, kClear, kFireEmission;
     bool initialized;
 
     ComputeBuffer emitterBuffer;
@@ -180,6 +270,22 @@ public class SmokeSim : MonoBehaviour
 
     void Init()
     {
+        // -----------------------------------------------------------------
+        // Grid alignment.
+        //
+        // Two simulations cannot agree unless they share a world-space
+        // origin. Everything downstream -- the fine->coarse box average,
+        // the coarse->fine velocity fetch, the thermal image lining up with
+        // the visible flame -- assumes fine voxel (i+0.5)*fineCell and
+        // coarse voxel (j+0.5)*coarseCell measure from the same point.
+        // -----------------------------------------------------------------
+        if (matchThermalBounds && thermalSim != null)
+        {
+            Bounds tb = thermalSim.SimBounds;
+            volumeCenter = tb.center;
+            volumeSize = tb.size;
+        }
+
         origin = volumeCenter - volumeSize * 0.5f;
 
         gridX = Mathf.Max(4, Mathf.CeilToInt(volumeSize.x / cellSize));
@@ -193,6 +299,7 @@ public class SmokeSim : MonoBehaviour
         kEmitFire = compute.FindKernel("EmitFire");
         kStepFire = compute.FindKernel("StepFire");
         kClear = compute.FindKernel("Clear");
+        kFireEmission = compute.FindKernel("FireEmission");
         kCopyVolume = compute.FindKernel("CopyVolumeToBuffer");
         volumeReadBuffer = new ComputeBuffer(gridX * gridY * gridZ, sizeof(float));
 
@@ -201,7 +308,16 @@ public class SmokeSim : MonoBehaviour
         fireA = MakeVolume();
         fireB = MakeVolume();
         obstacle = MakeVolume();
+        fireEmission = MakeVolume();
 
+        fallbackVelocity = new RenderTexture(1, 1, 0, RenderTextureFormat.ARGBFloat);
+        fallbackVelocity.dimension = UnityEngine.Rendering.TextureDimension.Tex3D;
+        fallbackVelocity.volumeDepth = 1;
+        fallbackVelocity.enableRandomWrite = true;
+        fallbackVelocity.wrapMode = TextureWrapMode.Clamp;
+        fallbackVelocity.Create();
+
+        ClearVolume(fireEmission);
         ClearVolume(smokeA);
         ClearVolume(smokeB);
         ClearVolume(fireA);
@@ -227,7 +343,9 @@ public class SmokeSim : MonoBehaviour
         compute.SetInts("GridSize", gridX, gridY, gridZ);
         compute.SetFloat("DeltaTime", dt);
         compute.SetFloat("Time_", Time.time);
+        compute.SetFloat("OpenBoundary", openBoundaries ? 1f : 0f);
 
+        UploadCouplingParams();
         UploadDirectionalParams();
         BuildEmitterBuffer();
 
@@ -235,6 +353,7 @@ public class SmokeSim : MonoBehaviour
         DispatchStepFire();
         DispatchEmit();
         DispatchStep();
+        DispatchFireEmission();
 
         BindRenderTextures();
     }
@@ -284,6 +403,8 @@ public class SmokeSim : MonoBehaviour
         compute.SetBuffer(kEmitFire, "Emitters", emitterBuffer);
         // Step now needs the emitter list too, for the near-source anchor ramp.
         compute.SetBuffer(kStep, "Emitters", emitterBuffer);
+        // StepFire reaches EmitterAnchor through TransportOffset as well.
+        compute.SetBuffer(kStepFire, "Emitters", emitterBuffer);
         compute.SetInt("EmitterCount", count);
     }
 
@@ -297,6 +418,69 @@ public class SmokeSim : MonoBehaviour
         compute.SetTexture(kEmit, "Obstacle", obstacle);
         Dispatch(kEmit);
         Swap(ref smokeA, ref smokeB);
+    }
+
+    // -------------------------------------------------------------------
+    // Everything the fine grid needs to know about the coarse solver.
+    //
+    // Velocity is exchanged in METRES PER SECOND. That is the only unit
+    // both grids can agree on, since they have different cell sizes -- a
+    // velocity in "voxels per second" means different things on each.
+    // -------------------------------------------------------------------
+    void UploadCouplingParams()
+    {
+        compute.SetFloat("CellSizeMeters", cellSize);
+        compute.SetFloat("SubGridBuoyancy", subGridBuoyancy);
+        compute.SetFloat("FlameGasTempK", flameGasTempC + 273.15f);
+        compute.SetFloat("AmbientTempK", ambientTempC + 273.15f);
+        compute.SetFloat("SmokeDiffusion", smokeDiffusion);
+        compute.SetFloat("SootLuminousCutoff", sootLuminousCutoff);
+        compute.SetFloat("FlamePersistentRadius", flamePersistentHeight / cellSize);
+        compute.SetFloat("FlameIntermittency", flameIntermittency);
+        compute.SetFloat("FireCutoff", fireCutoff);
+        compute.SetFloat("ReactionSheetScale", reactionSheetScale);
+        compute.SetFloat("ReactionSheetWeight", reactionSheetWeight);
+
+        RenderTexture coarseVel = null;
+        int cx = 1, cy = 1, cz = 1;
+        float coarseCell = cellSize;
+
+        if (thermalSim != null && thermalSim.IsInitialized)
+        {
+            coarseVel = thermalSim.GetVelocityVolume();
+            thermalSim.GetGridSize(out cx, out cy, out cz);
+            coarseCell = thermalSim.CellSizePublic;
+        }
+
+        if (coarseVel != null)
+        {
+            compute.SetTexture(kStep, "CoarseVelocity", coarseVel);
+            compute.SetTexture(kStepFire, "CoarseVelocity", coarseVel);
+            compute.SetInts("CoarseGridSize", cx, cy, cz);
+            compute.SetFloat("FineOverCoarse", cellSize / Mathf.Max(coarseCell, 1e-4f));
+            compute.SetFloat("VelocityInfluence", velocityInfluence);
+        }
+        else
+        {
+            // No solver available. VelocityInfluence 0 makes the samples
+            // irrelevant, but the texture must STILL be bound or Unity
+            // refuses to dispatch the kernel at all. Any 3D texture will do.
+            compute.SetTexture(kStep, "CoarseVelocity", fallbackVelocity);
+            compute.SetTexture(kStepFire, "CoarseVelocity", fallbackVelocity);
+            compute.SetInts("CoarseGridSize", 1, 1, 1);
+            compute.SetFloat("FineOverCoarse", 1f);
+            compute.SetFloat("VelocityInfluence", 0f);
+        }
+    }
+
+    void DispatchFireEmission()
+    {
+        if (!useReactionSheet) return;
+
+        compute.SetTexture(kFireEmission, "FireIn", fireA);
+        compute.SetTexture(kFireEmission, "FireEmissionOut", fireEmission);
+        compute.SetTexture(kFireEmission, "Obstacle", obstacle);
+        Dispatch(kFireEmission);
     }
 
     void DispatchStep()
@@ -343,6 +527,13 @@ public class SmokeSim : MonoBehaviour
         compute.SetTexture(kStepFire, "FireIn", fireA);
         compute.SetTexture(kStepFire, "FireOut", fireB);
         compute.SetTexture(kStepFire, "Obstacle", obstacle);
+
+        // StepFire calls TransportOffset, which calls ShellMask -> ReadSmoke.
+        // Without this binding Unity refuses the dispatch outright, StepFire
+        // never runs, and the Swap below still executes -- so the fire field
+        // flips to a buffer nothing wrote and reads as empty.
+        compute.SetTexture(kStepFire, "SmokeIn", smokeA);
+
         Dispatch(kStepFire);
         Swap(ref fireA, ref fireB);
     }
@@ -354,12 +545,22 @@ public class SmokeSim : MonoBehaviour
         Dispatch(kClear);
     }
 
+    // Note: a failed Dispatch is silent apart from a console warning, and the
+    // ping-pong Swap that follows it is NOT skipped. A missing texture binding
+    // therefore shows up as a field that mysteriously empties, not as an error
+    // at the point of use. Check the console first when a field goes blank.
     void Dispatch(int kernel)
     {
         compute.Dispatch(kernel,
             Mathf.CeilToInt(gridX / 8f),
             Mathf.CeilToInt(gridY / 8f),
             Mathf.CeilToInt(gridZ / 8f));
+    }
+
+    void ReleaseCouplingTextures()
+    {
+        if (fireEmission != null) { fireEmission.Release(); fireEmission = null; }
+        if (fallbackVelocity != null) { fallbackVelocity.Release(); fallbackVelocity = null; }
     }
 
     RenderTexture MakeVolume()
@@ -423,7 +624,12 @@ public class SmokeSim : MonoBehaviour
     {
         if (smokeMaterial == null) return;
         smokeMaterial.SetTexture("_SmokeTex", smokeA);
-        smokeMaterial.SetTexture("_FireTex", fireA);
+        // Reaction-sheet weighted flame turns the flame from a glowing blob
+        // into overlapping tongues, but it also DIMS the field, so it is off
+        // by default until the raw flame is confirmed visible.
+        bool useSheet = useReactionSheet && fireEmission != null;
+
+        smokeMaterial.SetTexture("_FireTex", useSheet ? fireEmission : fireA);
         smokeMaterial.SetVector("_VolumeMin", origin);
         smokeMaterial.SetVector("_VolumeSize", volumeSize);
     }
@@ -437,6 +643,7 @@ public class SmokeSim : MonoBehaviour
         if (fireA != null) fireA.Release();
         if (fireB != null) fireB.Release();
         if (obstacle != null) obstacle.Release();
+        ReleaseCouplingTextures();
         if (emitterBuffer != null) emitterBuffer.Release();
         if (volumeReadBuffer != null) volumeReadBuffer.Release();
     }
@@ -540,4 +747,16 @@ public class SmokeSim : MonoBehaviour
     public RenderTexture ObstacleVolume => obstacle;
     public RenderTexture SmokeVolume => smokeA;
     public RenderTexture FireVolume => fireA;
+
+    // Sheet-weighted flame, for rendering. Point the fire material's
+    // texture at this rather than at FireVolume.
+    public RenderTexture FireEmissionVolume => fireEmission;
+
+    public void GetGridSize(out int x, out int y, out int z)
+    {
+        x = gridX; y = gridY; z = gridZ;
+    }
+
+    public float CellSizePublic => cellSize;
+    public bool IsInitialized => initialized;
 }

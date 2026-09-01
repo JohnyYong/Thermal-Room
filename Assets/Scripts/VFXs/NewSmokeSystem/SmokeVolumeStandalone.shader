@@ -5,14 +5,26 @@ Shader "Custom/SmokeVolumeStandalone"
         _SmokeTex   ("Smoke",           3D)    = "" {}
         _FireTex    ("Fire",            3D)    = "" {}
 
-        _Density         ("Smoke Density",     Float) = 8
+        _Density         ("Smoke Density",     Float) = 3
         _SmokeColorLow   ("Smoke Color Thin",  Color) = (0.15, 0.15, 0.15, 1)
         _SmokeColorHigh  ("Smoke Color Thick", Color) = (0.4,  0.4,  0.4,  1)
 
-        _FireBrightness  ("Fire Brightness",   Float) = 6
+        _FireBrightness  ("Fire Brightness",   Float) = 14
         _FireColorLow    ("Fire Color (Cool)", Color) = (1.0, 0.15, 0.0, 1)
         _FireColorMid    ("Fire Color (Mid)",  Color) = (1.0, 0.65, 0.1, 1)
         _FireColorHigh   ("Fire Color (Hot)",  Color) = (1.0, 1.0,  0.8, 1)
+
+        // Soot sitting inside the reaction zone is incandescent -- it is
+        // emitting, not blocking. Only cooled soot downstream reads as
+        // opaque. This is how much flame suppresses smoke opacity in the
+        // same cell. 1 = a fully luminous cell is completely transparent.
+        _SootIncandescence ("Soot Incandescence", Range(0,1)) = 0.85
+
+        // Flame light scattered by nearby soot. A real smoke plume glows
+        // orange near the fire because it is being lit by it, not because
+        // it is burning. This also means the flame reads through a thin
+        // layer of its own plume instead of vanishing behind it.
+        _FireScatter ("Fire In-Scatter", Range(0,4)) = 1.2
 
         _StepCount       ("Ray Steps",         Range(32, 512)) = 128
     }
@@ -20,7 +32,18 @@ Shader "Custom/SmokeVolumeStandalone"
     SubShader
     {
         Tags { "RenderPipeline"="UniversalPipeline" "Queue"="Transparent" "RenderType"="Transparent" }
-        Blend SrcAlpha OneMinusSrcAlpha
+
+        // PREMULTIPLIED ALPHA.
+        //
+        // This was SrcAlpha OneMinusSrcAlpha, which multiplies the returned
+        // RGB by the returned alpha at blend time. Both the fire and smoke
+        // terms below are already weighted by transmittance as they are
+        // accumulated, so that second multiply applied the alpha twice --
+        // and for emissive fire it is wrong in principle regardless. Light
+        // emitted by a flame is not attenuated by the flame's own opacity,
+        // so thin fire was being dimmed toward nothing and fire behind any
+        // smoke was multiplied away entirely.
+        Blend One OneMinusSrcAlpha
         Cull Front
         ZWrite Off
         ZTest Always
@@ -52,6 +75,8 @@ Shader "Custom/SmokeVolumeStandalone"
             float4 _FireColorMid;
             float4 _FireColorHigh;
 
+            float _SootIncandescence;
+            float _FireScatter;
             float _StepCount;
 
             struct appdata
@@ -129,8 +154,16 @@ Shader "Custom/SmokeVolumeStandalone"
                 float sceneEyeDepth = LinearEyeDepth(rawSceneDepth, _ZBufferParams);
 
                 float3 pos = ro + rd * entry;
+
+                // Emission accumulated so far, already premultiplied.
                 float3 accum = 0;
-                float  alpha = 0;
+
+                // Fraction of light from behind that still reaches the eye.
+                // Tracking transmittance directly rather than alpha makes the
+                // emission/absorption split explicit: emission is scaled by
+                // the transmittance IN FRONT of it, absorption reduces the
+                // transmittance for everything behind.
+                float transmittance = 1.0;
 
                 [loop]
                 for (int s = 0; s < steps; s++)
@@ -148,26 +181,56 @@ Shader "Custom/SmokeVolumeStandalone"
                     float smokeD = tex3D(_SmokeTex, pos).r;
                     float fireD  = tex3D(_FireTex,  pos).r;
 
+                    // --- emission first: this cell's light passes through
+                    //     only what is already in front of it ---
                     if (fireD > 0.001)
                     {
                         float edgeBoost = smoothstep(0.0, 0.15, fireD);
-                        float3 fc = FireColor(fireD) * fireD * _FireBrightness * step * edgeBoost;
-                        accum += fc * (1 - alpha);
+
+                        float3 fc = FireColor(fireD) * fireD
+                                  * _FireBrightness * step * edgeBoost;
+
+                        accum += fc * transmittance;
                     }
 
+                    // --- then absorption, which affects everything behind ---
                     if (smokeD > 0.005)
                     {
-                        float3 sc = lerp(_SmokeColorLow.rgb, _SmokeColorHigh.rgb, saturate(smokeD));
+                        float3 sc = lerp(_SmokeColorLow.rgb,
+                                         _SmokeColorHigh.rgb,
+                                         saturate(smokeD));
+
                         float sa = saturate(smokeD * step * _Density * 4.0);
-                        accum += sc * sa * (1 - alpha);
-                        alpha += sa * (1 - alpha);
-                        if (alpha > 0.99) break;
+
+                        // Glowing soot in the reaction zone does not occlude.
+                        // Without this the flame is buried under the very
+                        // smoke it is producing.
+                        sa *= saturate(1.0 - fireD * _SootIncandescence);
+
+                        // In-scattering: soot next to a flame is lit by it.
+                        if (fireD > 0.001)
+                        {
+                            sc += FireColor(fireD) * fireD * _FireScatter;
+                        }
+
+                        accum += sc * sa * transmittance;
+
+                        transmittance *= (1.0 - sa);
+
+                        // Early-out only once the remaining contribution is
+                        // genuinely negligible. At 0.01 the ray was
+                        // terminating inside the plume before reaching the
+                        // flame at its centre, so no amount of fire
+                        // brightness could ever show up.
+                        if (transmittance < 0.002) break;
                     }
 
                     pos += rd * step;
                 }
 
-                return float4(accum, alpha);
+                // Premultiplied output: RGB is already transmittance-weighted,
+                // alpha is coverage only. Do not multiply RGB by alpha here.
+                return float4(accum, 1.0 - transmittance);
             }
             ENDHLSL
         }

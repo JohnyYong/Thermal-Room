@@ -129,6 +129,7 @@ public class ThermalSimulation : MonoBehaviour
     int flameGenerationKernel;
     int advectFlameKernel;
     int flameHeatKernel;
+    int injectFineKernel;
     int runtimeIgniteKernel;
     int extinguishKernel;
     int suppressantDecayKernel;
@@ -138,7 +139,43 @@ public class ThermalSimulation : MonoBehaviour
 
     public float firePower = 0;
     public float diffusionRate = 1.0f;
+    // Superseded by buoyancyScale below; kept so existing scenes still
+    // deserialize. BuoyancyStep no longer reads it.
     public float buoyancyStrength = 0.01f;
+
+    [Header("Buoyancy (physical)")]
+    [Tooltip("Multiplier on true buoyant acceleration g*(T/Tamb - 1). 1.0 is " +
+             "physically correct. The old linear buoyancyStrength produced " +
+             "roughly a fourteenth of this, which is why the fire looked fluid.")]
+    public float buoyancyScale = 1.0f;
+
+    [Tooltip("Cap on buoyant acceleration in m/s^2. Real plumes stop " +
+             "accelerating because they entrain cool air; this stands in for " +
+             "the part of that the grid cannot resolve. ~30 is reasonable.")]
+    public float maxBuoyantAccel = 30f;
+
+    [Tooltip("Baroclinic vorticity production: (grad rho x grad p)/rho^2. " +
+             "This is what actually rolls the plume edge into the vortices " +
+             "that shed as puffs. Vorticity confinement can only amplify " +
+             "vorticity that already exists -- this creates it.")]
+    public float baroclinicStrength = 1.0f;
+
+    [Header("Fine Grid Coupling (SmokeSim)")]
+    [Tooltip("The SmokeSim that owns the visible fire and smoke. This sim " +
+             "reads its fields to decide where heat is, so the thermal image " +
+             "and the visible flame are two readouts of one state.")]
+    public SmokeSim smokeSim;
+
+    [Tooltip("Measured gas temperature of a fully luminous flame cell, deg C.")]
+    public float flameGasTemp = 1000f;
+
+    [Tooltip("Temperature fresh combustion products carry, deg C.")]
+    public float smokeGasTemp = 300f;
+
+    [Tooltip("How fast gas temperature relaxes toward the values above, 1/s. " +
+             "Relaxing rather than assigning is what lets heat persist after " +
+             "the flame has moved on -- which is what a thermal imager shows.")]
+    public float fineCouplingRate = 8f;
     public float smokeBuoyancyStrength = 0.02f;
     public float smokeBuoyancyCutoff = 40f;   // °C above ambient -- smoke keeps its own lift above this, loses it below
     public float smokeSettleStrength = 0.15f; // gentle sink applied once smoke has cooled past the cutoff
@@ -288,6 +325,8 @@ public class ThermalSimulation : MonoBehaviour
         advectFlameKernel = simulation.FindKernel("AdvectFlameStep");
 
         flameHeatKernel = simulation.FindKernel("FlameHeatStep");
+
+        injectFineKernel = simulation.FindKernel("InjectFineFieldsStep");
 
         runtimeIgniteKernel = simulation.FindKernel("RuntimeIgnite");
 
@@ -502,6 +541,42 @@ public class ThermalSimulation : MonoBehaviour
         if (!simulationActive)
             return;
 
+        // Cell size must be uploaded before anything that advects: velocity
+        // is stored in m/s and converted to voxels at point of use.
+        simulation.SetFloat("CellSize", cellSize);
+
+        UploadFineCoupling();
+
+        // -----------------------------------------------------------------
+        // Read SmokeSim's fields in FIRST, before any of the thermal steps.
+        // SmokeSim owns where the fire is; this sim owns how hot things are.
+        // Injecting here means buoyancy, radiation and conduction all act on
+        // the fire the player can actually see.
+        // -----------------------------------------------------------------
+        if (HasFineFields())
+        {
+            simulation.SetTexture(injectFineKernel, "TemperatureIn", temperatureA);
+            simulation.SetTexture(injectFineKernel, "TemperatureOut", temperatureB);
+            simulation.SetTexture(injectFineKernel, "SmokeOut", smokeB);
+            simulation.SetTexture(injectFineKernel, "Obstacle", obstacleVolume);
+            simulation.SetTexture(injectFineKernel, "FineFireIn", smokeSim.FireVolume);
+            simulation.SetTexture(injectFineKernel, "FineSmokeIn", smokeSim.SmokeVolume);
+
+            simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+
+            simulation.Dispatch(injectFineKernel, Mathf.CeilToInt(gridX / 8f),
+                                Mathf.CeilToInt(gridY / 8f),
+                                Mathf.CeilToInt(gridZ / 8f));
+
+            RenderTexture injTemp = temperatureA;
+            temperatureA = temperatureB;
+            temperatureB = injTemp;
+
+            RenderTexture injSmoke = smokeA;
+            smokeA = smokeB;
+            smokeB = injSmoke;
+        }
+
         simulation.SetTexture(heatKernel, "TemperatureIn", temperatureA);
 
         simulation.SetTexture(heatKernel, "TemperatureOut", temperatureB);
@@ -542,6 +617,10 @@ public class ThermalSimulation : MonoBehaviour
         simulation.SetTexture(buoyancyKernel, "VelocityOut", velocityB);
 
         simulation.SetFloat("BuoyancyStrength", buoyancyStrength);
+
+        simulation.SetFloat("BuoyancyScale", buoyancyScale);
+
+        simulation.SetFloat("MaxBuoyantAccel", maxBuoyantAccel);
 
         simulation.SetFloat("SmokeBuoyancyStrength", smokeBuoyancyStrength);
 
@@ -586,6 +665,9 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(computeCurlKernel, "CurlOut", curlA);
 
+        // The baroclinic term needs the temperature field.
+        simulation.SetTexture(computeCurlKernel, "TemperatureIn", temperatureA);
+
         simulation.Dispatch(computeCurlKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
                             Mathf.CeilToInt(gridZ / 8f));
@@ -600,6 +682,8 @@ public class ThermalSimulation : MonoBehaviour
         simulation.SetTexture(vorticityKernel, "CurlIn", curlA);
 
         simulation.SetFloat("VorticityStrength", vorticityStrength);
+
+        simulation.SetFloat("BaroclinicStrength", baroclinicStrength);
 
         simulation.Dispatch(vorticityKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -877,6 +961,17 @@ public class ThermalSimulation : MonoBehaviour
             (suppressantB, suppressantA);
         //surpression
 
+        // -----------------------------------------------------------------
+        // The coarse sim's own smoke generation and advection are skipped
+        // whenever SmokeSim is driving. Running both would mean two
+        // independent smoke fields on two grids, which is exactly the
+        // divergence this coupling exists to eliminate: InjectFineFieldsStep
+        // already wrote the downsampled fine smoke into smokeA this tick,
+        // and these dispatches would overwrite it.
+        // -----------------------------------------------------------------
+        if (!HasFineFields())
+        {
+
         // smoke
         simulation.SetTexture(smokeGenerationKernel, "SmokeIn", smokeA);
 
@@ -926,6 +1021,8 @@ public class ThermalSimulation : MonoBehaviour
         smokeA = smokeB;
         smokeB = smokeTemp;
         // smoke2
+
+        } // end !HasFineFields smoke block
 
         // combustion to air
         simulation.SetTexture(combustionToAirKernel, "BurningIn", burningA);
@@ -1008,6 +1105,15 @@ public class ThermalSimulation : MonoBehaviour
         simulation.SetTexture(flameHeatKernel, "Obstacle", obstacleVolume);
 
         simulation.SetTexture(flameHeatKernel, "SmokeIn", smokeA);
+
+        // The thermal image is built from the same fields the player sees.
+        if (HasFineFields())
+        {
+            simulation.SetTexture(flameHeatKernel, "FineFireIn", smokeSim.FireVolume);
+            simulation.SetTexture(flameHeatKernel, "FineSmokeIn", smokeSim.SmokeVolume);
+        }
+
+        simulation.SetFloat("AmbientTemp", 20);
 
         simulation.Dispatch(flameHeatKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -1439,6 +1545,55 @@ public class ThermalSimulation : MonoBehaviour
         Graphics.CopyTexture(temp, burningA);
 
         Graphics.CopyTexture(temp, burningB);
+    }
+
+    // -------------------------------------------------------------------
+    // Fine/coarse coupling.
+    //
+    // The box-average ratio is coarseCell/fineCell. At 0.3 and 0.1 that is
+    // exactly 3, so the 3x3x3 taps land on fine cell centres and the average
+    // is exact. Non-integer ratios still work, just approximately.
+    // -------------------------------------------------------------------
+    bool HasFineFields()
+    {
+        return smokeSim != null
+            && smokeSim.IsInitialized
+            && smokeSim.FireVolume != null
+            && smokeSim.SmokeVolume != null;
+    }
+
+    void UploadFineCoupling()
+    {
+        simulation.SetFloat("FlameGasTemp", flameGasTemp);
+        simulation.SetFloat("SmokeGasTemp", smokeGasTemp);
+        simulation.SetFloat("FineCouplingRate", fineCouplingRate);
+
+        if (!HasFineFields())
+        {
+            simulation.SetInts("FineGridSize", 1, 1, 1);
+            simulation.SetFloat("CoarseOverFine", 1f);
+            simulation.SetInt("FineBoxTaps", 1);
+            return;
+        }
+
+        smokeSim.GetGridSize(out int fx, out int fy, out int fz);
+
+        float ratio = cellSize / Mathf.Max(smokeSim.CellSizePublic, 1e-4f);
+
+        simulation.SetInts("FineGridSize", fx, fy, fz);
+        simulation.SetFloat("CoarseOverFine", ratio);
+        simulation.SetInt("FineBoxTaps", Mathf.Clamp(Mathf.RoundToInt(ratio), 1, 4));
+    }
+
+    // Exposed so SmokeSim can adopt these bounds exactly. If the two grids
+    // do not share an origin, nothing downstream lines up.
+    public Bounds SimBounds => GetSimulationBounds();
+
+    public RenderTexture GetVelocityVolume() => velocityA;
+
+    public void GetGridSize(out int x, out int y, out int z)
+    {
+        x = gridX; y = gridY; z = gridZ;
     }
 
     public Vector3 WorldToVoxel(Vector3 worldPos)

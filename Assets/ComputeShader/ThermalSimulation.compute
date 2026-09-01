@@ -23,6 +23,8 @@
 
 #pragma kernel FlameHeatStep
 
+#pragma kernel InjectFineFieldsStep
+
 #pragma kernel RuntimeIgnite
 
 #pragma kernel ExtinguishStep
@@ -120,6 +122,50 @@ float BurnHeat;
 float FlameAirHeat;
 
 float VorticityStrength;
+
+// ===================================================================
+// UNIT CONVENTION
+//
+// Velocity is stored in METRES PER SECOND, not voxels per second. That
+// is the whole reason this grid and SmokeSim's finer grid can agree with
+// each other: a physical quantity does not care what the cell size is.
+// Advection converts to voxels at the point of use by dividing by
+// CellSize; divergence/pressure/projection are unit-agnostic because
+// they scale velocity and pressure together.
+// ===================================================================
+float CellSize;             // metres per voxel of THIS grid
+
+// Buoyancy, physical form. See BuoyancyStep.
+float BuoyancyScale;        // ~1.0 multiplier on true gravity
+float MaxBuoyantAccel;      // m/s^2 cap; entrainment does this in reality
+
+// Baroclinic vorticity production. See ComputeCurl.
+float BaroclinicStrength;
+
+// -------------------------------------------------------------------
+// FINE-GRID COUPLING (SmokeSim)
+//
+// SmokeSim runs the visible fire and smoke on a finer grid sharing this
+// grid's world-space origin. It is the single source of truth for WHERE
+// the fire is; this sim is the single source of truth for HOW HOT things
+// are. Sampling below is a box average over the fine cells covering one
+// coarse cell, which conserves the integral -- a point sample would not,
+// and would make the thermal image flicker as fine detail moved between
+// coarse cell centres.
+// -------------------------------------------------------------------
+Texture3D<float> FineFireIn;
+Texture3D<float> FineSmokeIn;
+int3  FineGridSize;
+float CoarseOverFine;       // CellSize / fine cell size (e.g. 0.3/0.1 = 3)
+int   FineBoxTaps;          // samples per axis for the box average
+
+// Measured gas temperatures, degrees C (this sim works in Celsius).
+// A hydrocarbon diffusion flame is adiabatically ~2000 C, but radiative
+// loss and air entrainment put the actual measured gas temperature of a
+// room fire's flame at roughly 900-1100 C.
+float FlameGasTemp;         // temperature a fully luminous cell drives toward
+float SmokeGasTemp;         // temperature fresh combustion products carry
+float FineCouplingRate;     // 1/s; how fast gas temp relaxes to the above
 
 float SmokeGenerationRate;
 float SmokeDecayRate;
@@ -411,14 +457,39 @@ void BuoyancyStep(uint3 id : SV_DispatchThreadID)
 
     float4 velocity = VelocityIn[id];
 
-    // Hot air rises. This is what actually drives the plume -- smoke gets
-    // carried along by the ambient upflow, it doesn't lift itself.
-    float thermalBuoyancy = max(temp - AmbientTemp, 0);
+    // -----------------------------------------------------------------
+    // Buoyancy, physical form.
+    //
+    // The old code used a linear (T - T_ambient) term scaled by a small
+    // magic number, which produced roughly 2 m/s^2 -- about a fourteenth
+    // of the real value. A plume that weak never reaches the velocities
+    // where shear instability kicks in, so it stays laminar and smooth.
+    // That was the main reason the fire looked fluid rather than ablaze.
+    //
+    // Correct form for an ideal gas at constant pressure (rho ~ 1/T):
+    //     a = g * (T / T_ambient - 1)
+    // Both temperatures MUST be absolute, hence the +273.15 -- this sim
+    // works in Celsius everywhere else.
+    //
+    // At a 1000 C flame against 20 C ambient that gives about 33 m/s^2,
+    // which is what actually drives a real fire plume.
+    // -----------------------------------------------------------------
+    float tempK    = temp + 273.15;
+    float ambientK = AmbientTemp + 273.15;
+
+    float buoyantAccel = 9.81 * max(tempK / max(ambientK, 1.0) - 1.0, 0.0);
+
+    // Real plumes stop accelerating because they entrain cool air. The
+    // advection step does model that, but under-resolved at this cell
+    // size, so cap the acceleration rather than let it run away.
+    buoyantAccel = min(buoyantAccel * BuoyancyScale, MaxBuoyantAccel);
+
+    float thermalBuoyancy = buoyantAccel;
 
     // Extra lift the smoke gets while it's still in a very hot pocket.
     // Smooths the transition at the edge of the plume rather than
     // switching on/off. Optional -- keep SmokeBuoyancyStrength small.
-    float smokeWarmth = saturate(thermalBuoyancy / max(SmokeBuoyancyCutoff, 0.0001));
+    float smokeWarmth = saturate((temp - AmbientTemp) / max(SmokeBuoyancyCutoff, 0.0001));
     float smokeLift = smoke * SmokeBuoyancyStrength * smokeWarmth;
 
     // Soot is heavier than air -- gravity is ALWAYS pulling smoke down,
@@ -431,8 +502,9 @@ void BuoyancyStep(uint3 id : SV_DispatchThreadID)
     // air ever getting cold.
     float smokeSettle = smoke * SmokeSettleStrength;
 
-    velocity.y += (thermalBuoyancy * BuoyancyStrength +
-                   smokeLift - smokeSettle) * DeltaTime;
+    // thermalBuoyancy is already an acceleration in m/s^2; smokeLift and
+    // smokeSettle are m/s^2 too now that velocity is metric.
+    velocity.y += (thermalBuoyancy + smokeLift - smokeSettle) * DeltaTime;
 
     if (id.x > 0 && id.x < GridX - 1 && id.y > 0 && id.y < GridY - 1 &&
         id.z > 0 && id.z < GridZ - 1)
@@ -443,12 +515,18 @@ void BuoyancyStep(uint3 id : SV_DispatchThreadID)
         float gradZ = TemperatureIn[int3(id.x, id.y, id.z + 1)] -
                       TemperatureIn[int3(id.x, id.y, id.z - 1)];
 
+        // Kept for compatibility, but this is not baroclinic torque -- it
+        // pushes fluid toward hot regions rather than spinning it. The
+        // physically correct vorticity source now lives in ComputeCurl.
+        // Set TurbulenceStrength to 0 and use BaroclinicStrength instead.
         velocity.x += gradX * TurbulenceStrength * DeltaTime;
 
         velocity.z += gradZ * TurbulenceStrength * DeltaTime;
     }
 
-    velocity.xyz *= 0.999;
+    // Light damping only. Heavy damping kills the small-scale motion that
+    // reads as turbulence.
+    velocity.xyz *= 0.9995;
 
     VelocityOut[id] = velocity;
 }
@@ -543,7 +621,8 @@ void AdvectTemperatureStep(uint3 id : SV_DispatchThreadID)
 
     float3 currentPos = float3(id);
 
-    float3 previousPos = currentPos - velocity.xyz * DeltaTime;
+    // Velocity is m/s; convert to voxels for the backward trace.
+    float3 previousPos = currentPos - velocity.xyz * DeltaTime / CellSize;
 
     float advectedTemperature = SampleTemperature(previousPos);
 
@@ -566,7 +645,8 @@ void AdvectVelocityStep(uint3 id : SV_DispatchThreadID)
 
     float3 currentPos = float3(id);
 
-    float3 previousPos = currentPos - velocity.xyz * DeltaTime;
+    // Velocity is m/s; convert to voxels for the backward trace.
+    float3 previousPos = currentPos - velocity.xyz * DeltaTime / CellSize;
 
     float4 advectedVelocity = SampleVelocity(previousPos);
 
@@ -1395,6 +1475,47 @@ void ComputeCurl(uint3 id : SV_DispatchThreadID)
     curl.y = dVx_dZ - dVz_dX;
     curl.z = dVy_dX - dVx_dY;
 
+    // -----------------------------------------------------------------
+    // Baroclinic vorticity production.
+    //
+    // Vorticity confinement AMPLIFIES vorticity that already exists; it
+    // cannot create the plume-edge roll-up in the first place. This term
+    // is the actual physical source:
+    //
+    //     dOmega/dt = (grad rho x grad p) / rho^2
+    //
+    // With hydrostatic pressure (grad p = rho * g) and an ideal gas at
+    // constant pressure (rho ~ 1/T) that reduces to
+    //
+    //     dOmega/dt = -(grad T x g) / T
+    //
+    // Physically: a horizontal temperature gradient sitting inside a
+    // vertical pressure gradient experiences a torque. On a fire plume
+    // that torque rolls the shear layer at the plume edge into a
+    // toroidal vortex, which detaches and rises. That shedding is the
+    // puffing you see in a real fire, at roughly f = 1.5/sqrt(D) Hz.
+    // -----------------------------------------------------------------
+    if (BaroclinicStrength > 0.0)
+    {
+        float3 gradT = float3(
+            TemperatureIn[int3(id.x + 1, id.y, id.z)] -
+            TemperatureIn[int3(id.x - 1, id.y, id.z)],
+
+            TemperatureIn[int3(id.x, id.y + 1, id.z)] -
+            TemperatureIn[int3(id.x, id.y - 1, id.z)],
+
+            TemperatureIn[int3(id.x, id.y, id.z + 1)] -
+            TemperatureIn[int3(id.x, id.y, id.z - 1)]) * (0.5 / CellSize);
+
+        float tempK = TemperatureIn[id] + 273.15;
+
+        float3 gvec = float3(0.0, -9.81, 0.0);
+
+        float3 baroclinic = -cross(gradT, gvec) / max(tempK, 1.0);
+
+        curl += baroclinic * BaroclinicStrength * DeltaTime;
+    }
+
     float curlMagnitude = length(curl);
 
     CurlOut[id] = float4(curl, curlMagnitude);
@@ -1545,6 +1666,93 @@ void AdvectFlameStep(uint3 id : SV_DispatchThreadID)
     FlameOut[id] = flame;
 }
 
+// -------------------------------------------------------------------
+// FINE -> COARSE RESAMPLING
+//
+// Box average over the fine cells covering this coarse cell. Both grids
+// share a world origin, so fine voxel i has its centre at the same place
+// as coarse coordinate (i + 0.5)/CoarseOverFine - 0.5. When the ratio is
+// an integer (0.3 / 0.1 = 3) the taps land exactly on fine cell centres
+// and the average is exact.
+// -------------------------------------------------------------------
+float SampleFineBox(Texture3D<float> fineTex, int3 coarseId)
+{
+    int taps = clamp(FineBoxTaps, 1, 4);
+
+    float invTaps = 1.0 / (float)taps;
+
+    // World-space extent of this coarse cell, expressed in fine voxels.
+    float3 fineMin = (float3)coarseId * CoarseOverFine;
+
+    float total = 0.0;
+    float count = 0.0;
+
+    for (int sx = 0; sx < taps; sx++)
+    for (int sy = 0; sy < taps; sy++)
+    for (int sz = 0; sz < taps; sz++)
+    {
+        float3 sub = (float3(sx, sy, sz) + 0.5) * invTaps * CoarseOverFine;
+
+        int3 f = (int3)floor(fineMin + sub);
+
+        f = clamp(f, int3(0, 0, 0), FineGridSize - 1);
+
+        total += fineTex[f];
+        count += 1.0;
+    }
+
+    return total / max(count, 1.0);
+}
+
+// -------------------------------------------------------------------
+// The one place the two simulations meet.
+//
+// SmokeSim owns where the fire and smoke ARE. This kernel reads that in
+// and relaxes the local gas temperature toward the measured temperature
+// of the corresponding gas. It does NOT overwrite the temperature field:
+// relaxing rather than assigning lets conduction, radiation and venting
+// keep working, and lets heat persist after the flame has moved on --
+// which is precisely what a thermal imager should show.
+// -------------------------------------------------------------------
+[numthreads(8, 8, 8)]
+void InjectFineFieldsStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)GridX || id.y >= (uint)GridY || id.z >= (uint)GridZ)
+        return;
+
+    if (Obstacle[id] > 0.5)
+    {
+        TemperatureOut[id] = TemperatureIn[id];
+        SmokeOut[id] = 0;
+        return;
+    }
+
+    int3 c = int3(id);
+
+    float fire  = saturate(SampleFineBox(FineFireIn, c));
+    float smoke = saturate(SampleFineBox(FineSmokeIn, c));
+
+    float temp = TemperatureIn[id];
+
+    // Target temperature of the gas actually present in this cell.
+    // Flame dominates where it exists; smoke carries hot products.
+    float target = lerp(SmokeGasTemp, FlameGasTemp, fire);
+
+    float presence = max(fire, smoke);
+
+    // Relax toward the target in proportion to how much hot gas is here.
+    float rate = saturate(FineCouplingRate * presence * DeltaTime);
+
+    temp = lerp(temp, max(temp, target), rate);
+
+    TemperatureOut[id] = temp;
+
+    // The coarse smoke field becomes a straight downsample of the fine
+    // one, so buoyancy/settle in BuoyancyStep act on the smoke the player
+    // can actually see rather than on an independently evolved copy.
+    SmokeOut[id] = smoke;
+}
+
 [numthreads(8, 8, 8)]
 void FlameHeatStep(uint3 id : SV_DispatchThreadID)
 {
@@ -1557,20 +1765,42 @@ void FlameHeatStep(uint3 id : SV_DispatchThreadID)
         return;
     }
 
+    // -----------------------------------------------------------------
+    // The thermal image.
+    //
+    // This is now built from the SAME fire and smoke fields the player
+    // sees in normal vision, resampled from SmokeSim's finer grid, plus
+    // this sim's own temperature field. That co-location is what makes
+    // the thermal view and the visible view agree: they are two readouts
+    // of one state, not two independent simulations that happen to look
+    // similar.
+    //
+    // The old version added flat offsets (smoke * 80, flame * 200) on top
+    // of the air temperature, which is not a temperature -- it was an
+    // arbitrary brightness boost. Gas temperature is already carried by
+    // TemperatureIn thanks to InjectFineFieldsStep, so all that remains
+    // is a small emissivity correction: soot-laden smoke radiates close
+    // to a black body, so an imager reads it near its true temperature,
+    // while thin flame gas reads slightly below.
+    // -----------------------------------------------------------------
+    int3 c = int3(id);
+
+    float fire  = saturate(SampleFineBox(FineFireIn, c));
+    float smoke = saturate(SampleFineBox(FineSmokeIn, c));
+
     float temp = TemperatureIn[id];
-    float smoke = SmokeIn[id];
-    float flame = FlameIn[id];
 
-    // Start with the actual air temperature
-    float heat = temp;
+    // Apparent temperature = emissivity-weighted blend of the gas and
+    // whatever is behind it. Dense soot is close to a black body
+    // (emissivity ~0.9); a thin luminous flame sheet is more transparent.
+    float emissivity = saturate(smoke * 0.9 + fire * 0.6);
 
-    // Smoke keeps some heat
-    heat += smoke * 80.0;
+    float apparent = lerp(AmbientTemp, temp, emissivity);
 
-    // Flames appear hotter
-    heat += flame * 200.0;
+    // Where flame is actually present the imager sees the flame itself.
+    apparent = max(apparent, FlameGasTemp * fire);
 
-    FlameHeatOut[id] = heat;
+    FlameHeatOut[id] = max(apparent, temp * emissivity);
 }
 
 [numthreads(8, 8, 8)]

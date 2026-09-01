@@ -113,7 +113,7 @@ Material:
     - _ClearCoatSmoothness: 0
     - _Cull: 2
     - _Cutoff: 0.5
-    - _Density: 10
+    - _Density: 6
     - _DetailAlbedoMapScale: 1
     - _DetailNormalMapScale: 1
     - _DetailScale: 3.1
@@ -122,7 +122,8 @@ Material:
     - _DstBlend: 0
     - _DstBlendAlpha: 0
     - _EnvironmentReflections: 1
-    - _FireBrightness: 1500
+    - _FireBrightness: 1000
+    - _FireScatter: 4
     - _GlossMapScale: 0
     - _Glossiness: 0
     - _GlossyReflections: 0
@@ -133,6 +134,7 @@ Material:
     - _ReceiveShadows: 1
     - _Smoothness: 0.5
     - _SmoothnessTextureChannel: 0
+    - _SootIncandescence: 0.85
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _SrcBlendAlpha: 1

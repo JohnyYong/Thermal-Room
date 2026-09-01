@@ -2,6 +2,7 @@
 #pragma kernel Step
 #pragma kernel EmitFire
 #pragma kernel StepFire
+#pragma kernel FireEmission
 #pragma kernel Clear
 #pragma kernel CopyVolumeToBuffer //Mainly for debugging
 
@@ -29,6 +30,45 @@ int3   GridSize;
 float  DeltaTime;
 float  Time_;
 
+// 0 = the six faces of the sim grid behave as solid walls (sealed box).
+// 1 = they are open to the outside world and smoke/fire drains out of them.
+float  OpenBoundary;
+
+// ===================================================================
+// COARSE SOLVER COUPLING
+//
+// This grid no longer invents its own transport. ThermalSimulation runs
+// a real Navier-Stokes solve on a coarser grid (buoyancy -> advection ->
+// vorticity -> pressure projection) and hands the resulting velocity
+// field over here. Smoke and fire are advected by that field, so the
+// motion obeys incompressible flow and matches, cell for cell, what the
+// thermal imager sees.
+//
+// Velocity is in METRES PER SECOND in both sims. That shared physical
+// unit is what lets a 0.1 m grid and a 0.3 m grid agree.
+//
+// Curl noise is still added on top, but its role has changed: it is now
+// genuine SUB-GRID turbulence, supplying the eddies smaller than the
+// coarse solver's cell size that the solver physically cannot represent.
+// ===================================================================
+Texture3D<float4> CoarseVelocity;
+int3   CoarseGridSize;
+float  CellSizeMeters;      // metres per voxel of THIS (fine) grid
+float  FineOverCoarse;      // fine cell size / coarse cell size (e.g. 1/3)
+float  VelocityInfluence;   // 0..1, how much of the solver field to use
+
+// Sub-grid buoyancy. A 0.3 m solver cannot resolve the acceleration
+// inside a flame only a couple of coarse cells wide, so the remainder is
+// added here where the flame is actually resolved.
+float  SubGridBuoyancy;     // 0..1 fraction of g*(T/Tamb - 1) added locally
+float  FlameGasTempK;       // absolute flame gas temperature, Kelvin
+float  AmbientTempK;        // absolute ambient temperature, Kelvin
+
+// Reaction-sheet emission. See the FireEmission kernel.
+RWTexture3D<float> FireEmissionOut;
+float  ReactionSheetScale;
+float  ReactionSheetWeight;
+
 // Per-emitter data uploaded as a StructuredBuffer -- supports any number
 // of active fire sources sharing the same sim grid.
 struct EmitterData
@@ -52,7 +92,18 @@ float  DecayRate;
 float  FireRiseSpeed;
 float  FireDecayRate;
 float  FireToSmokeRate;
-float  FireCeilingSpread;
+float  FireCeilingSpread;   // unused now: ceiling rollover comes from the solver
+float  FireCutoff;         // per-second subtraction that keeps flame tips crisp
+
+float  SmokeDiffusion;     // physical soot diffusion; keep small
+
+// How strongly bright flame suppresses smoke production in its own cell.
+// 1 = a fully luminous cell makes no visible smoke at all.
+float  SootLuminousCutoff;
+
+// Flame intermittency. See FlameDilution / StepFire.
+float  FlamePersistentRadius;  // voxels: extent of the continuously lit zone
+float  FlameIntermittency;     // 1/s extinction rate in the diluted region
 
 // Noise turbulence.
 float FireNoiseScale;
@@ -77,7 +128,10 @@ bool InBounds(int3 p)
 
 bool IsSolid(int3 p)
 {
-    if (!InBounds(p)) return true;
+    // Outside the grid is either a wall or open air, depending on
+    // OpenBoundary. Treating it as a wall (the old behaviour) makes the sim
+    // volume a sealed box that can only ever fill up.
+    if (!InBounds(p)) return OpenBoundary > 0.5 ? false : true;
     return Obstacle[p] > 0.5;
 }
 
@@ -226,6 +280,122 @@ float SampleSmokeWall(float3 p, float fallback)
     return IsSolid(ip) ? fallback : SampleSmoke(p);
 }
 
+// Trilinear fetch of the fine FIRE field, matching SampleSmoke.
+float SampleFire(float3 p)
+{
+    float3 fl = floor(p);
+    float3 f  = p - fl;
+    int3   b  = (int3)fl;
+
+    float c000 = ReadFire(b + int3(0, 0, 0));
+    float c100 = ReadFire(b + int3(1, 0, 0));
+    float c010 = ReadFire(b + int3(0, 1, 0));
+    float c110 = ReadFire(b + int3(1, 1, 0));
+    float c001 = ReadFire(b + int3(0, 0, 1));
+    float c101 = ReadFire(b + int3(1, 0, 1));
+    float c011 = ReadFire(b + int3(0, 1, 1));
+    float c111 = ReadFire(b + int3(1, 1, 1));
+
+    float x00 = lerp(c000, c100, f.x);
+    float x10 = lerp(c010, c110, f.x);
+    float x01 = lerp(c001, c101, f.x);
+    float x11 = lerp(c011, c111, f.x);
+
+    return lerp(lerp(x00, x10, f.y), lerp(x01, x11, f.y), f.z);
+}
+
+// Min/max over the 8 cells a trilinear fetch at p would touch. The
+// MacCormack correction below is unstable without clamping to this range.
+void SampleBoundsSmoke(float3 p, out float lo, out float hi)
+{
+    int3 b = (int3)floor(p);
+
+    lo =  1e9;
+    hi = -1e9;
+
+    for (int i = 0; i < 8; i++)
+    {
+        int3 o = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        float v = ReadSmoke(b + o);
+        lo = min(lo, v);
+        hi = max(hi, v);
+    }
+}
+
+void SampleBoundsFire(float3 p, out float lo, out float hi)
+{
+    int3 b = (int3)floor(p);
+
+    lo =  1e9;
+    hi = -1e9;
+
+    for (int i = 0; i < 8; i++)
+    {
+        int3 o = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        float v = ReadFire(b + o);
+        lo = min(lo, v);
+        hi = max(hi, v);
+    }
+}
+
+// -------------------------------------------------------------------
+// Solver velocity, upsampled.
+//
+// Both grids share a world origin, so fine voxel centre (id + 0.5) maps
+// to coarse coordinate (id + 0.5) * FineOverCoarse - 0.5.
+// Returns metres per second.
+// -------------------------------------------------------------------
+float3 SampleCoarseVelocity(float3 fineCentre)
+{
+    float3 cp = fineCentre * FineOverCoarse - 0.5;
+
+    cp = clamp(cp, float3(0, 0, 0), (float3)(CoarseGridSize - 1) - 0.001);
+
+    float3 fl = floor(cp);
+    float3 f  = cp - fl;
+    int3   b  = (int3)fl;
+
+    int3 hi = min(b + 1, CoarseGridSize - 1);
+
+    float3 c000 = CoarseVelocity[int3(b.x,  b.y,  b.z )].xyz;
+    float3 c100 = CoarseVelocity[int3(hi.x, b.y,  b.z )].xyz;
+    float3 c010 = CoarseVelocity[int3(b.x,  hi.y, b.z )].xyz;
+    float3 c110 = CoarseVelocity[int3(hi.x, hi.y, b.z )].xyz;
+    float3 c001 = CoarseVelocity[int3(b.x,  b.y,  hi.z)].xyz;
+    float3 c101 = CoarseVelocity[int3(hi.x, b.y,  hi.z)].xyz;
+    float3 c011 = CoarseVelocity[int3(b.x,  hi.y, hi.z)].xyz;
+    float3 c111 = CoarseVelocity[int3(hi.x, hi.y, hi.z)].xyz;
+
+    float3 x00 = lerp(c000, c100, f.x);
+    float3 x10 = lerp(c010, c110, f.x);
+    float3 x01 = lerp(c001, c101, f.x);
+    float3 x11 = lerp(c011, c111, f.x);
+
+    return lerp(lerp(x00, x10, f.y), lerp(x01, x11, f.y), f.z);
+}
+
+// -------------------------------------------------------------------
+// Mixture dilution, 0 at the fuel bed and 1 beyond the persistent zone.
+//
+// A diffusion flame burns only while the local mixture sits between its
+// flammability limits. Air entrained into the plume dilutes it, and that
+// dilution grows with distance from the fuel. This is the quantity that
+// decides where flame can survive continuously and where it cannot.
+// -------------------------------------------------------------------
+float FlameDilution(float3 p)
+{
+    if (EmitterCount <= 0 || FlamePersistentRadius <= 0.0001) return 0.0;
+
+    float nearest = 1e9;
+    for (int i = 0; i < EmitterCount; i++)
+    {
+        EmitterData e = Emitters[i];
+        nearest = min(nearest, length(p - e.center) - e.radius);
+    }
+
+    return saturate(nearest / FlamePersistentRadius);
+}
+
 // ~0 where density is locally uniform (the plume core, and empty air),
 // ~1 at a density boundary. Multiplying the warp by this is what stops the
 // interior from riding the noise as one rigid block.
@@ -285,6 +455,15 @@ void Emit(uint3 id : SV_DispatchThreadID)
 
     float3 p = float3(id) + 0.5;
 
+    float fireHere = FireIn[id];
+
+    // How much this cell is inside the luminous reaction zone. Soot here
+    // is incandescent rather than obscuring, so BOTH smoke sources below
+    // are suppressed by it. Gating only the fire-to-smoke conversion was
+    // not enough: the emitter injects smoke directly, and that path was
+    // dumping opaque soot straight onto the flame every tick, burying it.
+    float luminous = saturate(1.0 - fireHere * SootLuminousCutoff);
+
     // Contributions from every active emitter. Squared-distance early-out
     // skips the sqrt when clearly outside the ball -- cheap perf win when
     // you have many emitters and most voxels are far from all of them.
@@ -298,18 +477,81 @@ void Emit(uint3 id : SV_DispatchThreadID)
 
         float d = sqrt(distSq);
         float w = 1.0 - d / max(e.radius, 0.0001);
-        current += e.emitRate * DeltaTime * w;
+        current += e.emitRate * DeltaTime * w * luminous;
     }
 
-    // Burning voxels also produce smoke, regardless of source.
-    float fireHere = FireIn[id];
+    // -----------------------------------------------------------------
+    // Soot production.
+    //
+    // Soot forms inside the flame, but while it is in the reaction zone it
+    // is incandescent -- it IS the flame's light, not an obstruction. It
+    // only reads as opaque smoke once it has left the luminous region and
+    // cooled. Generating smoke in proportion to flame intensity therefore
+    // puts maximum smoke density exactly where the flame is, and the flame
+    // ends up permanently hidden behind its own soot.
+    //
+    // Weighting by (1 - flame) instead produces smoke where the flame is
+    // FADING: the base of the fire stays clean and luminous and the plume
+    // darkens above it, which is what a real fire looks like.
+    // -----------------------------------------------------------------
     if (fireHere > 0.01)
     {
-        current += fireHere * FireToSmokeRate * DeltaTime;
+        current += fireHere * luminous * FireToSmokeRate * DeltaTime;
     }
 
     SmokeOut[id] = saturate(current);
 }
+// -------------------------------------------------------------------
+// Displacement shared by Step and StepFire, in FINE VOXELS per tick.
+//
+// Solver velocity supplies the resolved flow; curl noise supplies the
+// sub-grid eddies. The noise is masked to the density boundary and ramped
+// in away from the source, because a plume is near-laminar for its first
+// couple of source diameters and only then breaks up.
+// -------------------------------------------------------------------
+float3 TransportOffset(int3 c, float3 pp, float noiseScale,
+                       float noiseStrength, float noiseSpeed,
+                       float selfHeat)
+{
+    // --- resolved flow from the coarse Navier-Stokes solve, m/s ---
+    float3 vel = SampleCoarseVelocity(pp) * VelocityInfluence;
+
+    // --- sub-grid buoyancy the coarse grid cannot resolve, m/s^2 ---
+    if (SubGridBuoyancy > 0.0 && selfHeat > 0.0)
+    {
+        float ratio = lerp(1.0, FlameGasTempK / max(AmbientTempK, 1.0), selfHeat);
+        vel.y += 9.81 * max(ratio - 1.0, 0.0) * SubGridBuoyancy * DeltaTime;
+    }
+
+    // metres/second -> fine voxels this tick
+    float3 offset = vel * DeltaTime / max(CellSizeMeters, 0.0001);
+
+    // --- sub-grid turbulence, already in voxels ---
+    float3 turb = (SmokeUseCurlNoise > 0.5)
+        ? CurlNoise(pp, noiseScale, noiseSpeed)
+        : NoiseVelocity(pp, noiseScale, noiseSpeed);
+
+    turb *= noiseStrength * ShellMask(c) * EmitterAnchor(pp);
+
+    offset += turb;
+
+    // --- authored wind / vent attraction ---
+    offset += WindDirection * WindStrength;
+
+    if (AttractorStrength > 0.0)
+    {
+        float3 toAttractor = AttractorCenter - pp;
+        float distAtt = length(toAttractor);
+        if (distAtt > 0.001)
+        {
+            float pull = saturate(1.0 - distAtt / max(AttractorRadius, 0.0001));
+            offset += normalize(toAttractor) * pull * AttractorStrength;
+        }
+    }
+
+    return clamp(offset, -SmokeWarpClamp, SmokeWarpClamp);
+}
+
 [numthreads(8,8,8)]
 void Step(uint3 id : SV_DispatchThreadID)
 {
@@ -323,94 +565,58 @@ void Step(uint3 id : SV_DispatchThreadID)
     }
 
     float3 pc = float3(id);        // cell centre in sampling space
-    float3 pp = pc + 0.5;          // voxel space; matches emitter/attractor coords
+    float3 pp = pc + 0.5;          // voxel space; matches emitter coords
 
-    // ---------------------------------------------------------------
-    // Build the displacement.
-    // ---------------------------------------------------------------
-    float3 turb = (SmokeUseCurlNoise > 0.5)
-        ? CurlNoise(pp, SmokeNoiseScale, SmokeNoiseSpeed)
-        : NoiseVelocity(pp, SmokeNoiseScale, SmokeNoiseSpeed);
+    float3 offset = TransportOffset(c, pp, SmokeNoiseScale,
+                                    SmokeNoiseStrength, SmokeNoiseSpeed,
+                                    0.0);
 
-    turb *= SmokeNoiseStrength;
-
-    // Turbulence only deforms the boundary, and only away from the source.
-    // Without these two masks the noise translates the whole plume rigidly
-    // (its wavelength is wider than the plume), which is the "wobbly centre".
-    turb *= ShellMask(c) * EmitterAnchor(pp);
-
-    // Wind and attractor are bulk transport, not turbulence -- never masked.
-    float3 windOffset = WindDirection * WindStrength;
-
-    float3 attractorOffset = 0;
-    if (AttractorStrength > 0.0)
-    {
-        float3 toAttractor = AttractorCenter - pp;
-        float distAtt = length(toAttractor);
-        if (distAtt > 0.001)
-        {
-            float pull = saturate(1.0 - distAtt / max(AttractorRadius, 0.0001));
-            attractorOffset = normalize(toAttractor) * pull * AttractorStrength;
-        }
-    }
-
-    float3 offset = turb + windOffset + attractorOffset;
-    offset.y *= 0.5;
-    offset = clamp(offset, -SmokeWarpClamp, SmokeWarpClamp);
-
-    // ---------------------------------------------------------------
-    // ONE warped sampling basis. Every tap is taken relative to it.
+    // -----------------------------------------------------------------
+    // MacCormack advection.
     //
-    // This is the main correction: previously `here` was read at c - off
-    // while `below` was read at c - off*0.7 with no Y term, so `below` was
-    // not actually below `here`. The rise term fed mass in from a laterally
-    // displaced cell every frame and the column leaned with the noise.
+    // Plain semi-Lagrangian takes one trilinear sample, and trilinear is
+    // an 8-cell average -- i.e. a blur kernel applied 50 times a second.
+    // That is what turns sharp plume structure into a soft blob.
     //
-    // Backward (semi-Lagrangian) sampling: a voxel wanting to move by
-    // +offset must READ from -offset.
-    // ---------------------------------------------------------------
-    float3 basePos = pc - offset;
+    // MacCormack traces back, traces the result forward again, and
+    // corrects by half the round-trip error. The limiter afterwards is
+    // not optional: the correction is unstable without it.
+    // -----------------------------------------------------------------
+    float3 back = pc - offset;
 
-    float here  = SampleSmoke(basePos);
-    float below = SampleSmoke(basePos + float3(0, -1, 0));
-    float above = SampleSmoke(basePos + float3(0,  1, 0));
+    float phiHat  = SampleSmoke(back);            // standard SL result
+    float phiBack = SampleSmoke(back + offset);   // trace it forward again
 
-    // Obstacle queries stay on the TRUE cell, not the warped one.
-    bool ceilingAbove = IsSolid(c + int3(0,  1, 0));
-    bool floorBelow   = IsSolid(c + int3(0, -1, 0));
+    float here = phiHat + 0.5 * (SmokeIn[id] - phiBack);
 
-    float riseIn  = below * RiseSpeed * DeltaTime;
-    float riseOut = ceilingAbove ? 0.0 : here * RiseSpeed * DeltaTime;
+    float lo, hi;
+    SampleBoundsSmoke(back, lo, hi);
+    here = clamp(here, lo, hi);
 
-    // Soft replacement for the old boolean `activeRisingColumn`. The hard
-    // switch flipped per-voxel per-frame as the warp moved, adding shimmer.
-    float rising = saturate((below - here * 0.5) * 4.0);
+    // -----------------------------------------------------------------
+    // Physical diffusion only. Rise, settling and ceiling rollover are
+    // NOT written by hand any more -- they emerge from the solver's
+    // buoyancy term and from pressure projection redirecting the flow
+    // sideways when it hits a ceiling, which is the correct mechanism.
+    // -----------------------------------------------------------------
+    float result = here;
 
-    float settleIn  = above * SettleSpeed * DeltaTime * (1.0 - rising);
-    float settleOut = floorBelow
-                    ? 0.0
-                    : here * SettleSpeed * DeltaTime * (1.0 - rising);
-
-    // Horizontal ceiling spread: the row under a ceiling AND rows below it
-    // that have smoke above, so the layer can thicken downward.
-    float horizontal = 0.0;
-    if (ceilingAbove || above > 0.1)
+    if (SmokeDiffusion > 0.0)
     {
-        float xp = SampleSmokeWall(basePos + float3( 1, 0, 0), here);
-        float xn = SampleSmokeWall(basePos + float3(-1, 0, 0), here);
-        float zp = SampleSmokeWall(basePos + float3( 0, 0, 1), here);
-        float zn = SampleSmokeWall(basePos + float3( 0, 0,-1), here);
+        float xp = SampleSmokeWall(back + float3( 1, 0, 0), here);
+        float xn = SampleSmokeWall(back + float3(-1, 0, 0), here);
+        float yp = SampleSmokeWall(back + float3( 0, 1, 0), here);
+        float yn = SampleSmokeWall(back + float3( 0,-1, 0), here);
+        float zp = SampleSmokeWall(back + float3( 0, 0, 1), here);
+        float zn = SampleSmokeWall(back + float3( 0, 0,-1), here);
 
-        float laplacian = (xp + xn + zp + zn) - 4.0 * here;
-        horizontal = laplacian * CeilingSpread * DeltaTime;
+        float laplacian = (xp + xn + yp + yn + zp + zn) - 6.0 * here;
+
+        result += laplacian * SmokeDiffusion * DeltaTime;
     }
-
-    float result = here
-                 + riseIn - riseOut
-                 + settleIn - settleOut
-                 + horizontal;
 
     result *= (1.0 - DecayRate * DeltaTime);
+
     SmokeOut[id] = saturate(max(result, 0.0));
 }
 
@@ -461,75 +667,109 @@ void StepFire(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= (uint3)GridSize)) return;
 
-    if (IsSolid(int3(id)))
+    int3 c = int3(id);
+    if (IsSolid(c))
     {
         FireOut[id] = 0.0;
         return;
     }
 
+    float3 pc = float3(id);
+    float3 pp = pc + 0.5;
+
+    float selfHeat = FireIn[id];
+
+    // Fire uses its own noise band but the SAME solver velocity, which is
+    // what keeps flame and smoke moving as one plume instead of two.
+    float3 offset = TransportOffset(c, pp, FireNoiseScale,
+                                    FireNoiseStrength, FireNoiseSpeed,
+                                    selfHeat);
+
+    // MacCormack, same reasoning as Step. Sharpness matters more here
+    // than anywhere else -- a diffused flame is exactly what "too fluid"
+    // looks like.
+    float3 back = pc - offset;
+
+    float phiHat  = SampleFire(back);
+    float phiBack = SampleFire(back + offset);
+
+    float here = phiHat + 0.5 * (selfHeat - phiBack);
+
+    float lo, hi;
+    SampleBoundsFire(back, lo, hi);
+    here = clamp(here, lo, hi);
+
+    // Flame lifetime. A diffusion flame is not transported indefinitely --
+    // it exists only while fuel and oxidiser are still mixing, so it burns
+    // out over a fixed timescale rather than being advected forever.
+    float result = here * (1.0 - FireDecayRate * DeltaTime);
+
+    // -----------------------------------------------------------------
+    // Intermittency.
+    //
+    // A real flame is continuously luminous only in the persistent zone
+    // near the fuel bed. Higher up, entrained air pushes the mixture below
+    // its lower flammability limit MOST of the time, so flame appears only
+    // in bursts -- fuel-rich pockets carried up by shed vortices, burning
+    // out in mid-air. At the tip, flame is lit under ~5% of the time.
+    //
+    // Extinction is modulated by noise rather than applied smoothly, which
+    // is what makes pockets detach instead of the column simply fading. A
+    // uniform fade produces a gas burner; this produces a wood fire.
+    // -----------------------------------------------------------------
+    if (FlameIntermittency > 0.0)
+    {
+        float dilution = FlameDilution(pp);
+
+        float pocket = FBM(pp * FireNoiseScale * 2.0 +
+                           float3(0.0, -Time_ * 3.0, 0.0));
+
+        float extinction = saturate(dilution * (0.35 + pocket * 1.3));
+
+        result *= saturate(1.0 - FlameIntermittency * extinction * DeltaTime);
+    }
+
+    // Trim the faint tail so flame tips stay defined instead of fading
+    // into a haze.
+    result = max(0.0, result - FireCutoff * DeltaTime);
+
+    FireOut[id] = saturate(result);
+}
+
+// -------------------------------------------------------------------
+// Reaction-sheet emission.
+//
+// A real diffusion flame is luminous only in a thin layer where fuel and
+// oxidiser meet at stoichiometric ratio -- that is why fire looks like
+// overlapping tongues rather than a solid glowing mass. The simulated
+// fire field is a filled volume, so weighting emission by the magnitude
+// of its gradient recovers the sheet structure.
+//
+// This writes a SEPARATE texture: the simulation keeps working on the
+// physical field, and only the rendered field is sheet-weighted.
+// -------------------------------------------------------------------
+[numthreads(8,8,8)]
+void FireEmission(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)GridSize)) return;
+
     int3 c = int3(id);
-
-    float3 p = float3(id) + 0.5;
-    float3 noise = NoiseVelocity(p, FireNoiseScale, FireNoiseSpeed);
-
-    float3 windOffset = WindDirection * WindStrength;
-
-    float3 attractorOffset = 0;
-    if (AttractorStrength > 0.0)
+    if (IsSolid(c))
     {
-        float3 toAttractor = AttractorCenter - p;
-        float distAtt = length(toAttractor);
-        if (distAtt > 0.001)
-        {
-            float pull = saturate(1.0 - distAtt / max(AttractorRadius, 0.0001));
-            attractorOffset = normalize(toAttractor) * pull * AttractorStrength * 0.5;
-        }
+        FireEmissionOut[id] = 0.0;
+        return;
     }
 
-    float3 combinedOffset = noise * FireNoiseStrength + windOffset + attractorOffset;
+    float flame = FireIn[id];
 
-    // Shell warp for fire outline wobble.
-    // NOTE: same backward-sampling correction as Step -- subtract, don't add.
-    float offX = clamp(combinedOffset.x, -2.5, 2.5);
-    float offY = clamp(combinedOffset.y * 0.5, -1.5, 1.5);
-    float offZ = clamp(combinedOffset.z, -2.5, 2.5);
+    float3 gradF = float3(
+        ReadFire(c + int3(1, 0, 0)) - ReadFire(c - int3(1, 0, 0)),
+        ReadFire(c + int3(0, 1, 0)) - ReadFire(c - int3(0, 1, 0)),
+        ReadFire(c + int3(0, 0, 1)) - ReadFire(c - int3(0, 0, 1))) * 0.5;
 
-    int3 herePos = c - int3((int)round(offX), (int)round(offY), (int)round(offZ));
-    float here = ReadFire(herePos);
+    float sheet = saturate(length(gradF) * ReactionSheetScale);
 
-    int3 belowPos = c + int3(-(int)round(offX * 0.7), -1, -(int)round(offZ * 0.7));
-    float noiseBelow = ReadFire(belowPos);
-    float straightBelow = ReadFire(c + int3(0, -1, 0));
-    float below = noiseBelow * 0.6 + straightBelow * 0.4;
-
-    bool ceilingAbove = IsSolid(c + int3(0, 1, 0));
-
-    float riseIn  = below * FireRiseSpeed * DeltaTime;
-    float riseOut = ceilingAbove ? 0.0 : here * FireRiseSpeed * DeltaTime;
-
-    // Ceiling rollover.
-    float horizontal = 0.0;
-    if (ceilingAbove)
-    {
-        int3 xpP = c + int3( 1, 0, 0);
-        int3 xnP = c + int3(-1, 0, 0);
-        int3 zpP = c + int3( 0, 0, 1);
-        int3 znP = c + int3( 0, 0,-1);
-
-        float xp = IsSolid(xpP) ? here : FireIn[xpP];
-        float xn = IsSolid(xnP) ? here : FireIn[xnP];
-        float zp = IsSolid(zpP) ? here : FireIn[zpP];
-        float zn = IsSolid(znP) ? here : FireIn[znP];
-
-        float laplacian = (xp + xn + zp + zn) - 4.0 * here;
-        horizontal = laplacian * FireCeilingSpread * DeltaTime;
-    }
-
-    float result = here + riseIn - riseOut + horizontal;
-
-    result *= (1.0 - FireDecayRate * DeltaTime);
-
-    FireOut[id] = saturate(max(result, 0.0));
+    FireEmissionOut[id] = saturate(flame * lerp(1.0, sheet, ReactionSheetWeight));
 }
 
 // AsyncGPUReadback.Request on a Tex3D returns only z=0 on many backends.
