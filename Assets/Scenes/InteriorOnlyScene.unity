@@ -680,23 +680,27 @@ MonoBehaviour:
     smokeRate: 3
     fireRate: 1
     enabled: 1
-  riseSpeed: 1
+  riseSpeed: 10
   settleSpeed: 1
-  ceilingSpread: 3
-  decayRate: 0.01
-  smokeNoiseScale: 0.6
-  smokeNoiseStrength: 2.05
-  smokeNoiseSpeed: 4.65
-  fireRiseSpeed: 1
-  fireDecayRate: 2
+  ceilingSpread: 12
+  decayRate: -1
+  smokeNoiseScale: 0.15
+  smokeNoiseStrength: 2.4
+  smokeNoiseSpeed: 1
+  smokeWarpClamp: 0.12
+  smokeShellSharpness: 4
+  smokeAnchorRadius: 0.5
+  smokeUseCurlNoise: 1
+  fireRiseSpeed: 8
+  fireDecayRate: 1
   fireToSmokeRate: 0.25
-  fireCeilingSpread: 4
+  fireCeilingSpread: 5
   fireNoiseScale: 0.15
   fireNoiseStrength: 2.4
   fireNoiseSpeed: 1
   smokeMaterial: {fileID: 2100000, guid: 3852d5442683bbc4982d840fae93b82f, type: 2}
   windDirection: 1
-  windStrength: 2
+  windStrength: 1
   windDirectionCustom: {x: 0, y: 0, z: 0}
   attractorPoint: {fileID: 1036407983}
   attractorRadius: 5

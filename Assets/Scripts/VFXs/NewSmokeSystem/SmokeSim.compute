@@ -62,6 +62,12 @@ float SmokeNoiseScale;
 float SmokeNoiseStrength;
 float SmokeNoiseSpeed;
 
+// Smoke turbulence shaping (see Step). All in VOXEL units.
+float SmokeWarpClamp;        // hard cap on displacement, voxels
+float SmokeShellSharpness;   // how tightly the warp is confined to the boundary
+float SmokeAnchorRadius;     // turbulence fades in over this distance from an emitter
+float SmokeUseCurlNoise;     // 0 = FBM difference (old), 1 = divergence-free curl noise
+
 // -------------------------------------------------------------------
 
 bool InBounds(int3 p)
@@ -148,6 +154,110 @@ float3 NoiseVelocity(float3 p, float scale, float speed)
     return float3(ax, ay, az) * 2.0;
 }
 
+// Divergence-free turbulence. The curl of any vector field has zero
+// divergence by construction, so this swirls the smoke without locally
+// creating or destroying it -- no "breathing" of the plume silhouette.
+float3 Potential(float3 x)
+{
+    return float3(FBM(x),
+                  FBM(x + float3( 31.4,  57.7,  12.9)),
+                  FBM(x + float3(-73.2,  19.1,  88.6)));
+}
+
+float3 CurlNoise(float3 p, float scale, float speed)
+{
+    float3 stretchedP = float3(p.x, p.y * 0.4, p.z);
+
+    float3 q = stretchedP * scale + float3(Time_ * speed *  0.3,
+                                           Time_ * speed * -2.0,
+                                           Time_ * speed *  0.3);
+
+    const float e = 0.35;
+    float3 dx = float3(e, 0, 0);
+    float3 dy = float3(0, e, 0);
+    float3 dz = float3(0, 0, e);
+
+    float3 px1 = Potential(q + dx), px0 = Potential(q - dx);
+    float3 py1 = Potential(q + dy), py0 = Potential(q - dy);
+    float3 pz1 = Potential(q + dz), pz0 = Potential(q - dz);
+
+    float3 curl;
+    curl.x = (py1.z - py0.z) - (pz1.y - pz0.y);
+    curl.y = (pz1.x - pz0.x) - (px1.z - px0.z);
+    curl.z = (px1.y - px0.y) - (py1.x - py0.x);
+
+    return curl / (2.0 * e);
+}
+
+// -------------------------------------------------------------------
+// SMOKE SAMPLING / SHAPING HELPERS
+
+// Trilinear fetch of the smoke field that still respects obstacles and
+// bounds. Fractional displacement is essential: the old integer round()
+// snapped the plume a whole voxel at a time, which reads as a jitter.
+float SampleSmoke(float3 p)
+{
+    float3 fl = floor(p);
+    float3 f  = p - fl;
+    int3   b  = (int3)fl;
+
+    float c000 = ReadSmoke(b + int3(0, 0, 0));
+    float c100 = ReadSmoke(b + int3(1, 0, 0));
+    float c010 = ReadSmoke(b + int3(0, 1, 0));
+    float c110 = ReadSmoke(b + int3(1, 1, 0));
+    float c001 = ReadSmoke(b + int3(0, 0, 1));
+    float c101 = ReadSmoke(b + int3(1, 0, 1));
+    float c011 = ReadSmoke(b + int3(0, 1, 1));
+    float c111 = ReadSmoke(b + int3(1, 1, 1));
+
+    float x00 = lerp(c000, c100, f.x);
+    float x10 = lerp(c010, c110, f.x);
+    float x01 = lerp(c001, c101, f.x);
+    float x11 = lerp(c011, c111, f.x);
+
+    return lerp(lerp(x00, x10, f.y), lerp(x01, x11, f.y), f.z);
+}
+
+// Same, but a solid cell reads back as `fallback` (the local value) rather
+// than 0. Keeps the ceiling-spread laplacian no-flux instead of leaky.
+float SampleSmokeWall(float3 p, float fallback)
+{
+    int3 ip = (int3)round(p);
+    return IsSolid(ip) ? fallback : SampleSmoke(p);
+}
+
+// ~0 where density is locally uniform (the plume core, and empty air),
+// ~1 at a density boundary. Multiplying the warp by this is what stops the
+// interior from riding the noise as one rigid block.
+float ShellMask(int3 c)
+{
+    if (SmokeShellSharpness <= 0.0001) return 1.0;   // mask off, warp everywhere
+
+    float gx = ReadSmoke(c + int3(1, 0, 0)) - ReadSmoke(c - int3(1, 0, 0));
+    float gy = ReadSmoke(c + int3(0, 1, 0)) - ReadSmoke(c - int3(0, 1, 0));
+    float gz = ReadSmoke(c + int3(0, 0, 1)) - ReadSmoke(c - int3(0, 0, 1));
+
+    return saturate(length(float3(gx, gy, gz)) * SmokeShellSharpness);
+}
+
+// A real plume is near-laminar for the first couple of source diameters
+// and only then breaks into turbulence. Ramping the warp in with distance
+// from the nearest emitter anchors the base so the column can't sway at
+// its own root.
+float EmitterAnchor(float3 p)
+{
+    if (EmitterCount <= 0 || SmokeAnchorRadius <= 0.0001) return 1.0;
+
+    float nearest = 1e9;
+    for (int i = 0; i < EmitterCount; i++)
+    {
+        EmitterData e = Emitters[i];
+        nearest = min(nearest, length(p - e.center) - e.radius);
+    }
+
+    return saturate(nearest / SmokeAnchorRadius);
+}
+
 // -------------------------------------------------------------------
 
 [numthreads(8,8,8)]
@@ -205,18 +315,31 @@ void Step(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= (uint3)GridSize)) return;
 
-    if (IsSolid(int3(id)))
+    int3 c = int3(id);
+    if (IsSolid(c))
     {
         SmokeOut[id] = 0.0;
         return;
     }
 
-    int3 c = int3(id);
+    float3 pc = float3(id);        // cell centre in sampling space
+    float3 pp = pc + 0.5;          // voxel space; matches emitter/attractor coords
 
-    // Sample noise for this voxel's turbulence direction.
-    float3 pp = float3(id) + 0.5;
-    float3 noise = NoiseVelocity(pp, SmokeNoiseScale, SmokeNoiseSpeed);
+    // ---------------------------------------------------------------
+    // Build the displacement.
+    // ---------------------------------------------------------------
+    float3 turb = (SmokeUseCurlNoise > 0.5)
+        ? CurlNoise(pp, SmokeNoiseScale, SmokeNoiseSpeed)
+        : NoiseVelocity(pp, SmokeNoiseScale, SmokeNoiseSpeed);
 
+    turb *= SmokeNoiseStrength;
+
+    // Turbulence only deforms the boundary, and only away from the source.
+    // Without these two masks the noise translates the whole plume rigidly
+    // (its wavelength is wider than the plume), which is the "wobbly centre".
+    turb *= ShellMask(c) * EmitterAnchor(pp);
+
+    // Wind and attractor are bulk transport, not turbulence -- never masked.
     float3 windOffset = WindDirection * WindStrength;
 
     float3 attractorOffset = 0;
@@ -231,63 +354,52 @@ void Step(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    float3 combinedOffset = noise * SmokeNoiseStrength + windOffset + attractorOffset;
+    float3 offset = turb + windOffset + attractorOffset;
+    offset.y *= 0.5;
+    offset = clamp(offset, -SmokeWarpClamp, SmokeWarpClamp);
 
-    // Shell warp: read `here` from a noise-displaced position so smoke's
-    // outline wobbles, matching Kelvin-Helmholtz billowing behaviour.
-    // NOTE: subtract the offset -- we're doing backward (semi-Lagrangian)
-    // sampling, so a voxel wanting to move by +offset must READ from -offset.
-    float offX = clamp(combinedOffset.x, -2.5, 2.5);
-    float offY = clamp(combinedOffset.y * 0.5, -1.5, 1.5);
-    float offZ = clamp(combinedOffset.z, -2.5, 2.5);
+    // ---------------------------------------------------------------
+    // ONE warped sampling basis. Every tap is taken relative to it.
+    //
+    // This is the main correction: previously `here` was read at c - off
+    // while `below` was read at c - off*0.7 with no Y term, so `below` was
+    // not actually below `here`. The rise term fed mass in from a laterally
+    // displaced cell every frame and the column leaned with the noise.
+    //
+    // Backward (semi-Lagrangian) sampling: a voxel wanting to move by
+    // +offset must READ from -offset.
+    // ---------------------------------------------------------------
+    float3 basePos = pc - offset;
 
-    int3 herePos = c - int3((int)round(offX), (int)round(offY), (int)round(offZ));
-    float here = ReadSmoke(herePos);
+    float here  = SampleSmoke(basePos);
+    float below = SampleSmoke(basePos + float3(0, -1, 0));
+    float above = SampleSmoke(basePos + float3(0,  1, 0));
 
-    // Rise sample: pull from below with lighter noise offset, blended with
-    // straight-below so we always have some vertical component regardless
-    // of what the noise says this frame. Horizontal noise offset is also
-    // inverted here for the same backward-sampling reason; the vertical
-    // "-1" (straight down) is NOT flipped -- that's the rise mechanic.
-    int3 belowPos = c + int3(-(int)round(offX * 0.7), -1, -(int)round(offZ * 0.7));
-    float noiseBelow = ReadSmoke(belowPos);
-    float straightBelow = ReadSmoke(c + int3(0, -1, 0));
-    float below = noiseBelow * 0.5 + straightBelow * 0.5;
-
-    float above = ReadSmoke(c + int3(0, 1, 0));
-
+    // Obstacle queries stay on the TRUE cell, not the warped one.
     bool ceilingAbove = IsSolid(c + int3(0,  1, 0));
     bool floorBelow   = IsSolid(c + int3(0, -1, 0));
 
     float riseIn  = below * RiseSpeed * DeltaTime;
     float riseOut = ceilingAbove ? 0.0 : here * RiseSpeed * DeltaTime;
 
-    // Settle only where we're NOT in an active rising column, so the plume
-    // rises cleanly while outer edges of the ceiling layer drift down.
-    bool activeRisingColumn = (below > here * 0.5);
-    float settleIn = 0.0;
-    float settleOut = 0.0;
-    if (!activeRisingColumn)
-    {
-        settleIn  = above * SettleSpeed * DeltaTime;
-        settleOut = floorBelow ? 0.0 : here * SettleSpeed * DeltaTime;
-    }
+    // Soft replacement for the old boolean `activeRisingColumn`. The hard
+    // switch flipped per-voxel per-frame as the warp moved, adding shimmer.
+    float rising = saturate((below - here * 0.5) * 4.0);
 
-    // Horizontal ceiling spread: applies to the row under a ceiling AND
-    // rows below with smoke above -- lets the layer thicken downward.
+    float settleIn  = above * SettleSpeed * DeltaTime * (1.0 - rising);
+    float settleOut = floorBelow
+                    ? 0.0
+                    : here * SettleSpeed * DeltaTime * (1.0 - rising);
+
+    // Horizontal ceiling spread: the row under a ceiling AND rows below it
+    // that have smoke above, so the layer can thicken downward.
     float horizontal = 0.0;
-    bool inLayer = ceilingAbove || (above > 0.1);
-    if (inLayer)
+    if (ceilingAbove || above > 0.1)
     {
-        int3 xpP = c + int3( 1, 0, 0);
-        int3 xnP = c + int3(-1, 0, 0);
-        int3 zpP = c + int3( 0, 0, 1);
-        int3 znP = c + int3( 0, 0,-1);
-
-        float xp = IsSolid(xpP) ? here : SmokeIn[xpP];
-        float xn = IsSolid(xnP) ? here : SmokeIn[xnP];
-        float zp = IsSolid(zpP) ? here : SmokeIn[zpP];
-        float zn = IsSolid(znP) ? here : SmokeIn[znP];
+        float xp = SampleSmokeWall(basePos + float3( 1, 0, 0), here);
+        float xn = SampleSmokeWall(basePos + float3(-1, 0, 0), here);
+        float zp = SampleSmokeWall(basePos + float3( 0, 0, 1), here);
+        float zn = SampleSmokeWall(basePos + float3( 0, 0,-1), here);
 
         float laplacian = (xp + xn + zp + zn) - 4.0 * here;
         horizontal = laplacian * CeilingSpread * DeltaTime;
@@ -301,6 +413,7 @@ void Step(uint3 id : SV_DispatchThreadID)
     result *= (1.0 - DecayRate * DeltaTime);
     SmokeOut[id] = saturate(max(result, 0.0));
 }
+
 // -------------------------------------------------------------------
 // FIRE PIPELINE
 

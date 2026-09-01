@@ -34,7 +34,11 @@ public class SmokeSim : MonoBehaviour
     [Header("Sim Volume (world space)")]
     public Vector3 volumeCenter = Vector3.zero;
     public Vector3 volumeSize = new Vector3(10, 5, 10);
-    public float cellSize = 0.25f;
+
+    [Tooltip("Smaller = finer plume detail. At 0.25 with a 0.6 emitter radius " +
+             "the plume is only ~5 voxels wide, which leaves almost no interior " +
+             "for the shell mask to hold still. 0.15 is a good target.")]
+    public float cellSize = 0.15f;
 
     [Header("Room Auto-Detection")]
     public LayerMask obstacleLayers = ~0;
@@ -51,9 +55,32 @@ public class SmokeSim : MonoBehaviour
     public float decayRate = 0.005f;
 
     [Header("Smoke Noise")]
-    public float smokeNoiseScale = 0.08f;
-    public float smokeNoiseStrength = 1.0f;
-    public float smokeNoiseSpeed = 0.6f;
+    [Tooltip("Higher = smaller turbulence features. Must be small enough that " +
+             "features are NARROWER than the plume, or the noise translates the " +
+             "whole plume rigidly instead of deforming it. Rough guide: feature " +
+             "size in voxels is about 1/scale.")]
+    public float smokeNoiseScale = 0.25f;
+    public float smokeNoiseStrength = 0.7f;
+    public float smokeNoiseSpeed = 0.35f;
+
+    [Header("Smoke Turbulence Shaping")]
+    [Tooltip("Hard cap on warp displacement, in VOXELS. Keep well below the " +
+             "plume radius in voxels or the core gets yanked around.")]
+    public float smokeWarpClamp = 1.2f;
+
+    [Tooltip("How tightly turbulence is confined to the density boundary. " +
+             "Higher = more of the plume interior stays rigid. 0 disables the " +
+             "mask (old behaviour).")]
+    public float smokeShellSharpness = 4.0f;
+
+    [Tooltip("World-space distance from an emitter over which turbulence fades " +
+             "in. Anchors the base of the plume so it cannot sway at its root. " +
+             "0 disables.")]
+    public float smokeAnchorRadius = 0.5f;
+
+    [Tooltip("Use divergence-free curl noise for smoke. Costs ~2x the noise " +
+             "evaluations but stops the plume silhouette breathing in and out.")]
+    public bool smokeUseCurlNoise = true;
 
     [Header("Fire")]
     public float fireRiseSpeed = 6.0f;
@@ -255,6 +282,8 @@ public class SmokeSim : MonoBehaviour
         emitterBuffer.SetData(emitterCPUCache);
         compute.SetBuffer(kEmit, "Emitters", emitterBuffer);
         compute.SetBuffer(kEmitFire, "Emitters", emitterBuffer);
+        // Step now needs the emitter list too, for the near-source anchor ramp.
+        compute.SetBuffer(kStep, "Emitters", emitterBuffer);
         compute.SetInt("EmitterCount", count);
     }
 
@@ -279,6 +308,12 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("SmokeNoiseScale", smokeNoiseScale);
         compute.SetFloat("SmokeNoiseStrength", smokeNoiseStrength);
         compute.SetFloat("SmokeNoiseSpeed", smokeNoiseSpeed);
+
+        compute.SetFloat("SmokeWarpClamp", Mathf.Max(0f, smokeWarpClamp));
+        compute.SetFloat("SmokeShellSharpness", smokeShellSharpness);
+        // Inspector value is in metres; the shader works in voxels.
+        compute.SetFloat("SmokeAnchorRadius", smokeAnchorRadius / cellSize);
+        compute.SetFloat("SmokeUseCurlNoise", smokeUseCurlNoise ? 1f : 0f);
 
         compute.SetTexture(kStep, "SmokeIn", smokeA);
         compute.SetTexture(kStep, "SmokeOut", smokeB);
