@@ -137,7 +137,14 @@ public class ThermalSimulation : MonoBehaviour
 
 
     public float firePower = 0;
-    public float diffusionRate = 1.0f;
+
+    // Was 1.0f -- this diffusion runs on the raw un-advected TemperatureIn
+    // field every single tick regardless of velocity, and at high values
+    // it out-competes any turbulence added upstream (noise, vorticity),
+    // blurring the plume back to smooth every frame. Lowered so the noise
+    // turbulence below actually survives to be visible under thermal view.
+    public float diffusionRate = 0.1f;
+
     public float buoyancyStrength = 0.01f;
     public float smokeBuoyancyStrength = 0.02f;
     public float smokeBuoyancyCutoff = 40f;   // °C above ambient -- smoke keeps its own lift above this, loses it below
@@ -167,7 +174,22 @@ public class ThermalSimulation : MonoBehaviour
 
     public float smokeGenerationRate = 1.0f;
     public float smokeDecayRate = 0.01f;
-    public float smokeDiffusionRate = 1f;
+
+    // Was 1f -- same reasoning as diffusionRate above: this runs every tick
+    // on SmokeIn regardless of velocity and will erase noise-driven
+    // turbulence in the smoke field if left too high.
+    public float smokeDiffusionRate = 0.15f;
+
+    [Header("Turbulence Noise")]
+    [Tooltip("Ported from SmokeSim -- curl-noise force added to velocity in BuoyancyStep, weighted by local heat/smoke presence.")]
+    public float noiseScale = 0.1f;
+    public float noiseStrength = 0.4f;
+    public float noiseSpeed = 1.0f;
+
+    [Header("Heat Display Noise")]
+    [Tooltip("Ragged-edge noise applied directly to the rendered FlameHeat field, so the plume silhouette stays irregular even after diffusion/resampling smooths the underlying data.")]
+    public float heatNoiseScale = 0.3f;
+    public float heatNoiseStrength = 60f;
 
     public int pressureIterations = 50;
 
@@ -185,7 +207,7 @@ public class ThermalSimulation : MonoBehaviour
     public float charRate = 0.15f;       // 0-1 over ~7s at full heat
     public float charStartTemp = 150f;
     public float charFullTemp = 400f;
-    public bool useTimeForBurn = false; 
+    public bool useTimeForBurn = false;
 
     // Cached once in Start so we don't call FindObjectsOfType twice.
     ThermalMaterial[] _thermalObjects;
@@ -196,10 +218,16 @@ public class ThermalSimulation : MonoBehaviour
     public RenderTexture GetObstacleVolume() => obstacleVolume;
 
     public RenderTexture GetFireHeatVolume() => flameHeatA;
+
+    // Exposes the actual pressure-projected velocity field (post
+    // ProjectVelocity, so it's divergence-free and obstacle-aware) for
+    // other systems -- e.g. SmokeSim -- to sample real room airflow
+    // instead of relying on fake noise/wind.
+    public RenderTexture GetVelocityVolume() => velocityA;
     public RenderTexture GetFuelVolume() => fuelA;
     public bool IsInitialized { get; private set; }
 
-     public bool infiniteFuel = false;
+    public bool infiniteFuel = false;
 
     // DEBUG//
     public bool igniteEverything;
@@ -502,6 +530,11 @@ public class ThermalSimulation : MonoBehaviour
         if (!simulationActive)
             return;
 
+        // Was never uploaded before -- AdvectFlameStep's flicker and
+        // FlameHeatStep's/BuoyancyStep's noise all key off Time_, so it
+        // needs to be live every tick alongside DeltaTime.
+        simulation.SetFloat("Time_", Time.time);
+
         simulation.SetTexture(heatKernel, "TemperatureIn", temperatureA);
 
         simulation.SetTexture(heatKernel, "TemperatureOut", temperatureB);
@@ -550,6 +583,14 @@ public class ThermalSimulation : MonoBehaviour
         simulation.SetFloat("SmokeSettleStrength", smokeSettleStrength);
 
         simulation.SetFloat("TurbulenceStrength", turbulenceStrength);
+
+        // Curl-noise turbulence (ported from SmokeSim) -- applied as a
+        // force on velocity inside BuoyancyStep.
+        simulation.SetFloat("NoiseScale", noiseScale);
+
+        simulation.SetFloat("NoiseStrength", noiseStrength);
+
+        simulation.SetFloat("NoiseSpeed", noiseSpeed);
 
         simulation.SetFloat("AmbientTemp", 20);
 
@@ -610,27 +651,6 @@ public class ThermalSimulation : MonoBehaviour
         velocityB = temp3;
         // vorticity
 
-        simulation.SetTexture(advectTemperatureKernel, "TemperatureIn",
-                              temperatureA);
-
-        simulation.SetTexture(advectTemperatureKernel, "TemperatureOut",
-                              temperatureB);
-
-        simulation.SetTexture(advectTemperatureKernel, "VelocityIn", velocityA);
-
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
-
-        simulation.SetTexture(advectTemperatureKernel, "Obstacle",
-                              obstacleVolume);
-
-        simulation.Dispatch(
-            advectTemperatureKernel, Mathf.CeilToInt(gridX / 8f),
-            Mathf.CeilToInt(gridY / 8f), Mathf.CeilToInt(gridZ / 8f));
-
-        RenderTexture tempAdvect = temperatureA;
-        temperatureA = temperatureB;
-        temperatureB = tempAdvect;
-
         simulation.SetTexture(divergenceKernel, "VelocityIn", velocityA);
 
         simulation.SetTexture(divergenceKernel, "Divergence", divergence);
@@ -678,6 +698,38 @@ public class ThermalSimulation : MonoBehaviour
         RenderTexture velProj = velocityA;
         velocityA = velocityB;
         velocityB = velProj;
+
+        // Temperature advection moved here, AFTER ProjectVelocity, so it
+        // uses the divergence-free velocity field -- same as
+        // AdvectSmokeStep and AdvectFlameStep already correctly do below.
+        // Previously this ran right after VorticityConfinementStep, i.e.
+        // BEFORE ComputeDivergence/SolvePressure/ProjectVelocity, so it was
+        // advected on a still-divergent field. Buoyancy injects strong
+        // local divergence into a rising plume, so advecting temperature
+        // with it smeared heat outward in all directions rather than along
+        // coherent streamlines -- this was the main cause of the
+        // "smooth blob" look, and it compounded every tick (smoothed temp
+        // -> smoother buoyancy next tick -> smoother velocity -> ...).
+        simulation.SetTexture(advectTemperatureKernel, "TemperatureIn",
+                              temperatureA);
+
+        simulation.SetTexture(advectTemperatureKernel, "TemperatureOut",
+                              temperatureB);
+
+        simulation.SetTexture(advectTemperatureKernel, "VelocityIn", velocityA);
+
+        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+
+        simulation.SetTexture(advectTemperatureKernel, "Obstacle",
+                              obstacleVolume);
+
+        simulation.Dispatch(
+            advectTemperatureKernel, Mathf.CeilToInt(gridX / 8f),
+            Mathf.CeilToInt(gridY / 8f), Mathf.CeilToInt(gridZ / 8f));
+
+        RenderTexture tempAdvect = temperatureA;
+        temperatureA = temperatureB;
+        temperatureB = tempAdvect;
 
         simulation.SetTexture(radiationKernel, "SolidTemperatureIn",
                               solidTemperatureA);
@@ -1009,6 +1061,11 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(flameHeatKernel, "SmokeIn", smokeA);
 
+        // Ragged-edge display noise, weighted by local smoke/flame presence.
+        simulation.SetFloat("HeatNoiseScale", heatNoiseScale);
+
+        simulation.SetFloat("HeatNoiseStrength", heatNoiseStrength);
+
         simulation.Dispatch(flameHeatKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
                             Mathf.CeilToInt(gridZ / 8f));
@@ -1018,7 +1075,7 @@ public class ThermalSimulation : MonoBehaviour
 
         Shader.SetGlobalTexture("_ObstacleTex", obstacleVolume);
 
-            
+
         volumeMaterial.SetTexture("_TemperatureTex", temperatureA);
 
         simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
@@ -1259,7 +1316,7 @@ public class ThermalSimulation : MonoBehaviour
         UploadOpeningVolume();
     }
 
-   void MarkExteriorAsObstacle(Vector3 simMin)
+    void MarkExteriorAsObstacle(Vector3 simMin)
     {
         if (volumeCollider == null)
             return;
@@ -1586,7 +1643,7 @@ public class ThermalSimulation : MonoBehaviour
 
         Bounds volumeBounds = GetSimulationBounds();
 
-        foreach(var opening in openings)
+        foreach (var opening in openings)
         {
             Collider col = opening.Collider;
             if (!col) continue;

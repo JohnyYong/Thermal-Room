@@ -29,6 +29,12 @@ int3   GridSize;
 float  DeltaTime;
 float  Time_;
 
+// This grid's own world-space placement -- needed to convert a voxel id
+// into a world position for sampling ThermalSimulation's velocity field
+// (which lives in a different grid, resolution, and origin).
+float3 Origin;
+float  CellSize;
+
 // Per-emitter data uploaded as a StructuredBuffer -- supports any number
 // of active fire sources sharing the same sim grid.
 struct EmitterData
@@ -61,6 +67,17 @@ float FireNoiseSpeed;
 float SmokeNoiseScale;
 float SmokeNoiseStrength;
 float SmokeNoiseSpeed;
+float DriftSpeed;
+
+// --- External (real) velocity field, e.g. from ThermalSimulation ---
+// A completely different grid than this one -- different resolution,
+// cell size, and world-space origin -- so sampling it requires converting
+// through world space rather than direct voxel indexing.
+Texture3D<float4> ExternalVelocity;
+float3 ExternalOrigin;
+float  ExternalCellSize;
+int3   ExternalGridSize;
+float  ExternalVelocityInfluence;
 
 // -------------------------------------------------------------------
 
@@ -148,6 +165,62 @@ float3 NoiseVelocity(float3 p, float scale, float speed)
     return float3(ax, ay, az) * 2.0;
 }
 
+// Manual trilinear sample of the external velocity field, in ITS OWN
+// voxel space (continuous coordinates, not integer). Same technique as
+// ThermalSimulation.compute's SampleVelocity -- that texture has no
+// SamplerState bound here, so this does the interpolation by hand across
+// the 8 neighboring texels.
+float4 SampleExternalVelocityRaw(float3 voxelPos)
+{
+    float3 maxCoord = float3(ExternalGridSize) - 2.0;
+    voxelPos = clamp(voxelPos, float3(0, 0, 0), max(maxCoord, float3(0,0,0)));
+
+    int3 p0 = int3(floor(voxelPos));
+    int3 p1 = p0 + 1;
+    float3 f = frac(voxelPos);
+
+    float4 c000 = ExternalVelocity[p0];
+    float4 c100 = ExternalVelocity[int3(p1.x, p0.y, p0.z)];
+    float4 c010 = ExternalVelocity[int3(p0.x, p1.y, p0.z)];
+    float4 c110 = ExternalVelocity[int3(p1.x, p1.y, p0.z)];
+    float4 c001 = ExternalVelocity[int3(p0.x, p0.y, p1.z)];
+    float4 c101 = ExternalVelocity[int3(p1.x, p0.y, p1.z)];
+    float4 c011 = ExternalVelocity[int3(p0.x, p1.y, p1.z)];
+    float4 c111 = ExternalVelocity[p1];
+
+    float4 c00 = lerp(c000, c100, f.x);
+    float4 c10 = lerp(c010, c110, f.x);
+    float4 c01 = lerp(c001, c101, f.x);
+    float4 c11 = lerp(c011, c111, f.x);
+
+    float4 c0 = lerp(c00, c10, f.y);
+    float4 c1 = lerp(c01, c11, f.y);
+
+    return lerp(c0, c1, f.z);
+}
+
+// Returns a per-tick VOXEL-SPACE offset (in THIS grid's voxels, already
+// multiplied by DeltaTime and ExternalVelocityInfluence) for a given
+// world position -- ready to add directly into combinedOffset alongside
+// noise/wind/attractor, which are also per-tick voxel-space quantities.
+//
+// Unit chain: ExternalVelocity is stored in the source grid's voxels/sec
+// -> multiply by ExternalCellSize to get world units/sec -> divide by
+// THIS grid's CellSize to get THIS grid's voxels/sec -> multiply by
+// DeltaTime to get voxels this tick -> scale by influence.
+float3 SampleExternalVelocityOffset(float3 worldPos)
+{
+    if (ExternalVelocityInfluence <= 0.0001) return float3(0, 0, 0);
+
+    float3 extVoxelPos = (worldPos - ExternalOrigin) / max(ExternalCellSize, 0.0001);
+    float4 velRaw = SampleExternalVelocityRaw(extVoxelPos);
+
+    float3 velWorldPerSec = velRaw.xyz * ExternalCellSize;
+    float3 velOwnVoxelsPerSec = velWorldPerSec / max(CellSize, 0.0001);
+
+    return velOwnVoxelsPerSec * DeltaTime * ExternalVelocityInfluence;
+}
+
 // -------------------------------------------------------------------
 
 [numthreads(8,8,8)]
@@ -231,8 +304,16 @@ void Step(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    float3 combinedOffset = noise * SmokeNoiseStrength + windOffset + attractorOffset;
+    // Real room airflow, sampled from ThermalSimulation's pressure-
+    // projected velocity field. This is what actually gives obstacle
+    // deflection/banking/venting -- it's already baked into the sampled
+    // velocity by that sim's own pressure solve, so nothing extra needs
+    // to happen here beyond adding it to the offset like any other term.
+    float3 worldPos = Origin + pp * CellSize;
+    float3 externalOffset = SampleExternalVelocityOffset(worldPos);
 
+    float3 combinedOffset = (noise * SmokeNoiseStrength + windOffset + attractorOffset) * DriftSpeed
+                           + externalOffset;
     // Shell warp: read `here` from a noise-displaced position so smoke's
     // outline wobbles, matching Kelvin-Helmholtz billowing behaviour.
     // NOTE: subtract the offset -- we're doing backward (semi-Lagrangian)
@@ -373,7 +454,15 @@ void StepFire(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    float3 combinedOffset = noise * FireNoiseStrength + windOffset + attractorOffset;
+    // Real room airflow -- same sampling as Step. Fire gets the full
+    // sampled offset here (not halved like attractorOffset above); if you
+    // want fire to feel a bit more anchored than smoke, scale this down
+    // in the same style as attractorOffset's own * 0.5.
+    float3 worldPos = Origin + p * CellSize;
+    float3 externalOffset = SampleExternalVelocityOffset(worldPos);
+
+    float3 combinedOffset = (noise * FireNoiseStrength + windOffset + attractorOffset) * DriftSpeed
+                           + externalOffset;
 
     // Shell warp for fire outline wobble.
     // NOTE: same backward-sampling correction as Step -- subtract, don't add.

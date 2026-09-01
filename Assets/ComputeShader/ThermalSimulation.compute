@@ -80,11 +80,89 @@ float DiffusionRate;
 float SolidDiffusionRate;
 
 float DeltaTime;
+float Time_;
 
 float AmbientTemp;
 float CoolingRate;
 
 float TurbulenceStrength;
+
+// --- Noise turbulence (ported from SmokeSim.compute) ---
+// Added as a force on velocity in BuoyancyStep, weighted by local
+// heat/smoke presence, so it flows naturally through self-advection,
+// vorticity confinement, and pressure projection like any other force,
+// instead of directly displacing sample positions the way SmokeSim does
+// (SmokeSim has no real velocity field to push on -- this sim does).
+float NoiseScale;
+float NoiseStrength;
+float NoiseSpeed;
+
+// --- Heat-display edge noise ---
+// Perturbs the rendered FlameHeat field directly so the plume's visible
+// silhouette stays ragged even after HeatStep/AdvectSmokeStep diffusion
+// and trilinear-sample smoothing have had their say.
+float HeatNoiseScale;
+float HeatNoiseStrength;
+
+float Hash3(float3 p)
+{
+    return frac(sin(dot(p, float3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+
+float ValueNoise(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float n000 = Hash3(i + float3(0, 0, 0));
+    float n100 = Hash3(i + float3(1, 0, 0));
+    float n010 = Hash3(i + float3(0, 1, 0));
+    float n110 = Hash3(i + float3(1, 1, 0));
+    float n001 = Hash3(i + float3(0, 0, 1));
+    float n101 = Hash3(i + float3(1, 0, 1));
+    float n011 = Hash3(i + float3(0, 1, 1));
+    float n111 = Hash3(i + float3(1, 1, 1));
+
+    float x00 = lerp(n000, n100, f.x);
+    float x10 = lerp(n010, n110, f.x);
+    float x01 = lerp(n001, n101, f.x);
+    float x11 = lerp(n011, n111, f.x);
+    float y0  = lerp(x00, x10, f.y);
+    float y1  = lerp(x01, x11, f.y);
+    return lerp(y0, y1, f.z);
+}
+
+float FBM(float3 p)
+{
+    float total = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    for (int i = 0; i < 3; i++)
+    {
+        total += ValueNoise(p * freq) * amp;
+        freq *= 2.1;
+        amp  *= 0.5;
+    }
+    return total;
+}
+
+// Curl-ish noise force for velocity. Doesn't need to be strictly
+// divergence-free -- ComputeDivergence/SolvePressure/ProjectVelocity
+// downstream already clean up whatever divergence this (or buoyancy)
+// introduces, same as the rest of the fluid pipeline.
+float3 NoiseTurbulence(float3 p, float scale, float speed)
+{
+    float3 q = p * scale + float3(Time_ * speed *  0.3,
+                                   Time_ * speed * -1.0,
+                                   Time_ * speed *  0.3);
+
+    float ax = FBM(q + float3(  0.0,   0.0,   0.0)) - FBM(q + float3( 47.3,  91.7,  13.1));
+    float ay = FBM(q + float3(101.9,  17.3,  61.5)) - FBM(q + float3(-33.7,  55.9, -22.1));
+    float az = FBM(q + float3( 71.1,  29.4, 143.2)) - FBM(q + float3( 12.5, -87.3,  99.4));
+
+    return float3(ax, ay, az) * 2.0;
+}
 
 // A single Transform-driven "FirePosition" only ever supported one fire,
 // and had to be wired up in the Inspector ahead of time. Runtime-spawned,
@@ -446,6 +524,20 @@ void BuoyancyStep(uint3 id : SV_DispatchThreadID)
         velocity.x += gradX * TurbulenceStrength * DeltaTime;
 
         velocity.z += gradZ * TurbulenceStrength * DeltaTime;
+    }
+
+    // Curl-noise turbulence (ported from SmokeSim), weighted by local
+    // heat/smoke presence so it's strongest right in the plume and fades
+    // out toward ambient air -- this is what breaks up the smooth-blob
+    // look under thermal view. Applied as a force on velocity, so it
+    // flows through self-advection, vorticity confinement, and pressure
+    // projection like any other force in this pipeline.
+    float heatPresence = saturate(thermalBuoyancy / max(SmokeBuoyancyCutoff, 0.0001));
+    float turbulencePresence = max(heatPresence, smoke);
+    if (turbulencePresence > 0.001 && NoiseStrength > 0.0)
+    {
+        float3 noise = NoiseTurbulence(float3(id) + 0.5, NoiseScale, NoiseSpeed);
+        velocity.xyz += noise * NoiseStrength * turbulencePresence * DeltaTime;
     }
 
     velocity.xyz *= 0.999;
@@ -1298,7 +1390,6 @@ float SampleFlame(float3 pos)
 
     return lerp(c0, c1, f.z);
 }
-
 [numthreads(8, 8, 8)]
 void AdvectSmokeStep(uint3 id : SV_DispatchThreadID)
 {
@@ -1323,6 +1414,20 @@ void AdvectSmokeStep(uint3 id : SV_DispatchThreadID)
     float3 currentPos = float3(id);
 
     float3 previousPos = currentPos - velocity.xyz * DeltaTime;
+
+    // Shell warp: on top of real velocity advection, perturb the sample
+    // position with noise so the visible BOUNDARY of the smoke volume
+    // wobbles, not just its interior color. This is what actually
+    // reshapes the silhouette every material sampling this volume sees.
+    // Subtracting (not adding) the offset is deliberate -- semi-Lagrangian
+    // backward sampling means "shift the visible content by +warp" means
+    // "read the source value from further back by warp" (same correction
+    // SmokeSim needed when its shell warp was inverted).
+    if (NoiseStrength > 0.0)
+    {
+        float3 warp = NoiseTurbulence(float3(id) + 0.5, NoiseScale, NoiseSpeed);
+        previousPos -= warp * NoiseStrength * 0.5;
+    }
 
     float smoke = SampleSmoke(previousPos);
 
@@ -1446,7 +1551,6 @@ void VorticityConfinementStep(uint3 id : SV_DispatchThreadID)
 
     VelocityOut[id] = velocity;
 }
-
 [numthreads(8, 8, 8)]
 void FlameGenerationStep(int3 id : SV_DispatchThreadID)
 {
@@ -1469,13 +1573,27 @@ void FlameGenerationStep(int3 id : SV_DispatchThreadID)
     flame = max(flame, 0);
 
     //---------------------------------------
-    // Burning material feeds the flame slowly
+    // Burning material feeds the flame slowly.
+    // Multiplied by a per-voxel, per-time flicker so the CORE itself is
+    // grainy at the source, rather than relying entirely on advection to
+    // rough up an already-uniform, already-saturated field. This is the
+    // same idea as SmokeSim's EmitFire flicker term.
     //---------------------------------------
+
+    float flicker = 1.0;
+    if (NoiseStrength > 0.0)
+    {
+        float n = FBM(float3(id) * NoiseScale * 2.0 +
+                      float3(Time_ * NoiseSpeed * 1.5, Time_ * NoiseSpeed * -2.0, Time_ * NoiseSpeed * 1.5));
+        // Keep it centered around 1.0 so average injection rate is
+        // unchanged -- this varies intensity, it doesn't dim the fire.
+        flicker = saturate(0.5 + n) * 1.4 + 0.3; // roughly 0.3..1.7 range
+    }
 
     if (BurningIn[id] > 0.02)
     {
     //The fire rate here is the one to alter to control fire spreading rate
-        flame += BurningIn[id] * 1.5 * DeltaTime;
+        flame += BurningIn[id] * 1.5 * DeltaTime * flicker;
     }
 
     //---------------------------------------
@@ -1485,7 +1603,7 @@ void FlameGenerationStep(int3 id : SV_DispatchThreadID)
     float thermal =
         saturate((TemperatureIn[id] - 250.0) / 600.0);
 
-    flame += thermal * 0.7 * DeltaTime;
+    flame += thermal * 0.7 * DeltaTime * flicker;
 
     //---------------------------------------
     // Limit intensity
@@ -1518,28 +1636,30 @@ void AdvectFlameStep(uint3 id : SV_DispatchThreadID)
 
     float3 velocity = VelocityIn[id].xyz;
 
-    // Flames naturally rise faster than smoke
     velocity.y += flameHere * 4.0;
 
-    // Small random sideways motion
     float random =
-        frac(sin(dot(float3(id), float3(12.9898, 78.233, 37.719))) * 43758.5453);
+        frac(sin(dot(float3(id) + Time_ * 4.0, float3(12.9898, 78.233, 37.719))) * 43758.5453);
 
     velocity.x += (random - 0.5) * flameHere * 0.5;
     velocity.z += (0.5 - random) * flameHere * 0.5;
 
     float3 currentPos = float3(id);
 
-    float3 previousPos =
-        currentPos - velocity * DeltaTime;
+    float3 previousPos = currentPos - velocity * DeltaTime;
 
-    float flame =
-        SampleFlame(previousPos);
+    // Shell warp -- same as AdvectSmokeStep. Flame's shell tends to want a
+    // slightly smaller/faster warp than smoke since it's a tighter, more
+    // energetic shape -- hence the extra 1.5x here relative to smoke's 0.5x.
+    if (NoiseStrength > 0.0)
+    {
+        float3 warp = NoiseTurbulence(float3(id) + 0.5, NoiseScale * 1.3, NoiseSpeed * 1.5);
+        previousPos -= warp * NoiseStrength * 0.75;
+    }
 
-    // Faster decay
+    float flame = SampleFlame(previousPos);
+
     flame *= 0.97;
-
-    // Remove weak flame
     flame = max(0, flame - 0.02);
 
     FlameOut[id] = flame;
@@ -1569,6 +1689,20 @@ void FlameHeatStep(uint3 id : SV_DispatchThreadID)
 
     // Flames appear hotter
     heat += flame * 200.0;
+
+    // Ragged-edge noise: perturbs the DISPLAYED heat field directly so the
+    // plume's visible silhouette stays irregular even after HeatStep's
+    // diffusion and the trilinear resampling in AdvectSmokeStep/
+    // AdvectTemperatureStep have smoothed the underlying data. Weighted by
+    // local smoke/flame presence so it roughens the tapering edges of the
+    // plume rather than adding static to the solid hot core.
+    if (HeatNoiseStrength > 0.0)
+    {
+        float n = FBM(float3(id) * HeatNoiseScale +
+                      float3(Time_ * 0.4, Time_ * -0.9, Time_ * 0.4)) - 0.5;
+        float presence = saturate(smoke + flame);
+        heat += n * HeatNoiseStrength * presence;
+    }
 
     FlameHeatOut[id] = heat;
 }

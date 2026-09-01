@@ -201,11 +201,11 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _heatPower
-      value: 10
+      value: 6
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _heatRadius
-      value: 7.5
+      value: 6
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _radiationPower
@@ -667,28 +667,28 @@ MonoBehaviour:
   emitters:
   - transform: {fileID: 1226026637}
     radius: 1.2
-    smokeRate: 3
+    smokeRate: 1.5
     fireRate: 1
     enabled: 1
   - transform: {fileID: 1169297610}
     radius: 1.2
-    smokeRate: 3
+    smokeRate: 1.5
     fireRate: 1
     enabled: 1
   - transform: {fileID: 350887612}
     radius: 1.2
-    smokeRate: 3
+    smokeRate: 1.5
     fireRate: 1
     enabled: 1
   riseSpeed: 1
-  settleSpeed: 1
+  settleSpeed: 2
   ceilingSpread: 3
   decayRate: 0.01
   smokeNoiseScale: 0.6
   smokeNoiseStrength: 2.05
   smokeNoiseSpeed: 4.65
-  fireRiseSpeed: 1
-  fireDecayRate: 2
+  fireRiseSpeed: 2
+  fireDecayRate: 1
   fireToSmokeRate: 0.25
   fireCeilingSpread: 4
   fireNoiseScale: 0.15
@@ -696,11 +696,16 @@ MonoBehaviour:
   fireNoiseSpeed: 1
   smokeMaterial: {fileID: 2100000, guid: 3852d5442683bbc4982d840fae93b82f, type: 2}
   windDirection: 1
-  windStrength: 2
+  windStrength: 1
   windDirectionCustom: {x: 0, y: 0, z: 0}
   attractorPoint: {fileID: 1036407983}
   attractorRadius: 5
   attractorStrength: 3
+  externalVelocitySource: {fileID: 639519184}
+  externalVelocityInfluence: 0
+  driftSpeed: 0
+  maxDriftSpeed: 0.5
+  driftRampDuration: 30
 --- !u!23 &55338655
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -1121,11 +1126,11 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _heatPower
-      value: 10
+      value: 6
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _heatRadius
-      value: 7.5
+      value: 6
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _radiationPower
@@ -1604,11 +1609,11 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _heatPower
-      value: 10
+      value: 6
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _heatRadius
-      value: 7.5
+      value: 6
       objectReference: {fileID: 0}
     - target: {fileID: 1585159673973591769, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: _radiationPower
@@ -2539,7 +2544,7 @@ Transform:
   m_GameObject: {fileID: 1036407982}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.167, y: 1.801, z: 2.824}
+  m_LocalPosition: {x: 0.167, y: 4.872, z: -0.951}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -3087,7 +3092,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: burnHeat
-      value: 1500
+      value: 1000
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: burnRate
@@ -3095,7 +3100,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: cellSize
-      value: 0.4
+      value: 0.3
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: charRate
@@ -3109,6 +3114,14 @@ PrefabInstance:
       propertyPath: fireSource
       value: 
       objectReference: {fileID: 2082933814}
+    - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
+      propertyPath: noiseScale
+      value: 60
+      objectReference: {fileID: 0}
+    - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
+      propertyPath: noiseSpeed
+      value: 8
+      objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: coolingRate
       value: 0.02
@@ -3127,7 +3140,11 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: diffusionRate
-      value: 0.6
+      value: 0.1
+      objectReference: {fileID: 0}
+    - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
+      propertyPath: noiseStrength
+      value: 200
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: thermalVolume
@@ -3159,7 +3176,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: buoyancyStrength
-      value: 0.5
+      value: 0.3
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: solidCoolingRate
@@ -3171,7 +3188,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: pressureIterations
-      value: 40
+      value: 15
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: smokeDiffusionRate
@@ -3183,7 +3200,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: turbulenceStrength
-      value: 0
+      value: 0.15
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: smokeBuoyancyCutoff
@@ -3211,7 +3228,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: smokeBuoyancyStrength
-      value: 1
+      value: 0.5
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: solidHeatTransferRate

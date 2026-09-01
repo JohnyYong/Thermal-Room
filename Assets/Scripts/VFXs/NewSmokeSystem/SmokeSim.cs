@@ -96,6 +96,35 @@ public class SmokeSim : MonoBehaviour
     public float attractorRadius = 5f;
     public float attractorStrength = 0f;
 
+    [Header("Real Room Airflow (optional)")]
+    [Tooltip("If assigned, SmokeSim samples this ThermalSimulation's actual pressure-projected velocity field, so smoke deflects around furniture and banks off walls/vents the way real airflow would -- instead of only the fake wind/attractor/noise offsets above. Leave unassigned to keep the old behavior exactly as-is.")]
+    public ThermalSimulation externalVelocitySource;
+
+    [Range(0f, 1f)]
+    [Tooltip("How much the real room airflow (above) blends into smoke/fire motion. 0 = fully ignored (old behavior). 1 = fully driven by real room pressure/velocity, on top of whatever wind/attractor/noise still contribute.")]
+    public float externalVelocityInfluence = 0f;
+
+    [Range(0f, 1f)]
+    [Tooltip("This IS the live dial -- it animates itself from 0 up to Max Drift Speed over Drift Ramp Duration. While the ramp is running, script writes to this every tick, so manual edits here get overwritten until the ramp finishes. After it finishes, this becomes a normal manually-adjustable slider again.")]
+    public float driftSpeed = 0f;
+
+    [Range(0f, 1f)]
+    [Tooltip("The ceiling driftSpeed ramps up to. Change this any time -- if the ramp already finished, it takes effect immediately; if it's still running, it changes where the ramp is heading.")]
+    public float maxDriftSpeed = 0.3f;
+
+    [Tooltip("Seconds after the sim starts (or after Rebake) before driftSpeed reaches maxDriftSpeed. 0 = instant, matching the old always-on behavior.")]
+    public float driftRampDuration = 4f;
+
+    // Time.time at which the ramp should start counting from. Set in
+    // Init() and reset in Rebake() so re-baking the room also restarts
+    // the drift ease-in, rather than snapping straight to full strength.
+    float driftRampStartTime;
+
+    // True once the ramp has reached its end and written the final value.
+    // After that, UploadDirectionalParams stops touching driftSpeed at all,
+    // so it goes back to being a plain manually-editable Inspector field.
+    bool driftRampFinished;
+
     Vector3 GetWindVector()
     {
         switch (windDirection)
@@ -122,6 +151,12 @@ public class SmokeSim : MonoBehaviour
     RenderTexture smokeA, smokeB;
     RenderTexture fireA, fireB;
     RenderTexture obstacle;
+
+    // Bound to the ExternalVelocity sampler whenever no ThermalSimulation
+    // is assigned (or externalVelocityInfluence is 0), so the compute
+    // shader always has a valid Texture3D<float4> bound -- Unity can throw
+    // or warn if a kernel expects a texture and nothing was ever set.
+    RenderTexture dummyExternalVelocity;
 
     int kEmit, kStep, kEmitFire, kStepFire, kClear;
     bool initialized;
@@ -175,6 +210,12 @@ public class SmokeSim : MonoBehaviour
         fireB = MakeVolume();
         obstacle = MakeVolume();
 
+        dummyExternalVelocity = new RenderTexture(1, 1, 0, RenderTextureFormat.ARGBFloat);
+        dummyExternalVelocity.dimension = UnityEngine.Rendering.TextureDimension.Tex3D;
+        dummyExternalVelocity.volumeDepth = 1;
+        dummyExternalVelocity.enableRandomWrite = true;
+        dummyExternalVelocity.Create();
+
         ClearVolume(smokeA);
         ClearVolume(smokeB);
         ClearVolume(fireA);
@@ -189,6 +230,10 @@ public class SmokeSim : MonoBehaviour
         transform.position = volumeCenter;
         transform.localScale = volumeSize;
 
+        driftRampStartTime = Time.time;
+        driftSpeed = 0f;
+        driftRampFinished = false;
+
         initialized = true;
     }
 
@@ -200,8 +245,11 @@ public class SmokeSim : MonoBehaviour
         compute.SetInts("GridSize", gridX, gridY, gridZ);
         compute.SetFloat("DeltaTime", dt);
         compute.SetFloat("Time_", Time.time);
+        compute.SetFloats("Origin", origin.x, origin.y, origin.z);
+        compute.SetFloat("CellSize", cellSize);
 
         UploadDirectionalParams();
+        UploadExternalVelocityParams();
         BuildEmitterBuffer();
 
         DispatchEmitFire();
@@ -382,6 +430,9 @@ public class SmokeSim : MonoBehaviour
         if (!initialized) return;
         Physics.SyncTransforms();
         BakeObstacleFromScene();
+        driftRampStartTime = Time.time;
+        driftSpeed = 0f;
+        driftRampFinished = false;
     }
 
     void BindRenderTextures()
@@ -402,6 +453,7 @@ public class SmokeSim : MonoBehaviour
         if (fireA != null) fireA.Release();
         if (fireB != null) fireB.Release();
         if (obstacle != null) obstacle.Release();
+        if (dummyExternalVelocity != null) dummyExternalVelocity.Release();
         if (emitterBuffer != null) emitterBuffer.Release();
         if (volumeReadBuffer != null) volumeReadBuffer.Release();
     }
@@ -413,6 +465,38 @@ public class SmokeSim : MonoBehaviour
 
         compute.SetFloats("WindDirection", wind.x, wind.y, wind.z);
         compute.SetFloat("WindStrength", windStrength);
+
+        // Ease driftSpeed itself up toward maxDriftSpeed over
+        // driftRampDuration seconds, so the Inspector slider visibly climbs
+        // in Play mode instead of a hidden value doing the ramping. Once
+        // the ramp completes, we stop writing to driftSpeed entirely so it
+        // goes back to being a normal manually-adjustable field -- without
+        // that cutoff, any manual edit here would get silently overwritten
+        // every tick forever.
+        if (!driftRampFinished)
+        {
+            if (driftRampDuration <= 0.0001f)
+            {
+                driftSpeed = maxDriftSpeed;
+                driftRampFinished = true;
+            }
+            else
+            {
+                float elapsed = Time.time - driftRampStartTime;
+                float t = Mathf.Clamp01(elapsed / driftRampDuration);
+                // Smoothstep -- eases in and out of the ramp itself so it
+                // doesn't feel like a mechanical linear slide.
+                float eased = t * t * (3f - 2f * t);
+                driftSpeed = maxDriftSpeed * eased;
+
+                if (t >= 1f)
+                {
+                    driftRampFinished = true;
+                }
+            }
+        }
+
+        compute.SetFloat("DriftSpeed", driftSpeed);
 
         if (attractorPoint != null && attractorStrength > 0f)
         {
@@ -426,6 +510,44 @@ public class SmokeSim : MonoBehaviour
             compute.SetFloats("AttractorCenter", 0, 0, 0);
             compute.SetFloat("AttractorRadius", 1f);
             compute.SetFloat("AttractorStrength", 0f);
+        }
+    }
+
+    // Binds ThermalSimulation's real, pressure-projected velocity field so
+    // Step/StepFire can sample actual room airflow -- obstacle deflection
+    // and venting toward openings come for free here, since they're already
+    // baked into that velocity field by ThermalSimulation's own pressure
+    // solve. Falls back to a 1x1x1 dummy texture and influence=0 whenever
+    // no source is assigned, so the shader always has a valid binding.
+    void UploadExternalVelocityParams()
+    {
+        bool sourceReady = externalVelocitySource != null
+            && externalVelocitySource.IsInitialized
+            && externalVelocityInfluence > 0.0001f;
+
+        if (sourceReady)
+        {
+            RenderTexture vel = externalVelocitySource.GetVelocityVolume();
+            compute.SetTexture(kStep, "ExternalVelocity", vel);
+            compute.SetTexture(kStepFire, "ExternalVelocity", vel);
+
+            Vector3 extMin = externalVelocitySource.SimBoundsMin;
+            compute.SetFloats("ExternalOrigin", extMin.x, extMin.y, extMin.z);
+            compute.SetFloat("ExternalCellSize", externalVelocitySource.CellSizePublic);
+            compute.SetInts("ExternalGridSize",
+                externalVelocitySource.GridXPublic,
+                externalVelocitySource.GridYPublic,
+                externalVelocitySource.GridZPublic);
+            compute.SetFloat("ExternalVelocityInfluence", externalVelocityInfluence);
+        }
+        else
+        {
+            compute.SetTexture(kStep, "ExternalVelocity", dummyExternalVelocity);
+            compute.SetTexture(kStepFire, "ExternalVelocity", dummyExternalVelocity);
+            compute.SetFloats("ExternalOrigin", 0, 0, 0);
+            compute.SetFloat("ExternalCellSize", 1f);
+            compute.SetInts("ExternalGridSize", 1, 1, 1);
+            compute.SetFloat("ExternalVelocityInfluence", 0f);
         }
     }
 

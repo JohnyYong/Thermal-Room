@@ -13,6 +13,15 @@ Shader "Custom/ThermalSurface"
         _BlurSigma(
             "Blur Sigma",
             Range(0.1, 5.0)) = 2.0
+
+        [Header(Cold Visibility)]
+        _MinAlpha(
+            "Min Alpha (cold floor)",
+            Range(0.0, 1.0)) = 0.6
+
+        _ColdColour(
+            "Cold Colour",
+            Color) = (0.05, 0.05, 0.15, 1)
     }
 
     SubShader
@@ -48,6 +57,9 @@ Shader "Custom/ThermalSurface"
             float _BlurRadius;
             float _BlurSigma;
 
+            float _MinAlpha;
+            float4 _ColdColour;
+
             struct appdata
             {
                 float4 vertex : POSITION;
@@ -75,13 +87,19 @@ Shader "Custom/ThermalSurface"
                 return o;
             }
 
+            // Cold end now returns _ColdColour instead of pure black. Pure
+            // black in a THERMAL palette reads as "no data" (transparent,
+            // showing whatever's underneath) rather than as a valid cold
+            // temperature reading -- which is exactly what was leaking the
+            // furniture's raw dark base texture through. A dark blue/grey
+            // reads unambiguously as "this is cold", not "this is a hole".
             float3 ThermalPalette(float heat)
             {
                 if (heat < 0.2)
                 {
-                    // Black -> White
+                    // Cold colour -> White
                     return lerp(
-                        float3(0, 0, 0),
+                        _ColdColour.rgb,
                         float3(1, 1, 1),
                         heat / 0.2);
                 }
@@ -235,11 +253,23 @@ Shader "Custom/ThermalSurface"
                     heat *
                     2.0;
 
+                // Was: alpha = smoothstep(0.2, 0.8, heat), which hits 0 at
+                // low heat -- fully transparent, letting whatever's behind
+                // this pass (the object's own raw dark base texture, from
+                // thermalGreyscaleMaterial) show through unmodified. That's
+                // what was rendering as solid black holes in the middle of
+                // visible fire: those objects hadn't heated up yet, so the
+                // thermal overlay vanished and exposed their real dark
+                // colour underneath. Flooring alpha at _MinAlpha keeps the
+                // thermal tint always dominant, so "cold" reads as a
+                // visible cold colour instead of "no overlay at all".
                 float alpha =
-                    smoothstep(
-                        0.2,
-                        0.8,
-                        heat);
+                    max(
+                        smoothstep(
+                            0.2,
+                            0.8,
+                            heat),
+                        _MinAlpha);
 
                 return float4(
                     colour * (1 + glow),
