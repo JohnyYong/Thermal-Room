@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 // Volumetric smoke + fire simulation with support for multiple emitters
@@ -262,6 +263,56 @@ public class SmokeSim : MonoBehaviour
 
     const int MaxEmitters = 32;
 
+    // -------------------------------------------------------------------
+    // Runtime emitters.
+    //
+    // There is exactly one smoke grid in the scene, so a fire spawned at
+    // play time cannot bring its own SmokeSim -- it registers an Emitter
+    // against this one instead. Mirrors ThermalSimulation's
+    // RegisterFireSource / _fireSources pattern so both sims are driven
+    // the same way.
+    //
+    // The list holds live Emitter objects and BuildEmitterBuffer re-reads
+    // them every FixedUpdate, so mutating radius/smokeRate/fireRate on a
+    // registered emitter takes effect next tick with no re-registration
+    // and no reinit.
+    // -------------------------------------------------------------------
+    static SmokeSim _instance;
+
+    public static SmokeSim Instance =>
+        _instance != null ? _instance : (_instance = FindObjectOfType<SmokeSim>());
+
+    readonly List<Emitter> _runtimeEmitters = new List<Emitter>();
+
+    void Awake()
+    {
+        if (_instance == null) _instance = this;
+    }
+
+    public void RegisterEmitter(Emitter e)
+    {
+        if (e != null && !_runtimeEmitters.Contains(e)) _runtimeEmitters.Add(e);
+    }
+
+    public void UnregisterEmitter(Emitter e)
+    {
+        _runtimeEmitters.Remove(e);
+    }
+
+    /// <summary>
+    /// True if a world point falls inside the sim volume. A fire placed
+    /// outside it emits into nothing, which is worth warning about at
+    /// spawn time rather than leaving as a silent no-op.
+    /// </summary>
+    public bool ContainsWorldPoint(Vector3 p)
+    {
+        Vector3 half = volumeSize * 0.5f;
+        Vector3 d = p - volumeCenter;
+        return Mathf.Abs(d.x) <= half.x
+            && Mathf.Abs(d.y) <= half.y
+            && Mathf.Abs(d.z) <= half.z;
+    }
+
     void Start()
     {
         if (!Application.isPlaying) return;
@@ -282,6 +333,7 @@ public class SmokeSim : MonoBehaviour
         if (matchThermalBounds && thermalSim != null)
         {
             Bounds tb = thermalSim.SimBounds;
+            Debug.Log($"[SmokeSim] Read SimBounds size={tb.size} center={tb.center}");
             volumeCenter = tb.center;
             volumeSize = tb.size;
         }
@@ -358,35 +410,40 @@ public class SmokeSim : MonoBehaviour
         BindRenderTextures();
     }
 
-    // Rebuilds the GPU emitter buffer from the Inspector list each tick.
-    // Skips disabled/null entries. Uploads the full fixed-size array
-    // (~768 bytes) rather than a partial range -- trivial cost, and it
-    // means the compute shader only ever reads the first `count` slots.
+    // Rebuilds the GPU emitter buffer from BOTH sources each tick: the
+    // Inspector list (authored, level-designer fires) and the runtime list
+    // (fires spawned by PlaceTool). Skips disabled/null entries. Uploads
+    // the full fixed-size array (~768 bytes) rather than a partial range --
+    // trivial cost, and it means the compute shader only ever reads the
+    // first `count` slots.
     void BuildEmitterBuffer()
     {
         int count = 0;
         int totalCandidates = 0;
 
+        void Add(Emitter e)
+        {
+            if (e == null || !e.enabled || e.transform == null) return;
+
+            totalCandidates++;
+            if (count >= MaxEmitters) return;
+
+            emitterCPUCache[count] = new EmitterGPU
+            {
+                center = (e.transform.position - origin) / cellSize,
+                radius = e.radius / cellSize,
+                emitRate = e.smokeRate,
+                fireRate = e.fireRate,
+            };
+            count++;
+        }
+
         if (emitters != null)
         {
-            for (int i = 0; i < emitters.Length; i++)
-            {
-                Emitter e = emitters[i];
-                if (e == null || !e.enabled || e.transform == null) continue;
-
-                totalCandidates++;
-                if (count >= MaxEmitters) continue;
-
-                emitterCPUCache[count] = new EmitterGPU
-                {
-                    center = (e.transform.position - origin) / cellSize,
-                    radius = e.radius / cellSize,
-                    emitRate = e.smokeRate,
-                    fireRate = e.fireRate,
-                };
-                count++;
-            }
+            for (int i = 0; i < emitters.Length; i++) Add(emitters[i]);
         }
+
+        for (int i = 0; i < _runtimeEmitters.Count; i++) Add(_runtimeEmitters[i]);
 
         if (totalCandidates > MaxEmitters && !loggedOverflowOnce)
         {

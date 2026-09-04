@@ -1,7 +1,27 @@
 Shader "Custom/FireHeatVolume" {
-    Properties { _FireHeatTex("Fire Heat", 3D) =
-                     "" {} _Density("Density", Float) =
-                         1 _MaxTemperature("Max Temperature", Float) = 500 }
+    Properties
+    {
+        _FireHeatTex("Fire Heat", 3D) = "" {}
+        _Density("Density", Float) = 1
+
+        // Bottom of the mapped range. Anything at or below this reads as
+        // the coldest palette colour, so it should sit at room ambient
+        // rather than absolute zero.
+        _MinTemperature("Min Temperature (C)", Float) = 20
+
+        // Top of the mapped range. MUST sit above ThermalSimulation's
+        // Flame Gas Temp C (1000 by default) or every flame pins to the
+        // darkest colour and the whole core renders as one flat blob --
+        // at the old value of 500 anything hotter than 500C was
+        // indistinguishable from anything hotter than 3000C.
+        _MaxTemperature("Max Temperature (C)", Float) = 1200
+
+        // Shapes the ramp between min and max. 1 = linear. Below 1 pushes
+        // detail into the cool end (the old hard-coded pow 0.5), above 1
+        // into the hot end. 0.75 keeps warm objects readable without
+        // throwing away the whole top of the range.
+        _HeatGamma("Heat Gamma", Range(0.25, 3)) = 0.75
+    }
 
     SubShader {
         Tags { "RenderPipeline" =
@@ -26,7 +46,9 @@ Shader "Custom/FireHeatVolume" {
                 sampler3D _FireHeatTex;
 
             float _Density;
+            float _MinTemperature;
             float _MaxTemperature;
+            float _HeatGamma;
 
             float2 RayBoxIntersection(
                 float3 rayOrigin,
@@ -111,8 +133,15 @@ Shader "Custom/FireHeatVolume" {
                                 (heat - 0.6) / 0.2);
                 }
 
-                // Red -> Dark Red
-                return lerp(float3(1, 0, 0), float3(0.35, 0, 0),
+                // Red -> Dark Red.
+                //
+                // The endpoint was (0.35, 0, 0). Against the saturated
+                // yellow and orange of the surrounding bands that reads as
+                // black, not as dark red -- simultaneous contrast does the
+                // rest. Lifting it to 0.55 with a touch of green and blue
+                // keeps it unmistakably RED while still being clearly the
+                // darkest, hottest end of the ramp.
+                return lerp(float3(1, 0, 0), float3(0.55, 0.06, 0.06),
                             (heat - 0.8) / 0.2);
             }
 
@@ -216,7 +245,22 @@ Shader "Custom/FireHeatVolume" {
 
                     float temp = tex3D(_FireHeatTex, samplePos).r;
 
-                    float heat = saturate(pow(temp / _MaxTemperature, 0.5));
+                    // Normalise across the ACTUAL mapped band rather than
+                    // from absolute zero. The old form was
+                    // pow(temp / _MaxTemperature, 0.5), which put 20C
+                    // ambient at 0.2 (pure white on this ramp) and drove
+                    // everything above _MaxTemperature to a single value.
+                    //
+                    // saturate() before pow() matters: pow() of a negative
+                    // base is undefined and returns NaN on some targets,
+                    // and a NaN here propagates through max() into the
+                    // palette. The existing !(maxHeat > 0) backstop below
+                    // catches it, but only after the fact.
+                    float t = saturate(
+                        (temp - _MinTemperature) /
+                        max(_MaxTemperature - _MinTemperature, 1e-3));
+
+                    float heat = pow(t, _HeatGamma);
 
                     maxHeat = max(maxHeat, heat);
 

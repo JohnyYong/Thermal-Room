@@ -667,18 +667,18 @@ MonoBehaviour:
   openBoundaries: 1
   emitters:
   - transform: {fileID: 1226026637}
-    radius: 1.2
-    smokeRate: 1
+    radius: 2
+    smokeRate: 3
     fireRate: 1
     enabled: 1
   - transform: {fileID: 1169297610}
-    radius: 1.2
-    smokeRate: 1
+    radius: 2
+    smokeRate: 3
     fireRate: 1
     enabled: 1
   - transform: {fileID: 350887612}
-    radius: 1.2
-    smokeRate: 1
+    radius: 2
+    smokeRate: 3
     fireRate: 1
     enabled: 1
   riseSpeed: 10
@@ -693,7 +693,7 @@ MonoBehaviour:
   smokeAnchorRadius: 0.5
   smokeUseCurlNoise: 1
   smokeDiffusion: 0.05
-  sootLuminousCutoff: 0.85
+  sootLuminousCutoff: 0.188
   thermalSim: {fileID: 639519184}
   matchThermalBounds: 1
   velocityInfluence: 1
@@ -1368,7 +1368,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 7679441955810017932, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalPosition.x
-      value: 1.557
+      value: 0.4
       objectReference: {fileID: 0}
     - target: {fileID: 7679441955810017932, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalPosition.y
@@ -1851,7 +1851,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 7679441955810017932, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalPosition.x
-      value: -1.8
+      value: -0.79
       objectReference: {fileID: 0}
     - target: {fileID: 7679441955810017932, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
       propertyPath: m_LocalPosition.y
@@ -3389,7 +3389,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 9104327960978393458, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 9119912631355376342, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.x

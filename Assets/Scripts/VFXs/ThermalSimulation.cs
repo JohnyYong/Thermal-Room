@@ -62,6 +62,15 @@ public class ThermalSimulation : MonoBehaviour
         _fireSources.Remove(src);
     }
 
+    // 1x1x1 zero volume bound to FineFireIn/FineSmokeIn whenever the fine
+    // SmokeSim fields are unavailable. FlameHeatStep samples those textures
+    // unconditionally, so leaving them unbound produces a "Property ... is
+    // not set" warning every tick and undefined reads. With FineGridSize
+    // already forced to 1,1,1 by UploadFineCoupling in that case, the box
+    // average clamps to this single zero texel -- fire/smoke read 0,
+    // emissivity is 0, and the imager correctly sees ambient.
+    RenderTexture fineFallback;
+
     RenderTexture temperatureA;
     RenderTexture temperatureB;
 
@@ -222,7 +231,7 @@ public class ThermalSimulation : MonoBehaviour
     public float charRate = 0.15f;       // 0-1 over ~7s at full heat
     public float charStartTemp = 150f;
     public float charFullTemp = 400f;
-    public bool useTimeForBurn = false; 
+    public bool useTimeForBurn = false;
 
     // Cached once in Start so we don't call FindObjectsOfType twice.
     ThermalMaterial[] _thermalObjects;
@@ -236,7 +245,7 @@ public class ThermalSimulation : MonoBehaviour
     public RenderTexture GetFuelVolume() => fuelA;
     public bool IsInitialized { get; private set; }
 
-     public bool infiniteFuel = false;
+    public bool infiniteFuel = false;
 
     // DEBUG//
     public bool igniteEverything;
@@ -339,6 +348,22 @@ public class ThermalSimulation : MonoBehaviour
 
         copyVolumeKernel = simulation.FindKernel("CopyVolumeToBuffer");
         volumeReadBuffer = new ComputeBuffer(gridX * gridY * gridZ, sizeof(float));
+
+        fineFallback = new RenderTexture(1, 1, 0, RenderTextureFormat.RFloat);
+        fineFallback.dimension = UnityEngine.Rendering.TextureDimension.Tex3D;
+        fineFallback.volumeDepth = 1;
+        fineFallback.enableRandomWrite = true;
+        fineFallback.wrapMode = TextureWrapMode.Clamp;
+        fineFallback.filterMode = FilterMode.Point;
+        fineFallback.Create();
+        // Fresh RTs are undefined, not zero. Clear once so the fallback
+        // genuinely reads 0 rather than whatever was in that memory.
+        {
+            RenderTexture prev = RenderTexture.active;
+            RenderTexture.active = fineFallback;
+            GL.Clear(false, true, Color.clear);
+            RenderTexture.active = prev;
+        }
 
         fireSourceBuffer = new ComputeBuffer(MaxFireSources, sizeof(float) * 7);
         _fireSourceCPUBuffer = new FireSourceGPU[MaxFireSources];
@@ -972,55 +997,55 @@ public class ThermalSimulation : MonoBehaviour
         if (!HasFineFields())
         {
 
-        // smoke
-        simulation.SetTexture(smokeGenerationKernel, "SmokeIn", smokeA);
+            // smoke
+            simulation.SetTexture(smokeGenerationKernel, "SmokeIn", smokeA);
 
-        simulation.SetTexture(smokeGenerationKernel, "SmokeOut", smokeB);
+            simulation.SetTexture(smokeGenerationKernel, "SmokeOut", smokeB);
 
-        simulation.SetTexture(smokeGenerationKernel, "BurningIn", burningA);
+            simulation.SetTexture(smokeGenerationKernel, "BurningIn", burningA);
 
-        simulation.SetTexture(smokeGenerationKernel, "OpeningVolume", openingVolume);
+            simulation.SetTexture(smokeGenerationKernel, "OpeningVolume", openingVolume);
 
-        simulation.SetFloat("SmokeGenerationRate", smokeGenerationRate);
+            simulation.SetFloat("SmokeGenerationRate", smokeGenerationRate);
 
-        simulation.SetFloat("OpeningVentRate", openingVentRate);
+            simulation.SetFloat("OpeningVentRate", openingVentRate);
 
-        simulation.Dispatch(smokeGenerationKernel, Mathf.CeilToInt(gridX / 8f),
-                            Mathf.CeilToInt(gridY / 8f),
-                            Mathf.CeilToInt(gridZ / 8f));
+            simulation.Dispatch(smokeGenerationKernel, Mathf.CeilToInt(gridX / 8f),
+                                Mathf.CeilToInt(gridY / 8f),
+                                Mathf.CeilToInt(gridZ / 8f));
 
-        RenderTexture smokeTemp = smokeA;
-        smokeA = smokeB;
-        smokeB = smokeTemp;
-        // smoke
+            RenderTexture smokeTemp = smokeA;
+            smokeA = smokeB;
+            smokeB = smokeTemp;
+            // smoke
 
-        // smoke2
-        simulation.SetTexture(advectSmokeKernel, "SmokeIn", smokeA);
+            // smoke2
+            simulation.SetTexture(advectSmokeKernel, "SmokeIn", smokeA);
 
-        simulation.SetTexture(advectSmokeKernel, "SmokeOut", smokeB);
+            simulation.SetTexture(advectSmokeKernel, "SmokeOut", smokeB);
 
-        simulation.SetTexture(advectSmokeKernel, "VelocityIn", velocityA);
+            simulation.SetTexture(advectSmokeKernel, "VelocityIn", velocityA);
 
-        simulation.SetTexture(advectSmokeKernel, "Obstacle", obstacleVolume);
+            simulation.SetTexture(advectSmokeKernel, "Obstacle", obstacleVolume);
 
-        simulation.SetTexture(advectSmokeKernel, "OpeningVolume", openingVolume);
+            simulation.SetTexture(advectSmokeKernel, "OpeningVolume", openingVolume);
 
-        simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
+            simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+            simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
 
-        simulation.SetFloat("SmokeDiffusionRate", smokeDiffusionRate);
+            simulation.SetFloat("SmokeDiffusionRate", smokeDiffusionRate);
 
-        simulation.SetFloat("OpeningVentRate", openingVentRate);
+            simulation.SetFloat("OpeningVentRate", openingVentRate);
 
-        simulation.Dispatch(advectSmokeKernel, Mathf.CeilToInt(gridX / 8f),
-                            Mathf.CeilToInt(gridY / 8f),
-                            Mathf.CeilToInt(gridZ / 8f));
+            simulation.Dispatch(advectSmokeKernel, Mathf.CeilToInt(gridX / 8f),
+                                Mathf.CeilToInt(gridY / 8f),
+                                Mathf.CeilToInt(gridZ / 8f));
 
-        smokeTemp = smokeA;
-        smokeA = smokeB;
-        smokeB = smokeTemp;
-        // smoke2
+            smokeTemp = smokeA;
+            smokeA = smokeB;
+            smokeB = smokeTemp;
+            // smoke2
 
         } // end !HasFineFields smoke block
 
@@ -1107,11 +1132,17 @@ public class ThermalSimulation : MonoBehaviour
         simulation.SetTexture(flameHeatKernel, "SmokeIn", smokeA);
 
         // The thermal image is built from the same fields the player sees.
-        if (HasFineFields())
-        {
-            simulation.SetTexture(flameHeatKernel, "FineFireIn", smokeSim.FireVolume);
-            simulation.SetTexture(flameHeatKernel, "FineSmokeIn", smokeSim.SmokeVolume);
-        }
+        //
+        // These MUST be bound on every dispatch, not just when the fine
+        // fields exist: this kernel is dispatched unconditionally below,
+        // and FlameHeatStep samples both textures with no guard of its own.
+        // Before SmokeSim.Init completes -- or if smokeSim is unassigned --
+        // the fallback stands in and contributes nothing.
+        bool hasFine = HasFineFields();
+        simulation.SetTexture(flameHeatKernel, "FineFireIn",
+                              hasFine ? smokeSim.FireVolume : fineFallback);
+        simulation.SetTexture(flameHeatKernel, "FineSmokeIn",
+                              hasFine ? smokeSim.SmokeVolume : fineFallback);
 
         simulation.SetFloat("AmbientTemp", 20);
 
@@ -1124,7 +1155,7 @@ public class ThermalSimulation : MonoBehaviour
 
         Shader.SetGlobalTexture("_ObstacleTex", obstacleVolume);
 
-            
+
         volumeMaterial.SetTexture("_TemperatureTex", temperatureA);
 
         simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
@@ -1222,6 +1253,7 @@ public class ThermalSimulation : MonoBehaviour
     {
         volumeReadBuffer?.Release();
         fireSourceBuffer?.Release();
+        if (fineFallback != null) fineFallback.Release();
     }
 
     public RenderTexture GetTemperatureVolume()
@@ -1365,7 +1397,7 @@ public class ThermalSimulation : MonoBehaviour
         UploadOpeningVolume();
     }
 
-   void MarkExteriorAsObstacle(Vector3 simMin)
+    void MarkExteriorAsObstacle(Vector3 simMin)
     {
         if (volumeCollider == null)
             return;
@@ -1741,7 +1773,7 @@ public class ThermalSimulation : MonoBehaviour
 
         Bounds volumeBounds = GetSimulationBounds();
 
-        foreach(var opening in openings)
+        foreach (var opening in openings)
         {
             Collider col = opening.Collider;
             if (!col) continue;

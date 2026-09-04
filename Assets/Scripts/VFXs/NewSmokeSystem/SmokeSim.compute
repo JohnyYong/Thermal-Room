@@ -83,13 +83,17 @@ StructuredBuffer<EmitterData> Emitters;
 int EmitterCount;
 
 // Smoke physics.
+// UNUSED: vertical smoke motion comes from the coarse solver velocity and
+// the SubGridBuoyancy term in TransportOffset, not from these. Kept only
+// so the existing SetFloat calls in SmokeSim.cs don't error. Adjust
+// VelocityInfluence / SubGridBuoyancy instead.
 float  RiseSpeed;
 float  SettleSpeed;
 float  CeilingSpread;
 float  DecayRate;
 
 // Fire physics.
-float  FireRiseSpeed;
+float  FireRiseSpeed;       // UNUSED: see RiseSpeed above
 float  FireDecayRate;
 float  FireToSmokeRate;
 float  FireCeilingSpread;   // unused now: ceiling rollover comes from the solver
@@ -536,7 +540,17 @@ float3 TransportOffset(int3 c, float3 pp, float noiseScale,
     offset += turb;
 
     // --- authored wind / vent attraction ---
-    offset += WindDirection * WindStrength;
+    //
+    // WindStrength is metres per second, and must be converted the same
+    // way the solver velocity above is. It used to be added raw, i.e. as
+    // voxels PER TICK: at strength 2 with a 0.15 cell on a 50Hz
+    // FixedUpdate that was 15 m/s, which on its own exceeded
+    // SmokeWarpClamp (1.2) and so clipped away the solver velocity,
+    // buoyancy and turbulence entirely. Wind stopped being one term among
+    // several and became the only one, which is why nothing else appeared
+    // to affect plume height.
+    offset += WindDirection * WindStrength * DeltaTime /
+              max(CellSizeMeters, 0.0001);
 
     if (AttractorStrength > 0.0)
     {
