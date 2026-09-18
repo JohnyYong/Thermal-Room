@@ -333,7 +333,6 @@ public class SmokeSim : MonoBehaviour
         if (matchThermalBounds && thermalSim != null)
         {
             Bounds tb = thermalSim.SimBounds;
-            Debug.Log($"[SmokeSim] Read SimBounds size={tb.size} center={tb.center}");
             volumeCenter = tb.center;
             volumeSize = tb.size;
         }
@@ -718,12 +717,26 @@ public class SmokeSim : MonoBehaviour
             Vector3 attVoxel = (attractorPoint.position - origin) / cellSize;
             compute.SetFloats("AttractorCenter", attVoxel.x, attVoxel.y, attVoxel.z);
             compute.SetFloat("AttractorRadius", attractorRadius / cellSize);
+
+            // Scale the attractor Transform to size the opening: a 1 x 2 x 0.2
+            // cube standing in a doorway behaves like that doorway. Leave the
+            // scale at zero for the old point-attractor behaviour.
+            Vector3 half = attractorPoint.lossyScale * 0.5f / cellSize;
+            compute.SetFloats("AttractorHalfExtents",
+                              Mathf.Abs(half.x), Mathf.Abs(half.y), Mathf.Abs(half.z));
+
+            // Smoke inside the opening travels along the Transform's blue
+            // axis, so point it the way you want the smoke to go.
+            Vector3 flow = attractorPoint.forward.normalized;
+            compute.SetFloats("AttractorFlowDir", flow.x, flow.y, flow.z);
             compute.SetFloat("AttractorStrength", attractorStrength);
         }
         else
         {
             compute.SetFloats("AttractorCenter", 0, 0, 0);
             compute.SetFloat("AttractorRadius", 1f);
+            compute.SetFloats("AttractorHalfExtents", 0f, 0f, 0f);
+            compute.SetFloats("AttractorFlowDir", 0f, 1f, 0f);
             compute.SetFloat("AttractorStrength", 0f);
         }
     }

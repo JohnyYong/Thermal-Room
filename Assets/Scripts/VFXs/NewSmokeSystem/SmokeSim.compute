@@ -23,7 +23,9 @@ float WindStrength;
 
 // --- Fire/Vent attraction point ---
 float3 AttractorCenter;
-float AttractorRadius;
+float AttractorRadius;       // falloff distance BEYOND the box surface, voxels
+float3 AttractorHalfExtents; // box half-size in voxels; 0 = point attractor
+float3 AttractorFlowDir;     // unit direction smoke takes once inside the box
 float AttractorStrength;
 
 int3   GridSize;
@@ -554,13 +556,44 @@ float3 TransportOffset(int3 c, float3 pp, float noiseScale,
 
     if (AttractorStrength > 0.0)
     {
-        float3 toAttractor = AttractorCenter - pp;
-        float distAtt = length(toAttractor);
-        if (distAtt > 0.001)
+        // Box attractor rather than a point.
+        //
+        // A point attractor pulls radially from every direction, so smoke
+        // converges on one spot and reads as a plughole. A doorway or vent
+        // is a REGION smoke passes through: outside it you are drawn to the
+        // nearest face, inside it you keep travelling along the opening's
+        // axis instead of collapsing to the middle.
+        //
+        // Standard signed-distance form for a box: offset by the half
+        // extents, clamp the negatives away, and the length of what remains
+        // is the distance to the surface -- exactly 0 anywhere inside.
+        float3 d = pp - AttractorCenter;
+        float3 q = abs(d) - AttractorHalfExtents;
+        float3 outside = max(q, 0.0);
+        float dist = length(outside);
+
+        float pull = saturate(1.0 - dist / max(AttractorRadius, 0.0001));
+
+        float3 dir;
+        if (dist > 0.001)
         {
-            float pull = saturate(1.0 - distAtt / max(AttractorRadius, 0.0001));
-            offset += normalize(toAttractor) * pull * AttractorStrength;
+            // Toward the nearest point on the box. Only the axes actually
+            // outside contribute, so flow arrives roughly perpendicular to
+            // the nearest face rather than aiming at the centre -- which is
+            // what makes it read as a draught instead of a vacuum.
+            dir = -normalize(outside * sign(d));
         }
+        else
+        {
+            // Inside the opening: carry on through it. Without this the
+            // smoke reaches the box and stalls, which looks worse than the
+            // point attractor did.
+            dir = AttractorFlowDir;
+        }
+
+        // Same m/s -> voxels-per-tick conversion as the wind above.
+        offset += dir * pull * AttractorStrength *
+                  DeltaTime / max(CellSizeMeters, 0.0001);
     }
 
     return clamp(offset, -SmokeWarpClamp, SmokeWarpClamp);
