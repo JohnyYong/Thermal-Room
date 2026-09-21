@@ -637,6 +637,7 @@ GameObject:
   - component: {fileID: 55338655}
   - component: {fileID: 55338654}
   - component: {fileID: 55338658}
+  - component: {fileID: 55338659}
   m_Layer: 0
   m_Name: CustomFireManager (Smoke+Fire)
   m_TagString: Untagged
@@ -668,23 +669,23 @@ MonoBehaviour:
   emitters:
   - transform: {fileID: 1226026637}
     radius: 2
-    smokeRate: 3
-    fireRate: 1
+    smokeRate: 0
+    fireRate: 0
     enabled: 1
   - transform: {fileID: 1169297610}
     radius: 2
-    smokeRate: 3
-    fireRate: 1
+    smokeRate: 0
+    fireRate: 0
     enabled: 1
   - transform: {fileID: 350887612}
     radius: 2
-    smokeRate: 3
-    fireRate: 1
+    smokeRate: 0
+    fireRate: 0
     enabled: 1
   riseSpeed: 10
   settleSpeed: 1
   ceilingSpread: 12
-  decayRate: -1.58
+  decayRate: 0
   smokeNoiseScale: 0.3
   smokeNoiseStrength: 2.14
   smokeNoiseSpeed: 1.75
@@ -715,7 +716,7 @@ MonoBehaviour:
   fireNoiseSpeed: 6
   smokeMaterial: {fileID: 2100000, guid: 3852d5442683bbc4982d840fae93b82f, type: 2}
   windDirection: 1
-  windStrength: 2.53
+  windStrength: 0
   windDirectionCustom: {x: 0, y: 0, z: 0}
   attractorPoint: {fileID: 1036407983}
   attractorRadius: 5
@@ -809,6 +810,26 @@ MonoBehaviour:
   readbackIntervalFrames: 5
   maxGizmosDrawn: 5000
   sliceY: 5
+--- !u!114 &55338659
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 55338653}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ed3cf2539f874d44aae78316cd874416, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::FireSmokeEmissionController
+  simulationManager: {fileID: 55338654}
+  maxFireEmission: 1
+  maxSmokeEmission: 3
+  startingFireEmission: 0
+  startingSmokeEmission: 0
+  sharedMultiplier: 0.005
+  smokeDecayMultiplier: 0.0005
+  maxSmokeDecay: -0.75
 --- !u!4 &64622231 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: 7679441955810017932, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
