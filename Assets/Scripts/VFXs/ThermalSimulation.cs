@@ -1253,6 +1253,11 @@ public class ThermalSimulation : MonoBehaviour
     {
         volumeReadBuffer?.Release();
         fireSourceBuffer?.Release();
+
+        if (_zeroScalarTex) Destroy(_zeroScalarTex);
+        if (_ambientScalarTex) Destroy(_ambientScalarTex);
+        if (_zeroVectorTex) Destroy(_zeroVectorTex);
+
         if (fineFallback != null) fineFallback.Release();
     }
 
@@ -2106,5 +2111,59 @@ public class ThermalSimulation : MonoBehaviour
             Mathf.CeilToInt(voxels.Count / 64f),
             1,
             1);
+    }
+
+    // Cached fill textures so repeated resets don't allocate new ones.
+    Texture3D _zeroScalarTex;
+    Texture3D _ambientScalarTex;
+    Texture3D _zeroVectorTex;
+
+    Texture3D MakeFilledVolume(TextureFormat format, float value)
+    {
+        Color[] pixels = new Color[gridX * gridY * gridZ];
+        Color c = new Color(value, value, value, value);
+        for (int i = 0; i < pixels.Length; i++) pixels[i] = c;
+
+        var tex = new Texture3D(gridX, gridY, gridZ, format, false);
+        tex.SetPixels(pixels);
+        tex.Apply();
+        return tex;
+    }
+
+    /// Puts the whole thermal sim back to its start-of-scene state.
+    public void ResetSimulation(float ambientTemp = 20f)
+    {
+        if (!IsInitialized) return;
+
+        if (_zeroScalarTex == null) _zeroScalarTex = MakeFilledVolume(TextureFormat.RFloat, 0f);
+        if (_ambientScalarTex == null) _ambientScalarTex = MakeFilledVolume(TextureFormat.RFloat, ambientTemp);
+        if (_zeroVectorTex == null) _zeroVectorTex = MakeFilledVolume(TextureFormat.RGBAFloat, 0f);
+
+        Graphics.CopyTexture(_ambientScalarTex, temperatureA);
+        Graphics.CopyTexture(_ambientScalarTex, temperatureB);
+
+        RenderTexture[] scalars =
+        {
+        pressureA, pressureB, divergence,
+        smokeA, smokeB, flameA, flameB,
+        flameHeatA, flameHeatB,
+        suppressantA, suppressantB
+    };
+        foreach (var rt in scalars) Graphics.CopyTexture(_zeroScalarTex, rt);
+
+        Graphics.CopyTexture(_zeroVectorTex, velocityA);
+        Graphics.CopyTexture(_zeroVectorTex, velocityB);
+        Graphics.CopyTexture(_zeroVectorTex, curlA);
+
+        InitializeSolidTemperature();
+
+
+        UploadObstacleVolume();
+        UploadMaterialVolume();
+        UploadFuelVolume();
+        UploadBurningVolume();
+        UploadOpeningVolume();
+
+        ResetChar();
     }
 }
