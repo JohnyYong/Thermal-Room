@@ -1698,21 +1698,26 @@ public class ThermalSimulation : MonoBehaviour
 
     bool PointInsideMeshCollider(MeshCollider meshCollider, Vector3 point)
     {
-        Ray ray = new Ray(point + Vector3.up * 1000f, Vector3.down);
+        bool prevBackfaces = Physics.queriesHitBackfaces;
+        Physics.queriesHitBackfaces = true;
 
-        RaycastHit[] hits = Physics.RaycastAll(ray, 2000f);
+        Vector3 origin = point;
+        float remaining = meshCollider.bounds.max.y - point.y + 0.1f;
+        int crossings = 0;
 
-        int hitCount = 0;
-
-        foreach (var hit in hits)
+        while (remaining > 0f && crossings < 64)
         {
-            if (hit.collider == meshCollider)
-            {
-                hitCount++;
-            }
+            if (!meshCollider.Raycast(new Ray(origin, Vector3.up), out RaycastHit hit, remaining))
+                break;
+
+            crossings++;
+            float step = hit.distance + 0.001f;   // nudge past the surface
+            origin += Vector3.up * step;
+            remaining -= step;
         }
 
-        return (hitCount & 1) == 1;
+        Physics.queriesHitBackfaces = prevBackfaces;
+        return (crossings & 1) == 1;   // odd = inside the room
     }
 
     //Re-scan the scene and rebuild the obstacle/material/fuel grid + thermal
