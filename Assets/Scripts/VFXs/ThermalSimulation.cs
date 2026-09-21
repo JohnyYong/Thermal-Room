@@ -271,6 +271,16 @@ public class ThermalSimulation : MonoBehaviour
     Collider[] openingColliders;
 
     public RenderTexture GetOpeningVolume() => openingVolume;
+
+    // Material instances created by CreateThermalClones. Tracked so they can
+    // be destroyed -- they are runtime copies, not project assets.
+    readonly List<Material> _createdThermalMaterials = new();
+
+    // Cached fill textures used by ResetSimulation so repeated resets don't
+    // allocate new full-grid textures every press.
+    Texture3D _zeroScalarTex;
+    Texture3D _ambientScalarTex;
+    Texture3D _zeroVectorTex;
     #endregion
 
 
@@ -1201,6 +1211,8 @@ public class ThermalSimulation : MonoBehaviour
         Graphics.CopyTexture(initTex, solidTemperatureA);
 
         Graphics.CopyTexture(initTex, solidTemperatureB);
+
+        Destroy(initTex);
     }
 
     RenderTexture CreateVectorVolume()
@@ -1251,14 +1263,28 @@ public class ThermalSimulation : MonoBehaviour
 
     void OnDestroy()
     {
+        DestroyThermalClones();
+
         volumeReadBuffer?.Release();
         fireSourceBuffer?.Release();
+        runtimeVoxelBuffer?.Release();
+
+        RenderTexture[] all =
+        {
+            fineFallback, temperatureA, temperatureB, velocityA, velocityB,
+            divergence, pressureA, pressureB, obstacleVolume, materialVolume,
+            openingVolume, fuelA, fuelB, burningA, burningB,
+            suppressantA, suppressantB, solidTemperatureA, solidTemperatureB,
+            curlA, smokeA, smokeB, flameA, flameB, flameHeatA, flameHeatB, charVolume
+        };
+        foreach (var rt in all)
+            if (rt != null) rt.Release();
 
         if (_zeroScalarTex) Destroy(_zeroScalarTex);
         if (_ambientScalarTex) Destroy(_ambientScalarTex);
         if (_zeroVectorTex) Destroy(_zeroVectorTex);
 
-        if (fineFallback != null) fineFallback.Release();
+        if (_instance == this) _instance = null;
     }
 
     public RenderTexture GetTemperatureVolume()
@@ -1494,6 +1520,8 @@ public class ThermalSimulation : MonoBehaviour
         temp.Apply();
 
         Graphics.CopyTexture(temp, openingVolume);
+
+        Destroy(temp);
     }
 
     void UploadObstacleVolume()
@@ -1515,6 +1543,8 @@ public class ThermalSimulation : MonoBehaviour
         temp.Apply();
 
         Graphics.CopyTexture(temp, obstacleVolume);
+
+        Destroy(temp);
     }
 
     void UploadMaterialVolume()
@@ -1536,6 +1566,8 @@ public class ThermalSimulation : MonoBehaviour
         temp.Apply();
 
         Graphics.CopyTexture(temp, materialVolume);
+
+        Destroy(temp);
     }
 
     void UploadFuelVolume()
@@ -1559,6 +1591,8 @@ public class ThermalSimulation : MonoBehaviour
         Graphics.CopyTexture(temp, fuelA);
 
         Graphics.CopyTexture(temp, fuelB);
+
+        Destroy(temp);
     }
 
     void UploadBurningVolume()
@@ -1582,6 +1616,8 @@ public class ThermalSimulation : MonoBehaviour
         Graphics.CopyTexture(temp, burningA);
 
         Graphics.CopyTexture(temp, burningB);
+
+        Destroy(temp);
     }
 
     // -------------------------------------------------------------------
@@ -1753,6 +1789,7 @@ public class ThermalSimulation : MonoBehaviour
             for (int m = 0; m < sourceMaterials.Length; m++)
             {
                 Material greyMaterial = new Material(thermalGreyscaleMaterial);
+                _createdThermalMaterials.Add(greyMaterial);
 
                 greyMaterial.CopyPropertiesFromMaterial(sourceMaterials[m]);
                 greyMaterial.shaderKeywords = new string[0];
@@ -1850,7 +1887,129 @@ public class ThermalSimulation : MonoBehaviour
         tex.SetPixels(pixels);
         tex.Apply();
         Graphics.CopyTexture(tex, charVolume);
+        Destroy(tex);
     }
+
+    #region Reset & Cleanup
+    Texture3D MakeFilledVolume(TextureFormat format, float value)
+    {
+        Color[] pixels = new Color[gridX * gridY * gridZ];
+        Color c = new Color(value, value, value, value);
+        for (int i = 0; i < pixels.Length; i++) pixels[i] = c;
+
+        var tex = new Texture3D(gridX, gridY, gridZ, format, false);
+        tex.SetPixels(pixels);
+        tex.Apply();
+        return tex;
+    }
+
+    /// Puts the whole thermal sim back to its start-of-scene state:
+    /// air/solid temperatures, fluid, smoke, flame, suppressant, fuel,
+    /// burning voxels, runtime ignitions and char. Hook this to a reset button.
+    public void ResetSimulation(float ambientTemp = 20f)
+    {
+        if (!IsInitialized) return;
+
+        if (_zeroScalarTex == null) _zeroScalarTex = MakeFilledVolume(TextureFormat.RFloat, 0f);
+        if (_ambientScalarTex == null) _ambientScalarTex = MakeFilledVolume(TextureFormat.RFloat, ambientTemp);
+        if (_zeroVectorTex == null) _zeroVectorTex = MakeFilledVolume(TextureFormat.RGBAFloat, 0f);
+
+        // Air temperature back to ambient (both ping-pong buffers)
+        Graphics.CopyTexture(_ambientScalarTex, temperatureA);
+        Graphics.CopyTexture(_ambientScalarTex, temperatureB);
+
+        // Fluid, smoke, flame and suppressant fields back to zero
+        RenderTexture[] scalars =
+        {
+            pressureA, pressureB, divergence,
+            smokeA, smokeB, flameA, flameB,
+            flameHeatA, flameHeatB,
+            suppressantA, suppressantB
+        };
+        foreach (var rt in scalars) Graphics.CopyTexture(_zeroScalarTex, rt);
+
+        Graphics.CopyTexture(_zeroVectorTex, velocityA);
+        Graphics.CopyTexture(_zeroVectorTex, velocityB);
+        Graphics.CopyTexture(_zeroVectorTex, curlA);
+
+        // Solid temperatures back to ambient
+        InitializeSolidTemperature();
+
+        // Restore the original baked grids. The CPU arrays still hold the
+        // start-of-scene values, so this undoes runtime ignitions
+        // (RegisterRuntimeBurningObject) and burned-off fuel.
+        UploadObstacleVolume();
+        UploadMaterialVolume();
+        UploadFuelVolume();
+        UploadBurningVolume();
+        UploadOpeningVolume();
+
+        // Scorch marks
+        ResetChar();
+
+        // Surfaces and volumes show the cleared state immediately,
+        // even if the sim is currently paused.
+        RebindDisplayTextures();
+
+        Debug.Log("[ThermalSimulation] Simulation reset.");
+    }
+
+    /// Binds the current simulation textures to the thermal surface globals
+    /// and the volume materials. FixedUpdate does this every tick while the
+    /// sim is active; this covers the paused case.
+    void RebindDisplayTextures()
+    {
+        Bounds bounds = GetSimulationBounds();
+        Shader.SetGlobalVector("_ThermalVolumeMin", bounds.min);
+        Shader.SetGlobalVector("_ThermalVolumeSize", bounds.size);
+
+        Shader.SetGlobalTexture("_SolidTemperatureTex", solidTemperatureA);
+        Shader.SetGlobalTexture("_ObstacleTex", obstacleVolume);
+        Shader.SetGlobalTexture("_BurningTex", burningA);
+        Shader.SetGlobalTexture("_FuelTex", fuelA);
+        Shader.SetGlobalTexture("_CharTex", charVolume);
+
+        if (volumeMaterial) volumeMaterial.SetTexture("_TemperatureTex", temperatureA);
+
+        if (smokeVolumeMaterial)
+        {
+            smokeVolumeMaterial.SetTexture("_SmokeTex", smokeA);
+            smokeVolumeMaterial.SetTexture("_FlameTex", flameA);
+            smokeVolumeMaterial.SetTexture("_TemperatureTex", temperatureA);
+        }
+
+        if (fireVolumeMaterial)
+        {
+            fireVolumeMaterial.SetTexture("_FlameTex", flameA);
+            fireVolumeMaterial.SetTexture("_SmokeTex", smokeA);
+        }
+
+        if (fireHeatVolumeMaterial) fireHeatVolumeMaterial.SetTexture("_FireHeatTex", flameHeatA);
+    }
+
+    /// Destroys every "_Thermal" clone and the material instances made for
+    /// them. Does NOT touch thermalSurfaceMaterial / thermalGreyscaleMaterial,
+    /// which are shared project assets.
+    public void DestroyThermalClones()
+    {
+        if (_thermalObjects != null)
+        {
+            foreach (var thermalObject in _thermalObjects)
+            {
+                if (thermalObject == null) continue;
+
+                Transform clone = thermalObject.transform.Find(thermalObject.name + "_Thermal");
+                if (clone != null) Destroy(clone.gameObject);
+            }
+        }
+
+        foreach (var mat in _createdThermalMaterials)
+            if (mat != null) Destroy(mat);
+
+        _createdThermalMaterials.Clear();
+        thermalSurfaceRenderers = new Renderer[0];
+    }
+    #endregion
 
     public void RegisterRuntimeBurningObject(
         Collider collider,
@@ -2111,59 +2270,5 @@ public class ThermalSimulation : MonoBehaviour
             Mathf.CeilToInt(voxels.Count / 64f),
             1,
             1);
-    }
-
-    // Cached fill textures so repeated resets don't allocate new ones.
-    Texture3D _zeroScalarTex;
-    Texture3D _ambientScalarTex;
-    Texture3D _zeroVectorTex;
-
-    Texture3D MakeFilledVolume(TextureFormat format, float value)
-    {
-        Color[] pixels = new Color[gridX * gridY * gridZ];
-        Color c = new Color(value, value, value, value);
-        for (int i = 0; i < pixels.Length; i++) pixels[i] = c;
-
-        var tex = new Texture3D(gridX, gridY, gridZ, format, false);
-        tex.SetPixels(pixels);
-        tex.Apply();
-        return tex;
-    }
-
-    /// Puts the whole thermal sim back to its start-of-scene state.
-    public void ResetSimulation(float ambientTemp = 20f)
-    {
-        if (!IsInitialized) return;
-
-        if (_zeroScalarTex == null) _zeroScalarTex = MakeFilledVolume(TextureFormat.RFloat, 0f);
-        if (_ambientScalarTex == null) _ambientScalarTex = MakeFilledVolume(TextureFormat.RFloat, ambientTemp);
-        if (_zeroVectorTex == null) _zeroVectorTex = MakeFilledVolume(TextureFormat.RGBAFloat, 0f);
-
-        Graphics.CopyTexture(_ambientScalarTex, temperatureA);
-        Graphics.CopyTexture(_ambientScalarTex, temperatureB);
-
-        RenderTexture[] scalars =
-        {
-        pressureA, pressureB, divergence,
-        smokeA, smokeB, flameA, flameB,
-        flameHeatA, flameHeatB,
-        suppressantA, suppressantB
-    };
-        foreach (var rt in scalars) Graphics.CopyTexture(_zeroScalarTex, rt);
-
-        Graphics.CopyTexture(_zeroVectorTex, velocityA);
-        Graphics.CopyTexture(_zeroVectorTex, velocityB);
-        Graphics.CopyTexture(_zeroVectorTex, curlA);
-
-        InitializeSolidTemperature();
-
-
-        UploadObstacleVolume();
-        UploadMaterialVolume();
-        UploadFuelVolume();
-        UploadBurningVolume();
-        UploadOpeningVolume();
-
-        ResetChar();
     }
 }
