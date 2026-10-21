@@ -1,5 +1,8 @@
 {
   "dependencies": {
+    "com.middlevr": "file:C:/Users/admin/Desktop/MiddleVR Packages/com.middlevr.tgz",
+    "com.middlevr.inputsystem": "file:C:/Users/admin/Desktop/MiddleVR Packages/com.middlevr.inputsystem.tgz",
+    "com.middlevr.urp": "file:C:/Users/admin/Desktop/MiddleVR Packages/com.middlevr.urp.tgz",
     "com.unity.2d.sprite": "1.0.0",
     "com.unity.ai.navigation": "2.0.13",
     "com.unity.cloud.gltfast": "6.19.0",

@@ -178,6 +178,64 @@ public class SmokeSim : MonoBehaviour
     [Header("Rendering")]
     public Material smokeMaterial;
 
+    [Header("Performance")]
+    [Range(1, 4)]
+    [Tooltip("Step the smoke/fire grid every Nth physics tick with an N-times " +
+             "larger time step. 1 = every tick (original). 2 halves the cost; " +
+             "flames may start to look slightly steppy above that.")]
+    public int tickDivider = 1;
+
+    [Tooltip("When ON, turbulence, the displacement cap, soot diffusion and " +
+             "the shell mask are rescaled so they mean the same thing in " +
+             "METRES and SECONDS whatever cellSize / tick rate you use. The " +
+             "Inspector values are treated as 'what they did at " +
+             "referenceCellSize and 50 Hz', so a look tuned at 0.15 survives " +
+             "a change to 0.2 or 0.25. OFF = original voxel-unit behaviour.")]
+    public bool resolutionIndependent = true;
+
+    [Tooltip("The cell size the noise/turbulence values were tuned at.")]
+    public float referenceCellSize = 0.15f;
+
+    const float ReferenceDt = 0.02f;   // 50 Hz, Unity's default fixed step
+    int _tickCounter;
+
+    public enum StepMode
+    {
+        [Tooltip("Original: step in FixedUpdate. Fine on one PC, but on a " +
+                 "cluster each node can take a different number of physics " +
+                 "ticks per frame, so the walls' smoke drifts apart.")]
+        FixedUpdate,
+
+        [Tooltip("Cluster-safe: exactly one step per rendered frame with a " +
+                 "constant time step, and noise driven by a step counter " +
+                 "instead of Time.time. Frame-locked nodes then run " +
+                 "identical simulations.")]
+        LockstepPerFrame
+    }
+
+    [Header("Cluster")]
+    public StepMode stepMode = StepMode.LockstepPerFrame;
+
+    [Tooltip("Lockstep mode only. Simulated seconds per rendered frame. Set " +
+             "to 1 / the CAVE's real frame rate (e.g. 0.0333 at 30 fps, " +
+             "0.0167 at 60 fps) so smoke moves at real-world speed. It must " +
+             "be a CONSTANT -- never feed it Time.deltaTime, which differs " +
+             "per node.")]
+    public float lockstepDt = 1f / 30f;
+
+    [Tooltip("Lockstep mode only. When ON this component also steps the " +
+             "ThermalSimulation, so both sims advance in the same order on " +
+             "every node.")]
+    public bool driveThermalSim = true;
+
+    // Deterministic clock for the noise. Advances by exactly dt per step,
+    // so it is identical on every node regardless of wall-clock drift.
+    float _simTime;
+
+    // kSpace converts per-voxel quantities, kTurb converts per-voxel-per-tick
+    // displacements. Both are 1 at referenceCellSize and 50 Hz.
+    float _kSpace = 1f, _kTurb = 1f;
+
     //Wind Direction and flow
     public enum WindPreset
     {
@@ -388,16 +446,49 @@ public class SmokeSim : MonoBehaviour
 
     void FixedUpdate()
     {
+        if (stepMode != StepMode.FixedUpdate) return;
+        if (thermalSim != null) thermalSim.externallyDriven = false;
+        Tick(Time.fixedDeltaTime);
+    }
+
+    void Update()
+    {
+        if (stepMode != StepMode.LockstepPerFrame) return;
+        if (!Application.isPlaying || !initialized) return;
+
+        float baseDt = Mathf.Max(lockstepDt, 1e-4f);
+
+        // Thermal first, smoke second -- the same order on every node.
+        if (thermalSim != null)
+        {
+            thermalSim.externallyDriven = driveThermalSim;
+            if (driveThermalSim && thermalSim.IsInitialized)
+                thermalSim.ExternalTick(baseDt);
+        }
+
+        Tick(baseDt);
+    }
+
+    void Tick(float baseDt)
+    {
         if (!Application.isPlaying || !initialized || compute == null) return;
 
-        float dt = Time.fixedDeltaTime;
+        int div = Mathf.Max(1, tickDivider);
+        if (++_tickCounter < div) return;
+        _tickCounter = 0;
+
+        float dt = baseDt * div;
+        _simTime += dt;
+        ComputeScaleFactors(dt);
+
         compute.SetInts("GridSize", gridX, gridY, gridZ);
         compute.SetFloat("DeltaTime", dt);
-        compute.SetFloat("Time_", Time.time);
+        compute.SetFloat("Time_", _simTime);
         compute.SetFloat("OpenBoundary", openBoundaries ? 1f : 0f);
 
         UploadCouplingParams();
         UploadDirectionalParams();
+        UploadShapingParams();
         BuildEmitterBuffer();
 
         DispatchEmitFire();
@@ -489,7 +580,9 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("SubGridBuoyancy", subGridBuoyancy);
         compute.SetFloat("FlameGasTempK", flameGasTempC + 273.15f);
         compute.SetFloat("AmbientTempK", ambientTempC + 273.15f);
-        compute.SetFloat("SmokeDiffusion", smokeDiffusion);
+        // The shader's laplacian is in voxel units, so a fixed value means
+        // more physical spreading (m^2/s) on a coarser grid. Rescale.
+        compute.SetFloat("SmokeDiffusion", smokeDiffusion * _kSpace * _kSpace);
         compute.SetFloat("SootLuminousCutoff", sootLuminousCutoff);
         compute.SetFloat("FlamePersistentRadius", flamePersistentHeight / cellSize);
         compute.SetFloat("FlameIntermittency", flameIntermittency);
@@ -545,15 +638,9 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("SettleSpeed", settleSpeed);
         compute.SetFloat("CeilingSpread", ceilingSpread);
         compute.SetFloat("DecayRate", decayRate);
-        compute.SetFloat("SmokeNoiseScale", smokeNoiseScale);
-        compute.SetFloat("SmokeNoiseStrength", smokeNoiseStrength);
+        compute.SetFloat("SmokeNoiseScale", smokeNoiseScale / _kSpace);
+        compute.SetFloat("SmokeNoiseStrength", smokeNoiseStrength * _kTurb);
         compute.SetFloat("SmokeNoiseSpeed", smokeNoiseSpeed);
-
-        compute.SetFloat("SmokeWarpClamp", Mathf.Max(0f, smokeWarpClamp));
-        compute.SetFloat("SmokeShellSharpness", smokeShellSharpness);
-        // Inspector value is in metres; the shader works in voxels.
-        compute.SetFloat("SmokeAnchorRadius", smokeAnchorRadius / cellSize);
-        compute.SetFloat("SmokeUseCurlNoise", smokeUseCurlNoise ? 1f : 0f);
 
         compute.SetTexture(kStep, "SmokeIn", smokeA);
         compute.SetTexture(kStep, "SmokeOut", smokeB);
@@ -576,8 +663,8 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("FireRiseSpeed", fireRiseSpeed);
         compute.SetFloat("FireDecayRate", fireDecayRate);
         compute.SetFloat("FireCeilingSpread", fireCeilingSpread);
-        compute.SetFloat("FireNoiseScale", fireNoiseScale);
-        compute.SetFloat("FireNoiseStrength", fireNoiseStrength);
+        compute.SetFloat("FireNoiseScale", fireNoiseScale / _kSpace);
+        compute.SetFloat("FireNoiseStrength", fireNoiseStrength * _kTurb);
         compute.SetFloat("FireNoiseSpeed", fireNoiseSpeed);
 
         compute.SetTexture(kStepFire, "FireIn", fireA);
@@ -592,6 +679,42 @@ public class SmokeSim : MonoBehaviour
 
         Dispatch(kStepFire);
         Swap(ref fireA, ref fireB);
+    }
+
+    // -------------------------------------------------------------------
+    // Resolution / tick-rate independence.
+    //
+    // Several shader quantities are expressed per VOXEL (noise frequency,
+    // diffusion, shell gradient) or per voxel PER TICK (turbulence, the
+    // displacement cap). With fixed Inspector values, a bigger cellSize
+    // therefore makes eddies bigger, diffusion blurrier and -- because
+    // SmokeWarpClamp caps the TOTAL offset, solver velocity included --
+    // raises the plume's speed limit in m/s. That is the "plume rises too
+    // fast / looks less volumetric" effect of a coarser grid.
+    // -------------------------------------------------------------------
+    void ComputeScaleFactors(float dt)
+    {
+        if (!resolutionIndependent)
+        {
+            _kSpace = 1f;
+            _kTurb = 1f;
+            return;
+        }
+
+        _kSpace = referenceCellSize / Mathf.Max(cellSize, 1e-4f);
+        _kTurb = _kSpace * (dt / ReferenceDt);
+    }
+
+    // Shared by Step AND StepFire. Uploaded once per tick, before either
+    // runs -- previously these were set inside DispatchStep, which runs
+    // after StepFire, so StepFire always used last tick's values.
+    void UploadShapingParams()
+    {
+        compute.SetFloat("SmokeWarpClamp", Mathf.Max(0f, smokeWarpClamp) * _kTurb);
+        compute.SetFloat("SmokeShellSharpness", smokeShellSharpness * _kSpace);
+        // Inspector value is in metres; the shader works in voxels.
+        compute.SetFloat("SmokeAnchorRadius", smokeAnchorRadius / cellSize);
+        compute.SetFloat("SmokeUseCurlNoise", smokeUseCurlNoise ? 1f : 0f);
     }
 
     void ClearVolume(RenderTexture rt)
@@ -829,4 +952,4 @@ public class SmokeSim : MonoBehaviour
 
     public float CellSizePublic => cellSize;
     public bool IsInitialized => initialized;
-}
+}

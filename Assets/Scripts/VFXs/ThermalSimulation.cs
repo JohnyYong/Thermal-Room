@@ -260,6 +260,33 @@ public class ThermalSimulation : MonoBehaviour
     // Set true if you ever want fire to keep spreading in the background.
     public bool simulationActive = true;
 
+    [Header("Performance")]
+    [Range(1, 4)]
+    [Tooltip("Run the thermal / Navier-Stokes step every Nth physics tick with " +
+             "an N-times larger time step. 2 halves the GPU cost of this sim. " +
+             "The smoke grid still steps every tick and simply reuses the " +
+             "latest velocity field, so the visible plume stays smooth.")]
+    public int tickDivider = 2;
+
+    int _tickCounter;
+
+    // Set by SmokeSim when it drives this sim (cluster lockstep mode). In
+    // that mode FixedUpdate does nothing and SmokeSim calls ExternalTick
+    // once per stepped frame, so every cluster node runs exactly the same
+    // sequence of thermal steps in the same order as the smoke steps.
+    [System.NonSerialized] public bool externallyDriven;
+    float _externalBaseDt = -1f;
+
+    // Time step actually used by one thermal tick.
+    float SimDt => (_externalBaseDt > 0f ? _externalBaseDt : Time.fixedDeltaTime)
+                   * Mathf.Max(1, tickDivider);
+
+    public void ExternalTick(float baseDt)
+    {
+        _externalBaseDt = baseDt;
+        Tick();
+    }
+
     [Header("Room Shape & Openings")]
     public Collider volumeCollider; //The room shape
 
@@ -531,6 +558,21 @@ public class ThermalSimulation : MonoBehaviour
 
     void FixedUpdate()
     {
+        if (externallyDriven) return;
+        _externalBaseDt = -1f;
+        Tick();
+    }
+
+    void Tick()
+    {
+        // Run the whole thermal/fluid step only every Nth physics tick, with
+        // a proportionally larger time step (SimDt). Everything below uses
+        // SimDt rather than Time.fixedDeltaTime, so heat, buoyancy and
+        // advection still advance at real-world speed -- just in fewer,
+        // larger steps.
+        if (++_tickCounter < Mathf.Max(1, tickDivider)) return;
+        _tickCounter = 0;
+
         // Char globals bound before the gate so char stays visible in normal
         // view even while the sim is paused.
 
@@ -564,7 +606,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("CharFullTemp", charFullTemp);
         simulation.SetInt("UseTimeForBurn", useTimeForBurn ? 1 : 0);
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.Dispatch(charAccumKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -597,7 +639,7 @@ public class ThermalSimulation : MonoBehaviour
             simulation.SetTexture(injectFineKernel, "FineFireIn", smokeSim.FireVolume);
             simulation.SetTexture(injectFineKernel, "FineSmokeIn", smokeSim.SmokeVolume);
 
-            simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+            simulation.SetFloat("DeltaTime", SimDt);
 
             simulation.Dispatch(injectFineKernel, Mathf.CeilToInt(gridX / 8f),
                                 Mathf.CeilToInt(gridY / 8f),
@@ -616,7 +658,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(heatKernel, "TemperatureOut", temperatureB);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.SetFloat("AmbientTemp", 20);
 
@@ -667,7 +709,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("AmbientTemp", 20);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.SetTexture(buoyancyKernel, "Obstacle", obstacleVolume);
 
@@ -683,7 +725,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(advectVelocityKernel, "VelocityOut", velocityB);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.SetTexture(advectVelocityKernel, "Obstacle", obstacleVolume);
 
@@ -737,7 +779,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(advectTemperatureKernel, "VelocityIn", velocityA);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.SetTexture(advectTemperatureKernel, "Obstacle",
                               obstacleVolume);
@@ -837,7 +879,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("SolidHeatTransferRate", solidHeatTransferRate);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.SetFloat("SolidConductionRate", solidConductionRate);
 
@@ -865,7 +907,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("SolidDiffusionRate", solidDiffusionRate);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.SetTexture(solidConductionKernel, "MaterialVolume",
                               materialVolume);
@@ -895,7 +937,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("SolidCoolingRate", solidCoolingRate);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.SetTexture(solidToAirKernel, "MaterialVolume",
                               materialVolume);
@@ -940,7 +982,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(combustionKernel, "Obstacle", obstacleVolume);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.Dispatch(combustionKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -984,7 +1026,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat(
             "DeltaTime",
-            Time.fixedDeltaTime);
+            SimDt);
 
         simulation.Dispatch(
             suppressantDecayKernel,
@@ -1042,7 +1084,7 @@ public class ThermalSimulation : MonoBehaviour
 
             simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
 
-            simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+            simulation.SetFloat("DeltaTime", SimDt);
 
             simulation.SetFloat("SmokeDiffusionRate", smokeDiffusionRate);
 
@@ -1073,7 +1115,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("FlameAirHeat", flameAirHeat);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.Dispatch(combustionToAirKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -1119,7 +1161,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(advectFlameKernel, "Obstacle", obstacleVolume);
 
-        simulation.SetFloat("DeltaTime", Time.fixedDeltaTime);
+        simulation.SetFloat("DeltaTime", SimDt);
 
         simulation.Dispatch(advectFlameKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -2276,4 +2318,4 @@ public class ThermalSimulation : MonoBehaviour
             1,
             1);
     }
-}
+}

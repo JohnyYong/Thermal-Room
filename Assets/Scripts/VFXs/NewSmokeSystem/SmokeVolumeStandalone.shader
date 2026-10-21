@@ -26,7 +26,10 @@ Shader "Custom/SmokeVolumeStandalone"
         // layer of its own plume instead of vanishing behind it.
         _FireScatter ("Fire In-Scatter", Range(0,4)) = 1.2
 
-        _StepCount       ("Ray Steps",         Range(32, 512)) = 128
+        _StepCount       ("Ray Steps",         Range(16, 512)) = 64
+
+        // Larger stride through cells with no smoke and no fire. 1 = off.
+        _EmptySkip       ("Empty Space Stride", Range(1, 4)) = 2
     }
 
     SubShader
@@ -78,6 +81,16 @@ Shader "Custom/SmokeVolumeStandalone"
             float _SootIncandescence;
             float _FireScatter;
             float _StepCount;
+            float _EmptySkip;
+
+            // Per-pixel 0..1 dither (Jimenez interleaved gradient noise).
+            // Offsetting each ray's start by a fraction of a step turns the
+            // banding you get from few steps into fine noise, which is far
+            // less visible -- this is what lets the step count come down.
+            float IGN(float2 pixel)
+            {
+                return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+            }
 
             struct appdata
             {
@@ -141,91 +154,86 @@ Shader "Custom/SmokeVolumeStandalone"
                 float2 hit = RayBox(ro, rd, float3(0,0,0), float3(1,1,1));
                 if (hit.x > hit.y) discard;
 
-                float entry  = max(hit.x, 0);
-                float travel = hit.y - entry;
-                int   steps  = (int)_StepCount;
-                float step   = travel / steps;
+                float entry   = max(hit.x, 0);
+                float exitT   = hit.y;
+                int   steps   = (int)_StepCount;
+                float stepLen = (exitT - entry) / steps;
 
-                // Per-eye scene depth sample. SampleSceneDepth already
-                // handles the stereo texture array under the hood when
-                // the shader is compiled with instancing support.
+                // ---------------------------------------------------------
+                // Scene-depth limit, computed ONCE per pixel.
+                //
+                // Eye depth is linear along a straight ray, so instead of a
+                // world + view transform on every step, find where the ray
+                // passes behind opaque geometry and stop there. The old loop
+                // also used `continue` once behind geometry, so it kept
+                // iterating (and transforming) all the way to the far side
+                // of the box for nothing.
+                // ---------------------------------------------------------
                 float2 sceneUV = i.screenPos.xy / i.screenPos.w;
-                float rawSceneDepth = SampleSceneDepth(sceneUV);
-                float sceneEyeDepth = LinearEyeDepth(rawSceneDepth, _ZBufferParams);
+                float sceneEyeDepth = LinearEyeDepth(SampleSceneDepth(sceneUV), _ZBufferParams) + 0.02;
 
-                float3 pos = ro + rd * entry;
+                float3 wEntry = mul(unity_ObjectToWorld, float4(ro + rd * entry - 0.5, 1)).xyz;
+                float3 wExit  = mul(unity_ObjectToWorld, float4(ro + rd * exitT - 0.5, 1)).xyz;
+                float dEntry  = -TransformWorldToView(wEntry).z;
+                float dExit   = -TransformWorldToView(wExit).z;
 
-                // Emission accumulated so far, already premultiplied.
-                float3 accum = 0;
+                if (dEntry > sceneEyeDepth) discard;
+                if (dExit > sceneEyeDepth)
+                    exitT = entry + (exitT - entry) *
+                            saturate((sceneEyeDepth - dEntry) / max(dExit - dEntry, 1e-5));
 
-                // Fraction of light from behind that still reaches the eye.
-                // Tracking transmittance directly rather than alpha makes the
-                // emission/absorption split explicit: emission is scaled by
-                // the transmittance IN FRONT of it, absorption reduces the
-                // transmittance for everything behind.
-                float transmittance = 1.0;
+                float t = entry + stepLen * IGN(i.pos.xy);
+
+                float3 accum = 0;            // premultiplied emission
+                float transmittance = 1.0;   // light from behind still reaching the eye
 
                 [loop]
                 for (int s = 0; s < steps; s++)
                 {
-                    float3 sampleLocal = pos - 0.5;
-                    float3 sampleWorld = mul(unity_ObjectToWorld, float4(sampleLocal, 1)).xyz;
-                    float sampleEyeDepth = -TransformWorldToView(sampleWorld).z;
+                    if (t >= exitT) break;
 
-                    if (sampleEyeDepth > sceneEyeDepth + 0.02)
+                    float3 pos  = ro + rd * t;
+                    float smokeD = tex3Dlod(_SmokeTex, float4(pos, 0)).r;
+                    float fireD  = tex3Dlod(_FireTex,  float4(pos, 0)).r;
+
+                    // Empty cell: nothing to emit or absorb, stride further.
+                    if (smokeD <= 0.005 && fireD <= 0.001)
                     {
-                        pos += rd * step;
+                        t += stepLen * _EmptySkip;
                         continue;
                     }
-
-                    float smokeD = tex3D(_SmokeTex, pos).r;
-                    float fireD  = tex3D(_FireTex,  pos).r;
 
                     // --- emission first: this cell's light passes through
                     //     only what is already in front of it ---
                     if (fireD > 0.001)
                     {
                         float edgeBoost = smoothstep(0.0, 0.15, fireD);
-
                         float3 fc = FireColor(fireD) * fireD
-                                  * _FireBrightness * step * edgeBoost;
-
+                                  * _FireBrightness * stepLen * edgeBoost;
                         accum += fc * transmittance;
                     }
 
                     // --- then absorption, which affects everything behind ---
                     if (smokeD > 0.005)
                     {
-                        float3 sc = lerp(_SmokeColorLow.rgb,
-                                         _SmokeColorHigh.rgb,
-                                         saturate(smokeD));
+                        float3 sc = lerp(_SmokeColorLow.rgb, _SmokeColorHigh.rgb, saturate(smokeD));
 
-                        float sa = saturate(smokeD * step * _Density * 4.0);
+                        float sa = saturate(smokeD * stepLen * _Density * 4.0);
 
                         // Glowing soot in the reaction zone does not occlude.
-                        // Without this the flame is buried under the very
-                        // smoke it is producing.
                         sa *= saturate(1.0 - fireD * _SootIncandescence);
 
                         // In-scattering: soot next to a flame is lit by it.
                         if (fireD > 0.001)
-                        {
                             sc += FireColor(fireD) * fireD * _FireScatter;
-                        }
 
                         accum += sc * sa * transmittance;
-
                         transmittance *= (1.0 - sa);
 
-                        // Early-out only once the remaining contribution is
-                        // genuinely negligible. At 0.01 the ray was
-                        // terminating inside the plume before reaching the
-                        // flame at its centre, so no amount of fire
-                        // brightness could ever show up.
                         if (transmittance < 0.002) break;
                     }
 
-                    pos += rd * step;
+                    t += stepLen;
                 }
 
                 // Premultiplied output: RGB is already transmittance-weighted,

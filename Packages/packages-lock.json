@@ -1,5 +1,29 @@
 {
   "dependencies": {
+    "com.middlevr": {
+      "version": "file:C:/Users/admin/Desktop/MiddleVR Packages/com.middlevr.tgz",
+      "depth": 0,
+      "source": "local-tarball",
+      "dependencies": {}
+    },
+    "com.middlevr.inputsystem": {
+      "version": "file:C:/Users/admin/Desktop/MiddleVR Packages/com.middlevr.inputsystem.tgz",
+      "depth": 0,
+      "source": "local-tarball",
+      "dependencies": {
+        "com.middlevr": "3.1.3",
+        "com.unity.inputsystem": "1.7.0"
+      }
+    },
+    "com.middlevr.urp": {
+      "version": "file:C:/Users/admin/Desktop/MiddleVR Packages/com.middlevr.urp.tgz",
+      "depth": 0,
+      "source": "local-tarball",
+      "dependencies": {
+        "com.middlevr": "3.1.3",
+        "com.unity.render-pipelines.universal": "14.0.8"
+      }
+    },
     "com.unity.2d.sprite": {
       "version": "1.0.0",
       "depth": 0,

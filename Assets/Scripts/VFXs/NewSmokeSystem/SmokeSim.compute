@@ -533,13 +533,30 @@ float3 TransportOffset(int3 c, float3 pp, float noiseScale,
     float3 offset = vel * DeltaTime / max(CellSizeMeters, 0.0001);
 
     // --- sub-grid turbulence, already in voxels ---
-    float3 turb = (SmokeUseCurlNoise > 0.5)
-        ? CurlNoise(pp, noiseScale, noiseSpeed)
-        : NoiseVelocity(pp, noiseScale, noiseSpeed);
+    //
+    // The mask is evaluated FIRST. Curl noise costs 6 Potential() calls =
+    // 54 value-noise lookups per voxel per kernel, and the result was
+    // multiplied by a mask that is exactly 0 in empty air, in the uniform
+    // plume core and at the emitter root -- i.e. most of the grid. Skipping
+    // the noise there gives an identical result for a fraction of the cost.
+    // Whole 8x8x8 thread groups in empty air skip together, so divergence
+    // is not an issue.
+    float turbMask = noiseStrength * ShellMask(c) * EmitterAnchor(pp);
 
-    turb *= noiseStrength * ShellMask(c) * EmitterAnchor(pp);
+    [branch]
+    if (abs(turbMask) > 1e-4)
+    {
+        // if/else, not ?: -- with FXC the HLSL ternary evaluates BOTH
+        // operands, so the old form paid for curl noise AND plain noise.
+        float3 turb;
+        [branch]
+        if (SmokeUseCurlNoise > 0.5)
+            turb = CurlNoise(pp, noiseScale, noiseSpeed);
+        else
+            turb = NoiseVelocity(pp, noiseScale, noiseSpeed);
 
-    offset += turb;
+        offset += turb * turbMask;
+    }
 
     // --- authored wind / vent attraction ---
     //
@@ -834,4 +851,4 @@ void CopyVolumeToBuffer(uint3 id : SV_DispatchThreadID)
 
     int index = id.x + CopyDims.x * (id.y + CopyDims.y * id.z);
     CopyDest[index] = CopySource[id];
-}
+}

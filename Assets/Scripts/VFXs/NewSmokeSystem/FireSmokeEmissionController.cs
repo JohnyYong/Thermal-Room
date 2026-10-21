@@ -1,4 +1,8 @@
+#if UNITY_EDITOR
 using UnityEditor.ShaderKeywordFilter;
+#endif
+
+
 using UnityEngine;
 
 public class FireSmokeEmissionController : MonoBehaviour
