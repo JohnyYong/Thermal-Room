@@ -11,10 +11,13 @@ public class SmokeSim : MonoBehaviour
     [System.Serializable]
     public class Emitter
     {
-        [Tooltip("Where smoke/fire is generated. Move to move the source.")]
+        [Tooltip("Centre of the burning SURFACE. Flame and smoke are emitted " +
+                 "in a thin bed here and rise from it -- put this on top of " +
+                 "the fuel (or on the floor for a pool/pile), not in the " +
+                 "middle of the object.")]
         public Transform transform;
 
-        [Tooltip("World-space radius of the emit ball.")]
+        [Tooltip("World-space horizontal radius of the fuel bed.")]
         public float radius = 0.6f;
 
         [Range(0f, 20f)]
@@ -76,15 +79,16 @@ public class SmokeSim : MonoBehaviour
 
     [Header("Smoke Turbulence Shaping")]
     [Tooltip("Hard cap on warp displacement, in VOXELS. Keep well below the " +
-             "plume radius in voxels or the core gets yanked around.")]
+             "plume radius in voxels or the core gets yanked around. Also caps " +
+             "plume speed: 1.2 voxels/tick at 0.1 m cells and 50 Hz is ~6 m/s.")]
     public float smokeWarpClamp = 1.2f;
 
     [Tooltip("How tightly turbulence is confined to the density boundary. " +
              "Higher = more of the plume interior stays rigid. 0 disables the " +
-             "mask (old behaviour).")]
+             "mask (old behaviour). Fire is masked by its own edge, smoke by its.")]
     public float smokeShellSharpness = 4.0f;
 
-    [Tooltip("World-space distance from an emitter over which turbulence fades " +
+    [Tooltip("Height above a fuel bed, in metres, over which turbulence fades " +
              "in. Anchors the base of the plume so it cannot sway at its root. " +
              "0 disables.")]
     public float smokeAnchorRadius = 0.5f;
@@ -121,21 +125,65 @@ public class SmokeSim : MonoBehaviour
     public float velocityInfluence = 1.0f;
 
     [Range(0f, 1f)]
-    [Tooltip("Buoyant acceleration added on this grid because the coarse " +
-             "solver cannot resolve a flame only a couple of its cells wide. " +
-             "0.3-0.5 is reasonable; 0 relies on the solver alone.")]
-    public float subGridBuoyancy = 0.4f;
+    [Tooltip("Fraction of the ideal plume rise speed sqrt(2 g' h) applied on " +
+             "this grid. Gives the flame lift from the very first tick, before " +
+             "the coarse solver has spun up, and covers what a solver cell too " +
+             "coarse to resolve the flame cannot. 0.4-0.6 is reasonable; 0 " +
+             "relies on the solver alone.")]
+    public float subGridBuoyancy = 0.5f;
+
+    [Tooltip("Entrainment coefficient. Ambient air is drawn into the plume at " +
+             "about this fraction of its rise speed, which tapers the flame " +
+             "toward its axis. ~0.1 is physical; 0 gives a straight column.")]
+    public float plumeEntrainment = 0.1f;
+
+    [Header("Fire Bed")]
+    [Range(0.05f, 1f)]
+    [Tooltip("Bed half-height as a fraction of emitter radius. The emitter is " +
+             "a flat bed of fuel the flame rises from, not a ball.")]
+    public float fireBedThickness = 0.25f;
+
+    [Range(0f, 1f)]
+    [Tooltip("0 = uniform disc. 1 = bed fully broken into hot spots, each " +
+             "feeding its own flame tongue.")]
+    public float fireBedBreakup = 0.7f;
+
+    [Tooltip("World size of one hot spot on the bed, metres.")]
+    public float fireBedFeatureSize = 0.25f;
+
+    [Tooltip("How fast hot spots come and go, 1/s.")]
+    public float fireBedNoiseSpeed = 1.5f;
+
+    [Header("Burning Surfaces (from ThermalSimulation)")]
+    [Tooltip("Emit flame and smoke from every burning surface in the thermal " +
+             "sim: runtime-ignited objects and fire that has spread. With this " +
+             "ON, RuntimeFire needs no emitter of its own -- whatever is " +
+             "actually burning is what shows flame.")]
+    public bool emitFromBurningSurfaces = true;
+
+    [Range(0f, 2f)]
+    [Tooltip("Fire density at a fully burning surface. Above 1 the bed " +
+             "saturates and the hot-spot breakup stops showing.")]
+    public float surfaceFireRate = 1.0f;
+
+    [Range(0f, 20f)]
+    [Tooltip("Smoke density added per second at a burning surface.")]
+    public float surfaceSmokeRate = 1.0f;
+
+    [Tooltip("How far out from a burning surface flame is emitted, metres. " +
+             "This is the thickness of the fuel bed.")]
+    public float surfaceFlameDepth = 0.15f;
 
     [Header("Flame Appearance")]
     [Tooltip("Per-second subtraction applied to the flame field. Keeps flame " +
              "tips crisp instead of fading into haze.")]
     public float fireCutoff = 0.15f;
 
-    [Tooltip("World-space extent of the continuously luminous zone above the " +
-             "fuel bed. Beyond this, flame survives only in intermittent " +
-             "pockets. Roughly the height at which a real flame stops being " +
-             "solid and starts flickering into detached tongues.")]
-    public float flamePersistentHeight = 0.8f;
+    [Tooltip("Height above the fuel bed of the continuously luminous zone, " +
+             "metres. Beyond this, flame survives only in intermittent " +
+             "pockets. Also where the sub-grid rise speed stops growing. " +
+             "1.0-1.5 suits a mattress-sized fire.")]
+    public float flamePersistentHeight = 1.0f;
 
     [Tooltip("Extinction rate in the diluted region, 1/s. 0 gives a flame " +
              "that burns continuously from the fuel to wherever it decays -- " +
@@ -240,6 +288,10 @@ public class SmokeSim : MonoBehaviour
     // is driving. Unity validates every referenced texture at dispatch time
     // regardless of whether the shader path actually reads it.
     RenderTexture fallbackVelocity;
+
+    // 1x1x1 float stand-in bound to CoarseBurning / CoarseObstacle when the
+    // thermal sim isn't available, for the same reason as fallbackVelocity.
+    RenderTexture fallbackScalar;
 
     int kEmit, kStep, kEmitFire, kStepFire, kClear, kFireEmission;
     bool initialized;
@@ -368,6 +420,20 @@ public class SmokeSim : MonoBehaviour
         fallbackVelocity.wrapMode = TextureWrapMode.Clamp;
         fallbackVelocity.Create();
 
+        fallbackScalar = new RenderTexture(1, 1, 0, RenderTextureFormat.RFloat);
+        fallbackScalar.dimension = UnityEngine.Rendering.TextureDimension.Tex3D;
+        fallbackScalar.volumeDepth = 1;
+        fallbackScalar.enableRandomWrite = true;
+        fallbackScalar.wrapMode = TextureWrapMode.Clamp;
+        fallbackScalar.Create();
+        {
+            // Fresh RTs are undefined, not zero.
+            RenderTexture prev = RenderTexture.active;
+            RenderTexture.active = fallbackScalar;
+            GL.Clear(false, true, Color.clear);
+            RenderTexture.active = prev;
+        }
+
         ClearVolume(fireEmission);
         ClearVolume(smokeA);
         ClearVolume(smokeB);
@@ -459,7 +525,8 @@ public class SmokeSim : MonoBehaviour
         compute.SetBuffer(kEmitFire, "Emitters", emitterBuffer);
         // Step now needs the emitter list too, for the near-source anchor ramp.
         compute.SetBuffer(kStep, "Emitters", emitterBuffer);
-        // StepFire reaches EmitterAnchor through TransportOffset as well.
+        // StepFire reaches the emitters through TransportOffset (buoyancy,
+        // entrainment, anchor) and FlameDilution.
         compute.SetBuffer(kStepFire, "Emitters", emitterBuffer);
         compute.SetInt("EmitterCount", count);
     }
@@ -487,6 +554,7 @@ public class SmokeSim : MonoBehaviour
     {
         compute.SetFloat("CellSizeMeters", cellSize);
         compute.SetFloat("SubGridBuoyancy", subGridBuoyancy);
+        compute.SetFloat("PlumeEntrainment", plumeEntrainment);
         compute.SetFloat("FlameGasTempK", flameGasTempC + 273.15f);
         compute.SetFloat("AmbientTempK", ambientTempC + 273.15f);
         compute.SetFloat("SmokeDiffusion", smokeDiffusion);
@@ -496,6 +564,13 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("FireCutoff", fireCutoff);
         compute.SetFloat("ReactionSheetScale", reactionSheetScale);
         compute.SetFloat("ReactionSheetWeight", reactionSheetWeight);
+
+        // Fuel bed shape. The noise scale is uploaded per VOXEL so the
+        // hot-spot size stays the same in metres whatever the cell size.
+        compute.SetFloat("FireBedThickness", fireBedThickness);
+        compute.SetFloat("FireBedBreakup", fireBedBreakup);
+        compute.SetFloat("FireBedNoiseScale", cellSize / Mathf.Max(fireBedFeatureSize, 1e-3f));
+        compute.SetFloat("FireBedNoiseSpeed", fireBedNoiseSpeed);
 
         RenderTexture coarseVel = null;
         int cx = 1, cy = 1, cz = 1;
@@ -527,6 +602,39 @@ public class SmokeSim : MonoBehaviour
             compute.SetFloat("FineOverCoarse", 1f);
             compute.SetFloat("VelocityInfluence", 0f);
         }
+
+        // --- burning surfaces from the thermal sim ---
+        RenderTexture coarseBurning = null;
+        RenderTexture coarseObstacle = null;
+
+        if (coarseVel != null)
+        {
+            coarseBurning = thermalSim.GetBurningVolume();
+            coarseObstacle = thermalSim.GetObstacleVolume();
+        }
+
+        bool useSurfaces = emitFromBurningSurfaces
+                        && coarseBurning != null
+                        && coarseObstacle != null;
+
+        // Every kernel that reaches NearestPlume or BurningSurfaceWeight
+        // references these, so all four need them bound -- otherwise Unity
+        // refuses the dispatch and the ping-pong swap reads an empty field.
+        BindCoarseScalar("CoarseBurning", useSurfaces ? coarseBurning : fallbackScalar);
+        BindCoarseScalar("CoarseObstacle", useSurfaces ? coarseObstacle : fallbackScalar);
+
+        compute.SetFloat("UseCoarseBurning", useSurfaces ? 1f : 0f);
+        compute.SetFloat("SurfaceFireRate", surfaceFireRate);
+        compute.SetFloat("SurfaceSmokeRate", surfaceSmokeRate);
+        compute.SetFloat("SurfaceFlameDepth", surfaceFlameDepth / cellSize);
+    }
+
+    void BindCoarseScalar(string name, Texture tex)
+    {
+        compute.SetTexture(kEmit, name, tex);
+        compute.SetTexture(kEmitFire, name, tex);
+        compute.SetTexture(kStep, name, tex);
+        compute.SetTexture(kStepFire, name, tex);
     }
 
     void DispatchFireEmission()
@@ -584,10 +692,12 @@ public class SmokeSim : MonoBehaviour
         compute.SetTexture(kStepFire, "FireOut", fireB);
         compute.SetTexture(kStepFire, "Obstacle", obstacle);
 
-        // StepFire calls TransportOffset, which calls ShellMask -> ReadSmoke.
-        // Without this binding Unity refuses the dispatch outright, StepFire
-        // never runs, and the Swap below still executes -- so the fire field
-        // flips to a buffer nothing wrote and reads as empty.
+        // TransportOffset still references ShellMask -> ReadSmoke for the
+        // smoke path, so StepFire's compiled kernel touches SmokeIn even
+        // though fire now uses its own edge mask. Without this binding
+        // Unity refuses the dispatch outright, StepFire never runs, and the
+        // Swap below still executes -- so the fire field flips to a buffer
+        // nothing wrote and reads as empty.
         compute.SetTexture(kStepFire, "SmokeIn", smokeA);
 
         Dispatch(kStepFire);
@@ -617,6 +727,7 @@ public class SmokeSim : MonoBehaviour
     {
         if (fireEmission != null) { fireEmission.Release(); fireEmission = null; }
         if (fallbackVelocity != null) { fallbackVelocity.Release(); fallbackVelocity = null; }
+        if (fallbackScalar != null) { fallbackScalar.Release(); fallbackScalar = null; }
     }
 
     RenderTexture MakeVolume()
@@ -754,7 +865,12 @@ public class SmokeSim : MonoBehaviour
                 Gizmos.color = e.enabled
                     ? new Color(1f, 0.3f, 0f, 1f)
                     : new Color(0.4f, 0.4f, 0.4f, 0.5f);
-                Gizmos.DrawWireSphere(e.transform.position, e.radius);
+
+                // Draw the actual emission footprint: a flat bed, not a ball.
+                Vector3 c = e.transform.position;
+                float halfH = Mathf.Max(e.radius * fireBedThickness, cellSize * 0.75f);
+                Gizmos.DrawWireCube(c, new Vector3(e.radius * 2f, halfH * 2f, e.radius * 2f));
+                Gizmos.DrawLine(c, c + Vector3.up * flamePersistentHeight);
             }
         }
 

@@ -72,6 +72,10 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _SmokeTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     - _SpecGlossMap:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
@@ -109,8 +113,12 @@ Material:
     - _DetailNormalMapScale: 1
     - _DstBlend: 0
     - _DstBlendAlpha: 0
+    - _Emission: 3
     - _EnvironmentReflections: 1
     - _FireIntensity: 0.21
+    - _FlameOpacity: 2
+    - _FlameSharpness: 1.6
+    - _FlameThreshold: 0.15
     - _GlossMapScale: 0
     - _Glossiness: 0
     - _GlossyReflections: 0

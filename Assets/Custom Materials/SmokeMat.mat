@@ -122,7 +122,7 @@ Material:
     - _DstBlend: 0
     - _DstBlendAlpha: 0
     - _EnvironmentReflections: 1
-    - _FireBrightness: 5000
+    - _FireBrightness: 100
     - _FireScatter: 0.45
     - _GlossMapScale: 0
     - _Glossiness: 0
@@ -134,7 +134,7 @@ Material:
     - _ReceiveShadows: 1
     - _Smoothness: 0.5
     - _SmoothnessTextureChannel: 0
-    - _SootIncandescence: 0.85
+    - _SootIncandescence: 0.75
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _SrcBlendAlpha: 1

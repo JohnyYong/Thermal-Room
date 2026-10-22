@@ -132,6 +132,11 @@ float VorticityStrength;
 // Advection converts to voxels at the point of use by dividing by
 // CellSize; divergence/pressure/projection are unit-agnostic because
 // they scale velocity and pressure together.
+//
+// EVERY backward trace must divide by CellSize. AdvectFlameStep and
+// AdvectSmokeStep used to skip it, so at 0.2 m cells flame and smoke
+// moved 5x slower than the air carrying them -- the coarse flame sat
+// where it was generated as a blob instead of rising.
 // ===================================================================
 float CellSize;             // metres per voxel of THIS grid
 
@@ -1402,7 +1407,10 @@ void AdvectSmokeStep(uint3 id : SV_DispatchThreadID)
 
     float3 currentPos = float3(id);
 
-    float3 previousPos = currentPos - velocity.xyz * DeltaTime;
+    // Velocity is m/s; convert to voxels for the backward trace. This
+    // division was missing, so smoke moved 1/CellSize times slower than
+    // the air (5x at 0.2 m cells).
+    float3 previousPos = currentPos - velocity.xyz * DeltaTime / CellSize;
 
     float smoke = SampleSmoke(previousPos);
 
@@ -1637,22 +1645,26 @@ void AdvectFlameStep(uint3 id : SV_DispatchThreadID)
 
     float flameHere = FlameIn[id];
 
-    float3 velocity = VelocityIn[id].xyz;
+    // Velocity is stored in m/s; the extra rise and jitter below were
+    // always in voxels/s, so convert first and keep them as they were.
+    // The trace used to skip the /CellSize entirely, so the coarse flame
+    // moved 5x slower than the air at 0.2 m cells and sat as a blob.
+    float3 velVox = VelocityIn[id].xyz / CellSize;
 
     // Flames naturally rise faster than smoke
-    velocity.y += flameHere * 4.0;
+    velVox.y += flameHere * 4.0;
 
     // Small random sideways motion
     float random =
         frac(sin(dot(float3(id), float3(12.9898, 78.233, 37.719))) * 43758.5453);
 
-    velocity.x += (random - 0.5) * flameHere * 0.5;
-    velocity.z += (0.5 - random) * flameHere * 0.5;
+    velVox.x += (random - 0.5) * flameHere * 0.5;
+    velVox.z += (0.5 - random) * flameHere * 0.5;
 
     float3 currentPos = float3(id);
 
     float3 previousPos =
-        currentPos - velocity * DeltaTime;
+        currentPos - velVox * DeltaTime;
 
     float flame =
         SampleFlame(previousPos);

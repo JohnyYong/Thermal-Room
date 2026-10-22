@@ -8,7 +8,7 @@ using UnityEngine.InputSystem;
 using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
 
-public class ThermalSimulation : MonoBehaviour
+public partial class ThermalSimulation : MonoBehaviour
 {
     #region Parameters and Variables
     private static ThermalSimulation _instance;
@@ -1915,6 +1915,8 @@ public class ThermalSimulation : MonoBehaviour
     {
         if (!IsInitialized) return;
 
+        StopRuntimeIgnitionSpreads();
+
         if (_zeroScalarTex == null) _zeroScalarTex = MakeFilledVolume(TextureFormat.RFloat, 0f);
         if (_ambientScalarTex == null) _ambientScalarTex = MakeFilledVolume(TextureFormat.RFloat, ambientTemp);
         if (_zeroVectorTex == null) _zeroVectorTex = MakeFilledVolume(TextureFormat.RGBAFloat, 0f);
@@ -2016,178 +2018,6 @@ public class ThermalSimulation : MonoBehaviour
     }
     #endregion
 
-    public void RegisterRuntimeBurningObject(
-        Collider collider,
-        ThermalMaterial material)
-    {
-        Debug.Log("Making out voxels");
-
-        List<BurningVoxel> voxels =
-            new List<BurningVoxel>();
-
-        Bounds bounds = collider.bounds;
-
-        Vector3 minVoxel =
-            WorldToVoxel(bounds.min);
-
-        Vector3 maxVoxel =
-            WorldToVoxel(bounds.max);
-
-        int minX =
-            Mathf.Clamp(
-                Mathf.FloorToInt(minVoxel.x),
-                0,
-                gridX - 1);
-
-        int minY =
-            Mathf.Clamp(
-                Mathf.FloorToInt(minVoxel.y),
-                0,
-                gridY - 1);
-
-        int minZ =
-            Mathf.Clamp(
-                Mathf.FloorToInt(minVoxel.z),
-                0,
-                gridZ - 1);
-
-        int maxX =
-            Mathf.Clamp(
-                Mathf.CeilToInt(maxVoxel.x),
-                0,
-                gridX - 1);
-
-        int maxY =
-            Mathf.Clamp(
-                Mathf.CeilToInt(maxVoxel.y),
-                0,
-                gridY - 1);
-
-        int maxZ =
-            Mathf.Clamp(
-                Mathf.CeilToInt(maxVoxel.z),
-                0,
-                gridZ - 1);
-
-        for (int z = minZ; z <= maxZ; z++)
-        {
-            for (int y = minY; y <= maxY; y++)
-            {
-                for (int x = minX; x <= maxX; x++)
-                {
-                    Vector3 voxelCenter =
-                        VoxelToWorld(
-                            new Vector3(
-                                x + 0.5f,
-                                y + 0.5f,
-                                z + 0.5f));
-
-                    if (!IsVoxelInsideCollider(collider, voxelCenter))
-                        continue;
-
-                    BurningVoxel voxel =
-                        new BurningVoxel();
-
-                    voxel.x = (uint)x;
-                    voxel.y = (uint)y;
-                    voxel.z = (uint)z;
-
-                    voxels.Add(voxel);
-
-                    Debug.DrawRay(
-                    voxelCenter,
-                    Vector3.up * 0.2f,
-                    Color.red,
-                    30f);
-                }
-            }
-        }
-
-
-        Debug.Log($"Grid: {gridX}x{gridY}x{gridZ} | SimBounds: {GetSimulationBounds()} | " +
-          $"ColliderBounds: {bounds} | VoxelRange: ({minX},{minY},{minZ}) to ({maxX},{maxY},{maxZ})");
-
-        if (voxels.Count == 0)
-        {
-            Debug.Log("No voxels found");
-            return;
-        }
-
-        runtimeVoxelBuffer.SetData(voxels);
-
-        simulation.SetBuffer(
-            runtimeIgniteKernel,
-            "RuntimeVoxels",
-            runtimeVoxelBuffer);
-
-        simulation.SetInt(
-            "RuntimeVoxelCount",
-            voxels.Count);
-
-        simulation.SetFloat(
-            "RuntimeFuel",
-            material.fuelAmount);
-
-        simulation.SetFloat(
-            "RuntimeMaterial",
-            (float)material.materialType);
-
-        simulation.SetTexture(
-            runtimeIgniteKernel,
-            "MaterialVolume",
-            materialVolume);
-
-        simulation.SetTexture(
-            runtimeIgniteKernel,
-            "FuelOut",
-            fuelA);
-
-        simulation.SetTexture(
-            runtimeIgniteKernel,
-            "BurningOut",
-            burningA);
-
-        simulation.SetTexture(
-            runtimeIgniteKernel,
-            "ObstacleOut",
-            obstacleVolume);
-
-        simulation.Dispatch(
-            runtimeIgniteKernel,
-            Mathf.CeilToInt(
-                voxels.Count / 64f),
-            1,
-            1);
-
-        RequestVolumeReadback(burningA, data =>
-        {
-            int gx = gridX;
-            int gy = gridY;
-
-            int Index(int x, int y, int z)
-            {
-                return x + gx * (y + gy * z);
-            }
-
-            float max = 0f;
-            int burningCount = 0;
-
-            foreach (float v in data)
-            {
-                if (v > max)
-                    max = v;
-
-                if (v > 0.5f)
-                    burningCount++;
-            }
-
-            Debug.Log($"Burning MAX = {max}, Burning Voxels = {burningCount}");
-        });
-
-        Debug.Log(
-            $"Injected {voxels.Count} voxels");
-    }
-
     public void Extinguish(Collider collider, float strength)
     {
         List<BurningVoxel> voxels = new List<BurningVoxel>();
@@ -2275,5 +2105,25 @@ public class ThermalSimulation : MonoBehaviour
             Mathf.CeilToInt(voxels.Count / 64f),
             1,
             1);
+    }
+
+    void BindVisibleFireTextures()
+    {
+        bool fine = HasFineFields();
+        RenderTexture flame = fine ? smokeSim.FireVolume : flameA;
+        RenderTexture smoke = fine ? smokeSim.SmokeVolume : smokeA;
+
+        if (fireVolumeMaterial)
+        {
+            fireVolumeMaterial.SetTexture("_FlameTex", flame);
+            fireVolumeMaterial.SetTexture("_SmokeTex", smoke);
+        }
+
+        if (smokeVolumeMaterial)
+        {
+            smokeVolumeMaterial.SetTexture("_SmokeTex", smoke);
+            smokeVolumeMaterial.SetTexture("_FlameTex", flame);
+            smokeVolumeMaterial.SetTexture("_TemperatureTex", temperatureA);
+        }
     }
 }
