@@ -1174,7 +1174,7 @@ MonoBehaviour:
   compute: {fileID: 7200000, guid: b90fe94c810075d42a66eaa1f5492951, type: 3}
   volumeCenter: {x: -0.22, y: 2.97, z: -2.35}
   volumeSize: {x: 8.01, y: 6.42, z: 18.7}
-  cellSize: 0.1
+  cellSize: 0.2
   obstacleLayers:
     serializedVersion: 2
     m_Bits: 4294967295
@@ -1238,6 +1238,7 @@ MonoBehaviour:
   fireNoiseStrength: 11
   fireNoiseSpeed: 6
   smokeMaterial: {fileID: 2100000, guid: 3852d5442683bbc4982d840fae93b82f, type: 2}
+  simulationHz: 30
   windDirection: 0
   windStrength: 0
   windDirectionCustom: {x: 0, y: 0, z: 0}
@@ -7938,6 +7939,14 @@ PrefabInstance:
       propertyPath: m_LocalEulerAnglesHint.z
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 243595705099549512, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 721216911519792614, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 1033311274402943813, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_Enabled
       value: 1
@@ -7945,6 +7954,10 @@ PrefabInstance:
     - target: {fileID: 1033311274402943813, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_TurnAmount
       value: 20
+      objectReference: {fileID: 0}
+    - target: {fileID: 1388660115433908216, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 1953067873861365444, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_Name
@@ -7958,9 +7971,21 @@ PrefabInstance:
       propertyPath: m_Enabled
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 4475159550976338339, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 4535940071381524773, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_Name
       value: ThermalView_Image
+      objectReference: {fileID: 0}
+    - target: {fileID: 4718864382634450637, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 4801333601474693807, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 6388449983676938217, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalScale.x
@@ -8006,21 +8031,29 @@ PrefabInstance:
       propertyPath: m_LocalEulerAnglesHint.z
       value: 180
       objectReference: {fileID: 0}
+    - target: {fileID: 6977071683036392917, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 7434124572545867783, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_AdditionalShaderChannelsFlag
       value: 25
       objectReference: {fileID: 0}
+    - target: {fileID: 8042993742021659094, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 8725588029800040901, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalScale.x
-      value: 0.3
+      value: 0.262878
       objectReference: {fileID: 0}
     - target: {fileID: 8725588029800040901, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalScale.y
-      value: 0.3
+      value: 0.262878
       objectReference: {fileID: 0}
     - target: {fileID: 8725588029800040901, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalScale.z
-      value: 0.3
+      value: 0.262878
       objectReference: {fileID: 0}
     - target: {fileID: 8725588029800040901, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalPosition.x
@@ -8028,15 +8061,19 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8725588029800040901, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalPosition.y
-      value: 0
+      value: -0.094
       objectReference: {fileID: 0}
     - target: {fileID: 8725588029800040901, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalPosition.z
-      value: 0.615
+      value: 0.246
       objectReference: {fileID: 0}
     - target: {fileID: 8969239353734813539, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_TagString
       value: GameController
+      objectReference: {fileID: 0}
+    - target: {fileID: 8992585877194423230, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+      propertyPath: m_Enabled
+      value: 0
       objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
@@ -18240,6 +18277,10 @@ PrefabInstance:
       value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
+      propertyPath: volumeMaterial
+      value: 
+      objectReference: {fileID: 2100000, guid: 56790775137549c4bbc975203f9812ea, type: 2}
+    - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: buoyancyStrength
       value: 0.5
       objectReference: {fileID: 0}
@@ -18253,7 +18294,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: pressureIterations
-      value: 25
+      value: 10
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: smokeDiffusionRate
@@ -18278,6 +18319,10 @@ PrefabInstance:
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: smokeSettleStrength
       value: 0.5
+      objectReference: {fileID: 0}
+    - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
+      propertyPath: smokeVolumeMaterial
+      value: 
       objectReference: {fileID: 0}
     - target: {fileID: 5793500181761506877, guid: 606b4f3e1eedd2140896a8b59ff36018, type: 3}
       propertyPath: solidConductionRate
@@ -18375,6 +18420,10 @@ PrefabInstance:
       propertyPath: m_IsActive
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 6817770709576178443, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
+      propertyPath: 'm_Materials.Array.data[0]'
+      value: 
+      objectReference: {fileID: 2100000, guid: 56790775137549c4bbc975203f9812ea, type: 2}
     - target: {fileID: 7323585529557386240, guid: e09fc2e2639c82e419ae4f429556a3a1, type: 3}
       propertyPath: m_LocalScale.x
       value: 10.575621

@@ -39,10 +39,11 @@ public class SmokeSim : MonoBehaviour
     public Vector3 volumeCenter = Vector3.zero;
     public Vector3 volumeSize = new Vector3(10, 5, 10);
 
-    [Tooltip("Smaller = finer plume detail. At 0.25 with a 0.6 emitter radius " +
-             "the plume is only ~5 voxels wide, which leaves almost no interior " +
-             "for the shell mask to hold still. 0.15 is a good target.")]
-    public float cellSize = 0.15f;
+    [Tooltip("Smaller = finer plume detail, but cost grows with the CUBE of " +
+             "1/cellSize: halving it is 8x the work. Desktop: 0.1-0.15. " +
+             "Quest: 0.2. Keep it a whole fraction of ThermalSimulation's " +
+             "cell size (e.g. 0.2 here with 0.4 there).")]
+    public float cellSize = 0.2f;
 
     [Header("Room Auto-Detection")]
     public LayerMask obstacleLayers = ~0;
@@ -93,9 +94,10 @@ public class SmokeSim : MonoBehaviour
              "0 disables.")]
     public float smokeAnchorRadius = 0.5f;
 
-    [Tooltip("Use divergence-free curl noise for smoke. Costs ~2x the noise " +
-             "evaluations but stops the plume silhouette breathing in and out.")]
-    public bool smokeUseCurlNoise = true;
+    [Tooltip("Use divergence-free curl noise. Looks slightly better but costs " +
+             "six times the noise evaluations per voxel, in both the smoke and " +
+             "fire steps. Leave OFF on Quest.")]
+    public bool smokeUseCurlNoise = false;
 
     [Tooltip("Physical diffusion of soot. Small -- most spreading should come " +
              "from the solver velocity field, not from this.")]
@@ -226,6 +228,15 @@ public class SmokeSim : MonoBehaviour
     [Header("Rendering")]
     public Material smokeMaterial;
 
+    [Header("Performance")]
+    [Tooltip("Simulation steps per second. Runs from Update, never more than " +
+             "once per frame. 30 is plenty for fire; it also caps how fast " +
+             "smoke can move per step via smokeWarpClamp, so keep cell size " +
+             "and this together in mind.")]
+    public float simulationHz = 30f;
+
+    float _simAccumulator;
+
     //Wind Direction and flow
     public enum WindPreset
     {
@@ -325,7 +336,7 @@ public class SmokeSim : MonoBehaviour
     // the same way.
     //
     // The list holds live Emitter objects and BuildEmitterBuffer re-reads
-    // them every FixedUpdate, so mutating radius/smokeRate/fireRate on a
+    // them every sim step, so mutating radius/smokeRate/fireRate on a
     // registered emitter takes effect next tick with no re-registration
     // and no reinit.
     // -------------------------------------------------------------------
@@ -452,11 +463,31 @@ public class SmokeSim : MonoBehaviour
         initialized = true;
     }
 
-    void FixedUpdate()
+    // -------------------------------------------------------------------
+    // Stepping.
+    //
+    // Runs from Update at simulationHz, at most ONE step per frame. It used
+    // to run in FixedUpdate: when a frame ran long, Unity ran several
+    // catch-up FixedUpdates the next frame, each a full sim step, which made
+    // that frame slower still. On Quest that spiral never recovers. Here a
+    // late frame just drops the backlog and the sim runs slightly slow.
+    // -------------------------------------------------------------------
+    void Update()
     {
         if (!Application.isPlaying || !initialized || compute == null) return;
 
-        float dt = Time.fixedDeltaTime;
+        float dt = 1f / Mathf.Max(simulationHz, 1f);
+
+        _simAccumulator += Time.deltaTime;
+        if (_simAccumulator < dt) return;
+
+        _simAccumulator = Mathf.Min(_simAccumulator - dt, dt);
+
+        StepSimulation(dt);
+    }
+
+    void StepSimulation(float dt)
+    {
         compute.SetInts("GridSize", gridX, gridY, gridZ);
         compute.SetFloat("DeltaTime", dt);
         compute.SetFloat("Time_", Time.time);
@@ -732,7 +763,14 @@ public class SmokeSim : MonoBehaviour
 
     RenderTexture MakeVolume()
     {
-        var rt = new RenderTexture(gridX, gridY, 0, RenderTextureFormat.RFloat);
+        // Half floats: half the bandwidth of RFloat for every kernel and for
+        // the ray-marcher, and filterable on Quest. Smoke and fire are 0..1
+        // fields, well inside half's precision.
+        var format = SystemInfo.SupportsRandomWriteOnRenderTextureFormat(RenderTextureFormat.RHalf)
+            ? RenderTextureFormat.RHalf
+            : RenderTextureFormat.RFloat;
+
+        var rt = new RenderTexture(gridX, gridY, 0, format);
         rt.dimension = UnityEngine.Rendering.TextureDimension.Tex3D;
         rt.volumeDepth = gridZ;
         rt.enableRandomWrite = true;
@@ -771,7 +809,12 @@ public class SmokeSim : MonoBehaviour
         for (int i = 0; i < data.Length; i++)
             pixels[i] = new Color(data[i], 0, 0, 0);
 
-        var tex = new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+        // Must match the obstacle RenderTexture's format for CopyTexture.
+        var texFormat = obstacle.format == RenderTextureFormat.RHalf
+            ? TextureFormat.RHalf
+            : TextureFormat.RFloat;
+
+        var tex = new Texture3D(gridX, gridY, gridZ, texFormat, false);
         tex.SetPixels(pixels);
         tex.Apply();
         Graphics.CopyTexture(tex, obstacle);
@@ -937,6 +980,11 @@ public class SmokeSim : MonoBehaviour
     // Sheet-weighted flame, for rendering. Point the fire material's
     // texture at this rather than at FireVolume.
     public RenderTexture FireEmissionVolume => fireEmission;
+
+    // What should be DRAWN. The physical field (FireVolume) still drives the
+    // thermal coupling; this is the reaction-sheet version when that is on.
+    public RenderTexture VisibleFireVolume =>
+        (useReactionSheet && fireEmission != null) ? fireEmission : fireA;
 
     public void GetGridSize(out int x, out int y, out int z)
     {

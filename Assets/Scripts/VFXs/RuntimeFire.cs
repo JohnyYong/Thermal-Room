@@ -9,7 +9,7 @@ using UnityEngine;
 //    collider's voxels ONCE, in place (same as before) -- for a solid
 //    object that's on fire where it stands.
 //  - Regardless of whether it has a collider, it ALSO registers itself as
-//    a live heat source every FixedUpdate, tracking its CURRENT position --
+//    a live heat source every sim step, tracking its CURRENT position --
 //    so if this object moves (a fireball, a torch someone's carrying),
 //    heat genuinely follows it instead of staying behind at spawn.
 //
@@ -23,7 +23,13 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
     [Header("Air heat (HeatStep)")]
     [Tooltip("Voxel-space falloff radius for heating the surrounding air.")]
     [SerializeField] private float _heatRadius = 6f;
-    [SerializeField] private float _heatPower = 40f;
+
+    [Tooltip("Heats a SPHERE of air around this object every step. Leave at 0 " +
+             "for objects that actually burn (collider + ThermalMaterial): " +
+             "their burning voxels and the visible flame already heat the air, " +
+             "and this sphere only adds a hot ball that rises as a dome. Use it " +
+             "for collider-less fireballs/torches, where it is the only heat.")]
+    [SerializeField] private float _heatPower = 0f;
 
     [Header("Solid radiant heat (RadiationStep)")]
     [Tooltip("Voxel-space falloff range for radiantly heating nearby solids. " +
@@ -36,8 +42,10 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
     [Header("Debug: fuel depletion")]
     [Tooltip("Periodically read back fuel over this object's own ignited " +
              "voxel range and log once it hits zero -- pinpoints exactly " +
-             "when/why this object's fire dies out.")]
-    [SerializeField] private bool _logFuelDepletion = true;
+             "when/why this object's fire dies out. DEBUG ONLY: reads the " +
+             "whole fuel volume back from the GPU every check, per fire. " +
+             "Leave OFF in builds -- it is expensive on Quest.")]
+    [SerializeField] private bool _logFuelDepletion = false;
     [SerializeField] private float _fuelCheckInterval = 0.5f;
 
     private bool _registeredAsFireSource;
@@ -74,7 +82,6 @@ public class RuntimeFire : MonoBehaviour, IMobileFireSource
         // purely a moving heat source below.
         if (col != null && mat != null)
         {
-            Debug.Log("RunTimeFire: " + col.bounds.center);
             ThermalSimulation.Instance.RegisterRuntimeBurningObject(col, mat);
 
             CacheFuelVoxelRange(col);

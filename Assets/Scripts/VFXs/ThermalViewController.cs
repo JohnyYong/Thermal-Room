@@ -125,7 +125,7 @@ public class ThermalViewController : MonoBehaviour
                 thermal.volumeMaterial.SetFloat("_Density", 0);
                 thermal.fireVolumeMaterial.SetFloat("_Density",
                                                     fireVolumeDensity);
-                thermal.smokeVolumeMaterial.SetFloat("_Density", smokeDensity);
+                //thermal.smokeVolumeMaterial.SetFloat("_Density", smokeDensity);
                 thermal.fireHeatVolumeMaterial.SetFloat("_Density",
                                                         fireHeatDensity);
 

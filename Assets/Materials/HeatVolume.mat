@@ -97,6 +97,7 @@ Material:
     - _Cull: 2
     - _Cutoff: 0.5
     - _Density: 0
+    - _DepthSlack: 1
     - _DetailAlbedoMapScale: 1
     - _DetailNormalMapScale: 1
     - _DstBlend: 0
@@ -105,6 +106,7 @@ Material:
     - _GlossMapScale: 0
     - _Glossiness: 0
     - _GlossyReflections: 0
+    - _MaxSteps: 40
     - _MaxTemperature: 1000
     - _Metallic: 0
     - _OcclusionStrength: 1
@@ -116,6 +118,7 @@ Material:
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _SrcBlendAlpha: 1
+    - _StepWorld: 0.15
     - _Surface: 0
     - _WorkflowMode: 1
     - _XRMotionVectorsPass: 1

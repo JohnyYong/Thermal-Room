@@ -178,8 +178,9 @@ public partial class ThermalSimulation
                 next = end;
             }
 
-            yield return new WaitForFixedUpdate();
-            elapsed += Time.fixedDeltaTime;
+            // Per frame, not per FixedUpdate: the sims step from Update now.
+            yield return null;
+            elapsed += Time.deltaTime;
         }
     }
 }
