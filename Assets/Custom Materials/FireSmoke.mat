@@ -120,7 +120,12 @@ Material:
     - _Cutoff: 0.5
     - _DepthSlack: 0.02
     - _DetailAlbedoMapScale: 1
+    - _DetailCoreProtect: 0.7
     - _DetailNormalMapScale: 1
+    - _DetailScale: 0.08
+    - _DetailSpeed: 1.5
+    - _DetailStrength: 0.6
+    - _DetailStretch: 2
     - _DstBlend: 0
     - _DstBlendAlpha: 0
     - _Emission: 3

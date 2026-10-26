@@ -23,6 +23,24 @@ Shader "Custom/FireSmokeVolume" {
         // How much a metre of flame hides what's behind it. Keep low.
         _FlameOpacity("Flame Opacity (per m)", Float) = 2
 
+        [Header(Flame Detail)]
+        // Sub-voxel detail. Animated noise erodes the flame's edges into
+        // finer tongues than the sim grid can hold, and adds flicker. It is
+        // purely visual: the simulation and the thermal image are unchanged.
+        // 0 turns it off.
+        _DetailStrength("Detail Strength", Range(0, 1.5)) = 0.6
+        // Size of the finest features, metres. Around half the sim cell
+        // size (0.2 m) is a good start; smaller = finer, busier detail.
+        _DetailScale("Detail Size (m)", Range(0.02, 0.5)) = 0.08
+        // How fast the detail rises, metres per second.
+        _DetailSpeed("Detail Rise Speed (m/s)", Range(0, 5)) = 1.5
+        // Vertical stretch. >1 makes streaks that read as licking tongues
+        // rather than round blobs.
+        _DetailStretch("Detail Vertical Stretch", Range(1, 4)) = 2.0
+        // How much the core is protected. 1 = detail only eats into the
+        // faint edges, 0 = it breaks up the whole flame evenly.
+        _DetailCoreProtect("Protect Core", Range(0, 1)) = 0.7
+
         [Header(Flame Colour)]
         _ColorEdge("Edge (faint)", Color) = (0.50, 0.05, 0.00, 1)
         _ColorBody("Body", Color) = (1.00, 0.28, 0.02, 1)
@@ -78,6 +96,12 @@ Shader "Custom/FireSmokeVolume" {
             float  _Emission;
             float  _FlameOpacity;
 
+            float  _DetailStrength;
+            float  _DetailScale;
+            float  _DetailSpeed;
+            float  _DetailStretch;
+            float  _DetailCoreProtect;
+
             float4 _ColorEdge;
             float4 _ColorBody;
             float4 _ColorCore;
@@ -90,6 +114,45 @@ Shader "Custom/FireSmokeVolume" {
             float  _SmokeOpacity;
             float  _SmokeDensity;
             float  _FireGlow;
+
+            // Hash without sin(): sin-based hashes lose precision on mobile
+            // GPUs and band visibly.
+            float Hash13(float3 p3)
+            {
+                p3 = frac(p3 * 0.1031);
+                p3 += dot(p3, p3.zyx + 31.32);
+                return frac((p3.x + p3.y) * p3.z);
+            }
+
+            float ValueNoise3(float3 x)
+            {
+                float3 i = floor(x);
+                float3 f = frac(x);
+                f = f * f * (3.0 - 2.0 * f);
+
+                float n000 = Hash13(i);
+                float n100 = Hash13(i + float3(1, 0, 0));
+                float n010 = Hash13(i + float3(0, 1, 0));
+                float n110 = Hash13(i + float3(1, 1, 0));
+                float n001 = Hash13(i + float3(0, 0, 1));
+                float n101 = Hash13(i + float3(1, 0, 1));
+                float n011 = Hash13(i + float3(0, 1, 1));
+                float n111 = Hash13(i + float3(1, 1, 1));
+
+                return lerp(lerp(lerp(n000, n100, f.x), lerp(n010, n110, f.x), f.y),
+                            lerp(lerp(n001, n101, f.x), lerp(n011, n111, f.x), f.y), f.z);
+            }
+
+            // Two octaves, centred on 0, roughly -0.5..0.5.
+            float FlameDetail(float3 worldPos, float t)
+            {
+                float3 q = worldPos / max(_DetailScale, 1e-3);
+                q.y = q.y / _DetailStretch - t * _DetailSpeed / max(_DetailScale, 1e-3);
+
+                float n = ValueNoise3(q) * 0.65
+                        + ValueNoise3(q * 2.03 + float3(17.1, 5.3, 41.7)) * 0.35;
+                return n - 0.5;
+            }
 
             float3 FlameColor(float t)
             {
@@ -125,6 +188,15 @@ Shader "Custom/FireSmokeVolume" {
                     discard;
 
                 float3 p = m.startPos;
+
+                // World position marched alongside p, for the detail noise:
+                // box UVW alone would stretch the noise with the box's shape.
+                float3 wp    = mul(unity_ObjectToWorld, float4(m.startPos - 0.5, 1)).xyz;
+                float3 wStep = mul((float3x3)unity_ObjectToWorld, m.rayDir * m.stepSize);
+
+                // Wrapped so precision doesn't decay over a long session.
+                float  t = fmod(_Time.y, 1000.0);
+
                 float3 accumColor    = 0;
                 float  transmittance = 1.0;
 
@@ -157,6 +229,15 @@ Shader "Custom/FireSmokeVolume" {
                         transmittance *= 1.0 - alpha;
                     }
 
+                    // --- sub-voxel detail: erode the flame's edges ---
+                    // Only where there is flame to shape; empty air skips the
+                    // noise entirely, which is most of the steps.
+                    if (flame > 0.01 && _DetailStrength > 0.0)
+                    {
+                        float edge = lerp(1.0, saturate(1.0 - flame), _DetailCoreProtect);
+                        flame = saturate(flame + FlameDetail(wp, t) * _DetailStrength * edge);
+                    }
+
                     // --- flame: emits light, blocks a little ---
                     float f = saturate((flame - _FlameThreshold) /
                                        max(1.0 - _FlameThreshold, 1e-3));
@@ -172,7 +253,8 @@ Shader "Custom/FireSmokeVolume" {
                     if (transmittance < 0.01)
                         break;
 
-                    p += m.rayDir * m.stepSize;
+                    p  += m.rayDir * m.stepSize;
+                    wp += wStep;
                 }
 
                 return float4(accumColor, 1.0 - transmittance);
