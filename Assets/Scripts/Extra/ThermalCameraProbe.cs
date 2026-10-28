@@ -35,9 +35,19 @@ public class ThermalCameraProbe : MonoBehaviour
     [Tooltip("Seconds between readings. 0.1 = 10 readings per second.")]
     [SerializeField] private float sampleInterval = 0.1f;
 
+    [Tooltip("A readback that hasn't come back after this many seconds is " +
+             "given up on. Without this, one lost readback left the probe " +
+             "'pending' forever and the reading froze at its last value.")]
+    [SerializeField] private float readbackTimeout = 1f;
+
     [Header("Output")]
     [Tooltip("Optional text to show the reading on.")]
     [SerializeField] private TMP_Text readout;
+
+    [Tooltip("Show the raw numbers (surface, max, air, fire along the ray, " +
+             "whether the sim is running) on the readout instead of just the " +
+             "surface temperature. Turn on while debugging.")]
+    [SerializeField] private bool showDebugReadout = false;
 
     public UnityEvent<float> onSurfaceTemperature;
 
@@ -57,6 +67,13 @@ public class ThermalCameraProbe : MonoBehaviour
     /// (raw FlameHeatStep output -- the same field the thermal image uses).
     public float FireHeatAlongRay { get; private set; }
 
+    /// What a thermal camera would actually report for this pixel: the
+    /// hottest of the surface, the air in front of it, and any flame or hot
+    /// gas in between. A real imager can't see "behind" a flame -- it reads
+    /// the flame. The surface value alone stays near ambient for anything
+    /// that isn't itself burning, which is why it can look like it never moves.
+    public float ApparentTemperature { get; private set; }
+
     public GameObject HitObject { get; private set; }
     public Vector3 HitPoint { get; private set; }
     public float HitDistance { get; private set; }
@@ -66,6 +83,7 @@ public class ThermalCameraProbe : MonoBehaviour
     ComputeBuffer _resultBuffer;
     int _kernel = -1;
     bool _pending;
+    float _pendingSince;
     float _nextSampleTime;
 
     readonly RaycastHit[] _hits = new RaycastHit[32];
@@ -102,11 +120,20 @@ public class ThermalCameraProbe : MonoBehaviour
     {
         _resultBuffer?.Release();
         _resultBuffer = null;
+        _pending = false;
     }
 
     void Update()
     {
-        if (_pending || Time.time < _nextSampleTime) return;
+        if (_pending)
+        {
+            if (Time.unscaledTime - _pendingSince < readbackTimeout) return;
+
+            Debug.LogWarning("[ThermalCameraProbe] Readback timed out; sampling again.");
+            _pending = false;
+        }
+
+        if (Time.time < _nextSampleTime) return;
 
         _nextSampleTime = Time.time + sampleInterval;
         Sample();
@@ -147,6 +174,8 @@ public class ThermalCameraProbe : MonoBehaviour
         probeShader.SetVector("RayDirVoxel", ray.direction);   // voxel space is just scaled world space
         probeShader.SetFloat("RayLengthVoxels", hit.distance / cell);
 
+        // Bound fresh every sample: these are ping-pong buffers, so the
+        // texture that is "current" changes every sim step.
         probeShader.SetTexture(_kernel, "SolidTemp", sim.GetSolidTemperatureVolume());
         probeShader.SetTexture(_kernel, "AirTemp", sim.GetTemperatureVolume());
         probeShader.SetTexture(_kernel, "Obstacle", sim.GetObstacleVolume());
@@ -160,6 +189,7 @@ public class ThermalCameraProbe : MonoBehaviour
         float hitDistance = hit.distance;
 
         _pending = true;
+        _pendingSince = Time.unscaledTime;
 
         AsyncGPUReadback.Request(_resultBuffer, request =>
         {
@@ -185,6 +215,11 @@ public class ThermalCameraProbe : MonoBehaviour
             SurfaceMaxTemperature = foundSolid ? data[1] : float.NaN;
             AirTemperatureAtSurface = data[3];
             FireHeatAlongRay = data[4];
+
+            float apparent = foundSolid ? data[1] : float.NegativeInfinity;
+            if (data[3] > -9000f) apparent = Mathf.Max(apparent, data[3]);
+            apparent = Mathf.Max(apparent, data[4]);
+            ApparentTemperature = float.IsNegativeInfinity(apparent) ? float.NaN : apparent;
 
             UpdateReadout();
 
@@ -225,15 +260,34 @@ public class ThermalCameraProbe : MonoBehaviour
     {
         HasReading = false;
         HitObject = null;
-        SurfaceTemperature = SurfaceMaxTemperature = float.NaN;
+        SurfaceTemperature = SurfaceMaxTemperature = ApparentTemperature = float.NaN;
         UpdateReadout();
     }
 
     void UpdateReadout()
     {
         if (readout == null) return;
-        readout.text = HasReading ? $"{SurfaceTemperature:0.0} °C" : "-- °C";
+
+        if (showDebugReadout)
+        {
+            ThermalSimulation sim = ThermalSimulation.Instance;
+            bool running = sim != null && sim.simulationActive;
+
+            readout.text =
+                $"{(HitObject ? HitObject.name : "no hit")}\n" +
+                $"surface {Fmt(SurfaceTemperature)}  max {Fmt(SurfaceMaxTemperature)}\n" +
+                $"air {Fmt(AirTemperatureAtSurface)}  fire {Fmt(FireHeatAlongRay)}\n" +
+                $"sim {(running ? "RUNNING" : "PAUSED")}";
+            return;
+        }
+
+        readout.text = float.IsNaN(ApparentTemperature)
+            ? "-- °C"
+            : $"{ApparentTemperature:0.0} °C";
     }
+
+    static string Fmt(float v) =>
+        float.IsNaN(v) || v < -9000f ? "--" : v.ToString("0.0");
 
     void OnDrawGizmos()
     {
