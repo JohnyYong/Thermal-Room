@@ -61,10 +61,15 @@ float  VelocityInfluence;   // 0..1, how much of the solver field to use
 
 // Sub-grid buoyancy. A 0.3 m solver cannot resolve the acceleration
 // inside a flame only a couple of coarse cells wide, so the remainder is
-// added here where the flame is actually resolved.
-float  SubGridBuoyancy;     // 0..1 fraction of g*(T/Tamb - 1) added locally
+// added here where the flame is actually resolved. See TransportOffset.
+float  SubGridBuoyancy;     // 0..1 fraction of the ideal plume velocity sqrt(2 g' h)
 float  FlameGasTempK;       // absolute flame gas temperature, Kelvin
 float  AmbientTempK;        // absolute ambient temperature, Kelvin
+
+// Air drawn into the plume at about this fraction of its rise speed
+// (Morton-Taylor-Turner entrainment coefficient, ~0.1). Necks the flame
+// toward its axis so it tapers instead of rising as a straight column.
+float  PlumeEntrainment;
 
 // Reaction-sheet emission. See the FireEmission kernel.
 RWTexture3D<float> FireEmissionOut;
@@ -73,6 +78,10 @@ float  ReactionSheetWeight;
 
 // Per-emitter data uploaded as a StructuredBuffer -- supports any number
 // of active fire sources sharing the same sim grid.
+//
+// An emitter is a fuel BED, not a ball: `center` is the centre of the
+// burning surface and `radius` is the bed's horizontal radius. Flame and
+// smoke are emitted in a thin lens there and rise from it.
 struct EmitterData
 {
     float3 center;      // voxel space
@@ -83,6 +92,28 @@ struct EmitterData
 
 StructuredBuffer<EmitterData> Emitters;
 int EmitterCount;
+
+// Fuel bed shape. See BedWeight / EmitFire.
+float  FireBedThickness;    // bed half-height as a fraction of emitter radius
+float  FireBedBreakup;      // 0 = uniform disc, 1 = fully broken into hot spots
+float  FireBedNoiseScale;   // 1 / hot-spot size, in fine voxels
+float  FireBedNoiseSpeed;   // how fast hot spots come and go, 1/s
+
+// -------------------------------------------------------------------
+// Burning surfaces from ThermalSimulation.
+//
+// ThermalSimulation owns combustion: which solid voxels are alight,
+// including runtime-ignited objects and fire that has spread. Reading
+// its burning field here means every burning surface emits visible
+// flame on this grid automatically -- no per-fire emitter needed, and
+// spread fire shows up the moment the coarse sim ignites a voxel.
+// -------------------------------------------------------------------
+Texture3D<float> CoarseBurning;
+Texture3D<float> CoarseObstacle;
+float  UseCoarseBurning;    // 0 = off (no thermal sim, or disabled)
+float  SurfaceFireRate;     // fire density at a fully burning surface
+float  SurfaceSmokeRate;    // smoke density per second at a burning surface
+float  SurfaceFlameDepth;   // fine voxels: how far out from a surface flame is emitted
 
 // Smoke physics.
 // UNUSED: vertical smoke motion comes from the coarse solver velocity and
@@ -108,7 +139,9 @@ float  SmokeDiffusion;     // physical soot diffusion; keep small
 float  SootLuminousCutoff;
 
 // Flame intermittency. See FlameDilution / StepFire.
-float  FlamePersistentRadius;  // voxels: extent of the continuously lit zone
+// Despite the name this is now a HEIGHT above the fuel bed, in voxels --
+// which is what flamePersistentHeight in SmokeSim.cs always described.
+float  FlamePersistentRadius;  // voxels: height of the continuously lit zone
 float  FlameIntermittency;     // 1/s extinction rate in the diluted region
 
 // Noise turbulence.
@@ -122,7 +155,7 @@ float SmokeNoiseSpeed;
 // Smoke turbulence shaping (see Step). All in VOXEL units.
 float SmokeWarpClamp;        // hard cap on displacement, voxels
 float SmokeShellSharpness;   // how tightly the warp is confined to the boundary
-float SmokeAnchorRadius;     // turbulence fades in over this distance from an emitter
+float SmokeAnchorRadius;     // turbulence fades in over this height above a bed
 float SmokeUseCurlNoise;     // 0 = FBM difference (old), 1 = divergence-free curl noise
 
 // -------------------------------------------------------------------
@@ -381,25 +414,191 @@ float3 SampleCoarseVelocity(float3 fineCentre)
 }
 
 // -------------------------------------------------------------------
-// Mixture dilution, 0 at the fuel bed and 1 beyond the persistent zone.
+// Coarse burning-surface lookups.
 //
-// A diffusion flame burns only while the local mixture sits between its
-// flammability limits. Air entrained into the plume dilutes it, and that
-// dilution grows with distance from the fuel. This is the quantity that
-// decides where flame can survive continuously and where it cannot.
+// Coarse voxel c spans [c, c+1) in coarse units measured from the shared
+// grid origin, and a fine position p (fine voxels) sits at p*FineOverCoarse
+// in those units.
 // -------------------------------------------------------------------
-float FlameDilution(float3 p)
-{
-    if (EmitterCount <= 0 || FlamePersistentRadius <= 0.0001) return 0.0;
 
-    float nearest = 1e9;
+// 0..1 burning intensity of a coarse cell. Ramps in over the second half
+// of the coarse ignition ramp, so voxels catching fire by spread fade
+// their flame in rather than popping on.
+float CoarseBurningAt(int3 c)
+{
+    if (any(c < 0) || any(c >= CoarseGridSize)) return 0.0;
+    return saturate(CoarseBurning[c] * 2.0 - 1.0);
+}
+
+// How strongly a fine voxel sits on a burning surface, 0..1.
+//
+// Flame is emitted in a thin layer of air just outside the burning solid:
+// full strength above burning top faces, half strength beside burning
+// side faces, nothing under bottom faces. This is the fuel bed, taken
+// directly from the shape of whatever is actually burning.
+float BurningSurfaceWeight(float3 p)
+{
+    if (UseCoarseBurning < 0.5) return 0.0;
+
+    float3 cp = p * FineOverCoarse;
+    int3   c  = (int3)floor(cp);
+
+    if (any(c < 0) || any(c >= CoarseGridSize)) return 0.0;
+
+    // Inside a coarse solid (including runtime-spawned objects the fine
+    // grid's obstacle bake never saw): not air, nothing to emit into.
+    if (CoarseObstacle[c] > 0.5) return 0.0;
+
+    float  cellFine = 1.0 / max(FineOverCoarse, 0.0001);   // fine voxels per coarse cell
+    float3 local    = (cp - (float3)c) * cellFine;          // fine voxels from the cell's min corner
+    float  depth    = max(SurfaceFlameDepth, 0.5);
+
+    float w = 0.0;
+
+    // Burning top face directly below.
+    w = max(w, CoarseBurningAt(c + int3(0, -1, 0)) * saturate(1.0 - local.y / depth));
+
+    // Burning side faces.
+    const float side = 0.5;
+    w = max(w, side * CoarseBurningAt(c + int3(-1, 0, 0)) * saturate(1.0 - local.x / depth));
+    w = max(w, side * CoarseBurningAt(c + int3( 1, 0, 0)) * saturate(1.0 - (cellFine - local.x) / depth));
+    w = max(w, side * CoarseBurningAt(c + int3( 0, 0,-1)) * saturate(1.0 - local.z / depth));
+    w = max(w, side * CoarseBurningAt(c + int3( 0, 0, 1)) * saturate(1.0 - (cellFine - local.z) / depth));
+
+    return w;
+}
+
+// Height of a fine position above the burning surface directly beneath
+// it, in fine voxels. -1 if the first solid below is not burning, or if
+// there is none within range. Gives burning surfaces the same plume frame
+// (height above the bed) that emitters have.
+float HeightAboveBurning(float3 p)
+{
+    if (UseCoarseBurning < 0.5) return -1.0;
+
+    float3 cp = p * FineOverCoarse;
+    int3   c  = (int3)floor(cp);
+
+    if (any(c < 0) || any(c >= CoarseGridSize)) return -1.0;
+
+    // 8 coarse cells: 1.6 m at 0.2 m cells -- covers the flame zone.
+    for (int k = 0; k <= 8; k++)
+    {
+        int3 q = c - int3(0, k, 0);
+        if (q.y < 0) break;
+
+        if (CoarseObstacle[q] > 0.5)
+        {
+            if (CoarseBurning[q] > 0.5)
+                return (cp.y - (float)(q.y + 1)) / max(FineOverCoarse, 0.0001);
+
+            return -1.0;   // a solid that isn't burning: not over a fire
+        }
+    }
+
+    return -1.0;
+}
+
+// -------------------------------------------------------------------
+// Emitter geometry in PLUME coordinates.
+//
+// A fire is a fuel bed that a plume rises from. Everything that used to
+// measure straight-line distance from the emitter centre -- emission,
+// the persistent flame zone, the turbulence anchor -- treated the fire
+// as a sphere, which is exactly why it started life as a ball. They now
+// measure height above the bed and horizontal distance from the plume
+// axis instead.
+// -------------------------------------------------------------------
+struct PlumeFrame
+{
+    float  h;       // voxels above the bed (negative below it)
+    float2 radial;  // horizontal offset from the plume axis, voxels
+    float  r;       // bed radius, voxels
+};
+
+bool NearestPlume(float3 p, out PlumeFrame f)
+{
+    f.h = 0.0;
+    f.radial = float2(0.0, 0.0);
+    f.r = 1.0;
+
+    bool  found = false;
+    float best  = 1e9;
+
     for (int i = 0; i < EmitterCount; i++)
     {
         EmitterData e = Emitters[i];
-        nearest = min(nearest, length(p - e.center) - e.radius);
+        float3 d = p - e.center;
+
+        // Distance to the plume AXIS -- a vertical ray from the bed
+        // upward -- so a point high in one plume isn't claimed by a
+        // neighbouring bed that happens to be closer in a straight line.
+        float dist = length(float3(d.x, min(d.y, 0.0), d.z)) - e.radius;
+
+        if (dist < best)
+        {
+            best = dist;
+            f.h = d.y;
+            f.radial = d.xz;
+            f.r = max(e.radius, 0.0001);
+            found = true;
+        }
     }
 
-    return saturate(nearest / FlamePersistentRadius);
+    // Burning surfaces. A surface has no single axis, so radial stays 0
+    // and r is huge: entrainment and the off-bed dilution term switch off,
+    // and only height above the surface matters. Used unless the point is
+    // inside an emitter's own column.
+    float hs = HeightAboveBurning(p);
+    if (hs >= 0.0 && (!found || best > 0.0))
+    {
+        f.h = hs;
+        f.radial = float2(0.0, 0.0);
+        f.r = 1e4;
+        found = true;
+    }
+
+    return found;
+}
+
+// Emission footprint of one bed: a thin lens, full radius horizontally
+// and only FireBedThickness * radius tall. 1 at the centre, 0 at the rim.
+float BedWeight(float3 p, EmitterData e)
+{
+    float  r     = max(e.radius, 0.0001);
+    float3 d     = p - e.center;
+
+    // At least ~1.5 voxels tall, so a small bed never falls between cells.
+    float  halfH = max(r * FireBedThickness, 0.75);
+
+    float  rh = length(d.xz);
+    if (rh >= r || abs(d.y) >= halfH) return 0.0;
+
+    float radial   = 1.0 - (rh * rh) / (r * r);  // broad and flat-topped
+    float vertical = 1.0 - abs(d.y) / halfH;
+    return radial * vertical;
+}
+
+// -------------------------------------------------------------------
+// Mixture dilution, 0 at the fuel bed and 1 at the top of the persistent
+// zone.
+//
+// A diffusion flame burns only while the local mixture sits between its
+// flammability limits. Air entrained into the plume dilutes it, and that
+// dilution grows with HEIGHT above the fuel -- and quickly once you move
+// sideways off the bed. This decides where flame survives continuously.
+// -------------------------------------------------------------------
+float FlameDilution(float3 p)
+{
+    if (FlamePersistentRadius <= 0.0001) return 0.0;
+
+    PlumeFrame f;
+    if (!NearestPlume(p, f)) return 0.0;
+
+    float above   = max(f.h, 0.0) / FlamePersistentRadius;
+    float outside = max(length(f.radial) - f.r, 0.0) / max(f.r, 1.0);
+
+    return saturate(above + outside);
 }
 
 // ~0 where density is locally uniform (the plume core, and empty air),
@@ -416,22 +615,40 @@ float ShellMask(int3 c)
     return saturate(length(float3(gx, gy, gz)) * SmokeShellSharpness);
 }
 
+// Same mask, built from the FIRE field.
+//
+// The flame used to be masked by the SMOKE gradient. But smoke is
+// deliberately suppressed wherever flame is bright (SootLuminousCutoff),
+// so inside and around the flame the smoke gradient is ~0 and the flame
+// received almost no turbulence at all -- it held whatever shape it was
+// emitted in. Masking by its own edge is what lets tongues peel off.
+float ShellMaskFire(int3 c)
+{
+    if (SmokeShellSharpness <= 0.0001) return 1.0;
+
+    float gx = ReadFire(c + int3(1, 0, 0)) - ReadFire(c - int3(1, 0, 0));
+    float gy = ReadFire(c + int3(0, 1, 0)) - ReadFire(c - int3(0, 1, 0));
+    float gz = ReadFire(c + int3(0, 0, 1)) - ReadFire(c - int3(0, 0, 1));
+
+    return saturate(length(float3(gx, gy, gz)) * SmokeShellSharpness);
+}
+
 // A real plume is near-laminar for the first couple of source diameters
-// and only then breaks into turbulence. Ramping the warp in with distance
-// from the nearest emitter anchors the base so the column can't sway at
-// its own root.
+// and only then breaks into turbulence. Ramping the warp in with HEIGHT
+// above the bed anchors the base so the column can't sway at its own
+// root. (This used to be a sphere around the emitter, which held the
+// whole emitted ball perfectly still and smooth.)
 float EmitterAnchor(float3 p)
 {
-    if (EmitterCount <= 0 || SmokeAnchorRadius <= 0.0001) return 1.0;
+    if (SmokeAnchorRadius <= 0.0001) return 1.0;
 
-    float nearest = 1e9;
-    for (int i = 0; i < EmitterCount; i++)
-    {
-        EmitterData e = Emitters[i];
-        nearest = min(nearest, length(p - e.center) - e.radius);
-    }
+    PlumeFrame f;
+    if (!NearestPlume(p, f)) return 1.0;
 
-    return saturate(nearest / SmokeAnchorRadius);
+    // Off to the side of the bed counts as "away from the root" too.
+    float side = max(length(f.radial) - f.r, 0.0);
+
+    return saturate(max(f.h, side) / SmokeAnchorRadius);
 }
 
 // -------------------------------------------------------------------
@@ -470,21 +687,21 @@ void Emit(uint3 id : SV_DispatchThreadID)
     // dumping opaque soot straight onto the flame every tick, burying it.
     float luminous = saturate(1.0 - fireHere * SootLuminousCutoff);
 
-    // Contributions from every active emitter. Squared-distance early-out
-    // skips the sqrt when clearly outside the ball -- cheap perf win when
-    // you have many emitters and most voxels are far from all of them.
+    // Direct smoke from every bed. Uses the same lens footprint as the
+    // flame: with a flat flame bed, a spherical smoke emitter would leave
+    // the upper half of the old ball unlit and show up as a dark ball
+    // sitting on top of the fire.
     for (int i = 0; i < EmitterCount; i++)
     {
         EmitterData e = Emitters[i];
-        float3 diff = p - e.center;
-        float distSq = dot(diff, diff);
-        float rSq = e.radius * e.radius;
-        if (distSq >= rSq) continue;
+        float w = BedWeight(p, e);
+        if (w <= 0.0) continue;
 
-        float d = sqrt(distSq);
-        float w = 1.0 - d / max(e.radius, 0.0001);
         current += e.emitRate * DeltaTime * w * luminous;
     }
+
+    // Direct smoke from burning surfaces in the thermal sim.
+    current += SurfaceSmokeRate * DeltaTime * BurningSurfaceWeight(p) * luminous;
 
     // -----------------------------------------------------------------
     // Soot production.
@@ -514,49 +731,81 @@ void Emit(uint3 id : SV_DispatchThreadID)
 // sub-grid eddies. The noise is masked to the density boundary and ramped
 // in away from the source, because a plume is near-laminar for its first
 // couple of source diameters and only then breaks up.
+//
+// fireShell selects which field's edge masks the turbulence: the flame's
+// own edge for StepFire, the smoke's for Step.
 // -------------------------------------------------------------------
 float3 TransportOffset(int3 c, float3 pp, float noiseScale,
                        float noiseStrength, float noiseSpeed,
-                       float selfHeat)
+                       float selfHeat, bool fireShell)
 {
     // --- resolved flow from the coarse Navier-Stokes solve, m/s ---
     float3 vel = SampleCoarseVelocity(pp) * VelocityInfluence;
 
-    // --- sub-grid buoyancy the coarse grid cannot resolve, m/s^2 ---
+    // --- sub-grid buoyant rise, m/s ---
+    //
+    // This grid stores no velocity, so the old "acceleration * DeltaTime"
+    // added only ONE tick's worth of speed (~0.3 m/s at full heat) and
+    // never built up. Until the coarse solver spun up -- the better part
+    // of a second, starting from still air -- nothing was really lifting
+    // the flame, and it sat where it was emitted: as a ball.
+    //
+    // Use the speed that acceleration would already have produced
+    // instead. A hot parcel rising h metres under reduced gravity
+    // g' = g (T/Tamb - 1) reaches w = sqrt(2 g' h). That growth holds
+    // through the continuous flame and levels off above it (McCaffrey's
+    // near-field plume zones), so h is capped at the persistent height.
+    //
+    // max() with the solver velocity rather than adding: once the coarse
+    // plume is established it already contains this rise, and adding the
+    // two would double-count it.
     if (SubGridBuoyancy > 0.0 && selfHeat > 0.0)
     {
         float ratio = lerp(1.0, FlameGasTempK / max(AmbientTempK, 1.0), selfHeat);
-        vel.y += 9.81 * max(ratio - 1.0, 0.0) * SubGridBuoyancy * DeltaTime;
+        float gRed  = 9.81 * max(ratio - 1.0, 0.0);              // m/s^2
+
+        PlumeFrame f;
+        bool inPlume = NearestPlume(pp, f);
+
+        // Flame that is not over any known bed has already been carried
+        // up and away from it, so it gets the full plume speed.
+        float hMax = max(FlamePersistentRadius, 1.0);
+        float hVox = inPlume ? clamp(f.h, 0.5, hMax) : hMax;
+
+        float wBuoy = sqrt(2.0 * gRed * hVox * CellSizeMeters) * SubGridBuoyancy;
+
+        vel.y = max(vel.y, wBuoy);
+
+        // Entrainment. Ambient air is drawn in at roughly alpha * w,
+        // which necks the flame toward its axis -- the taper that makes a
+        // fire read as a flame rather than a column. Only meaningful for
+        // emitters, which have an axis; surfaces leave radial at 0.
+        float rLen = length(f.radial);
+        if (inPlume && PlumeEntrainment > 0.0 && f.h > 0.0 && rLen > 0.001)
+        {
+            float2 inward = -f.radial / rLen;
+            vel.xz += inward * PlumeEntrainment * wBuoy *
+                      saturate(rLen / max(f.r, 1.0));
+        }
     }
 
     // metres/second -> fine voxels this tick
     float3 offset = vel * DeltaTime / max(CellSizeMeters, 0.0001);
 
     // --- sub-grid turbulence, already in voxels ---
-    //
-    // The mask is evaluated FIRST. Curl noise costs 6 Potential() calls =
-    // 54 value-noise lookups per voxel per kernel, and the result was
-    // multiplied by a mask that is exactly 0 in empty air, in the uniform
-    // plume core and at the emitter root -- i.e. most of the grid. Skipping
-    // the noise there gives an identical result for a fraction of the cost.
-    // Whole 8x8x8 thread groups in empty air skip together, so divergence
-    // is not an issue.
-    float turbMask = noiseStrength * ShellMask(c) * EmitterAnchor(pp);
+    float3 turb = (SmokeUseCurlNoise > 0.5)
+        ? CurlNoise(pp, noiseScale, noiseSpeed)
+        : NoiseVelocity(pp, noiseScale, noiseSpeed);
 
-    [branch]
-    if (abs(turbMask) > 1e-4)
-    {
-        // if/else, not ?: -- with FXC the HLSL ternary evaluates BOTH
-        // operands, so the old form paid for curl noise AND plain noise.
-        float3 turb;
-        [branch]
-        if (SmokeUseCurlNoise > 0.5)
-            turb = CurlNoise(pp, noiseScale, noiseSpeed);
-        else
-            turb = NoiseVelocity(pp, noiseScale, noiseSpeed);
+    // if/else rather than ?: -- HLSL may evaluate both sides of a ternary,
+    // and there's no reason to pay for both gradients.
+    float shell;
+    if (fireShell) shell = ShellMaskFire(c);
+    else           shell = ShellMask(c);
 
-        offset += turb * turbMask;
-    }
+    turb *= noiseStrength * shell * EmitterAnchor(pp);
+
+    offset += turb;
 
     // --- authored wind / vent attraction ---
     //
@@ -633,7 +882,7 @@ void Step(uint3 id : SV_DispatchThreadID)
 
     float3 offset = TransportOffset(c, pp, SmokeNoiseScale,
                                     SmokeNoiseStrength, SmokeNoiseSpeed,
-                                    0.0);
+                                    0.0, false);
 
     // -----------------------------------------------------------------
     // MacCormack advection.
@@ -702,26 +951,59 @@ void EmitFire(uint3 id : SV_DispatchThreadID)
 
     float3 p = float3(id) + 0.5;
 
-    // Contributions from every emitter -- taking the MAX rather than sum
-    // so overlapping fires don't create abnormally bright cores. Per-emitter
+    // Contributions from every bed -- taking the MAX rather than sum so
+    // overlapping fires don't create abnormally bright cores. Per-emitter
     // phase offset makes multiple fires flicker independently.
     for (int i = 0; i < EmitterCount; i++)
     {
         EmitterData e = Emitters[i];
-        float3 diff = p - e.center;
-        float distSq = dot(diff, diff);
-        float rSq = e.radius * e.radius;
-        if (distSq >= rSq) continue;
 
-        float d = sqrt(distSq);
-        float w = 1.0 - d / max(e.radius, 0.0001);
+        float w = BedWeight(p, e);
+        if (w <= 0.0) continue;
 
         float phase = float(i) * 1.7;
+
+        // -------------------------------------------------------------
+        // Hot spots.
+        //
+        // A real fuel bed doesn't burn uniformly: it has several hotter
+        // patches, and each one feeds its own flame tongue. A uniform disc
+        // rises as one slab; breaking it into patches gives the flow
+        // separate columns to work with from the very first tick, so the
+        // fire already has tongues before any turbulence has developed.
+        // Patches come and go over time rather than sliding sideways.
+        // -------------------------------------------------------------
+        float3 d = p - e.center;
+        float spots = ValueNoise(float3(d.x * FireBedNoiseScale,
+                                        d.z * FireBedNoiseScale,
+                                        Time_ * FireBedNoiseSpeed + phase * 10.0));
+        float tongue = smoothstep(0.35, 0.75, spots);
+        w *= lerp(1.0, tongue, FireBedBreakup);
+
         float flickerA = sin(Time_ * 12.0 + Hash3(p) * 6.28 + phase) * 0.5 + 0.5;
         float flickerB = sin(Time_ * 7.3  + Hash3(p + 100) * 6.28 + phase) * 0.5 + 0.5;
         float flicker = 0.6 + 0.4 * flickerA * flickerB;
 
         current = max(current, w * flicker * e.fireRate);
+    }
+
+    // Burning surfaces from the thermal sim, with the same hot-spot
+    // breakup and flicker as an emitter bed. Noise is in world xz so
+    // neighbouring surfaces share one continuous pattern of tongues.
+    float surf = BurningSurfaceWeight(p);
+    if (surf > 0.0)
+    {
+        float spots = ValueNoise(float3(p.x * FireBedNoiseScale,
+                                        p.z * FireBedNoiseScale,
+                                        Time_ * FireBedNoiseSpeed));
+        float tongue = smoothstep(0.35, 0.75, spots);
+        surf *= lerp(1.0, tongue, FireBedBreakup);
+
+        float flickerA = sin(Time_ * 12.0 + Hash3(p) * 6.28) * 0.5 + 0.5;
+        float flickerB = sin(Time_ * 7.3  + Hash3(p + 100) * 6.28) * 0.5 + 0.5;
+        float flicker = 0.6 + 0.4 * flickerA * flickerB;
+
+        current = max(current, surf * flicker * SurfaceFireRate);
     }
 
     FireOut[id] = saturate(current);
@@ -747,7 +1029,7 @@ void StepFire(uint3 id : SV_DispatchThreadID)
     // what keeps flame and smoke moving as one plume instead of two.
     float3 offset = TransportOffset(c, pp, FireNoiseScale,
                                     FireNoiseStrength, FireNoiseSpeed,
-                                    selfHeat);
+                                    selfHeat, true);
 
     // MacCormack, same reasoning as Step. Sharpness matters more here
     // than anywhere else -- a diffused flame is exactly what "too fluid"
@@ -851,4 +1133,4 @@ void CopyVolumeToBuffer(uint3 id : SV_DispatchThreadID)
 
     int index = id.x + CopyDims.x * (id.y + CopyDims.y * id.z);
     CopyDest[index] = CopySource[id];
-}
+}

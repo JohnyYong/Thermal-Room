@@ -1,213 +1,140 @@
 Shader "Custom/FireVolume" {
-    Properties { _FlameTex("Flame", 3D) = "" {} _Density("Density", Float) =
-                     1 _SmokeExtinction("Smoke Extinction", Float) = 8 }
+    Properties
+    {
+        _FlameTex("Flame", 3D) = "" {}
+        _SmokeTex("Smoke", 3D) = "" {}
+
+        // Overall multiplier, kept so existing materials keep their value.
+        _Density("Density", Float) = 1
+
+        // Smoke extinction per metre at full smoke density.
+        _SmokeExtinction("Smoke Extinction (1/m)", Float) = 8
+
+        // Flame values below this are treated as empty air, so faint traces
+        // don't glow into a halo around the fire.
+        _FlameThreshold("Flame Threshold", Range(0, 0.9)) = 0.15
+
+        // Contrast above the threshold: dim tongue edges, bright core.
+        _FlameSharpness("Flame Sharpness", Range(0.5, 4)) = 1.6
+
+        // Light emitted per metre of flame.
+        _Emission("Emission (per m)", Float) = 3
+
+        // How much a metre of flame hides what's behind it. Keep low.
+        _FlameOpacity("Flame Opacity (per m)", Float) = 2
+
+        [Header(Colour)]
+        // The flame ramp, faint edge -> hottest core. Tune these freely.
+        _ColorEdge("Edge (faint)", Color) = (0.50, 0.05, 0.00, 1)
+        _ColorBody("Body", Color) = (1.00, 0.28, 0.02, 1)
+        _ColorCore("Core", Color) = (1.00, 0.48, 0.08, 1)
+        _ColorHot("Hottest", Color) = (1.00, 0.68, 0.30, 1)
+
+        // Where the core and hottest colours start, 0..1 of flame intensity.
+        // Raise them to keep more of the flame orange.
+        _CoreStart("Core Starts At", Range(0, 1)) = 0.55
+        _HotStart("Hottest Starts At", Range(0, 1)) = 0.85
+
+        [Header(Performance)]
+        // Metres per ray step. Around the fine sim cell size is enough;
+        // smaller costs more without adding detail.
+        _StepWorld("Step Length (m)", Range(0.03, 0.5)) = 0.12
+        _MaxSteps("Max Steps", Range(8, 256)) = 48
+        _DepthSlack("Depth Slack (m)", Float) = 0.02
+    }
 
     SubShader {
-        Tags { "RenderPipeline" =
-                   "UniversalPipeline" "Queue" =
-                       "Transparent" "RenderType" = "Transparent" }
+        Tags { "RenderPipeline" = "UniversalPipeline"
+               "Queue" = "Transparent"
+               "RenderType" = "Transparent" }
 
-        Blend SrcAlpha OneMinusSrcAlpha Cull Front ZWrite Off ZTest Always
+        // Premultiplied: colour is emitted light, alpha is how much of the
+        // background the flame and smoke block.
+        Blend One OneMinusSrcAlpha
+        Cull Front ZWrite Off ZTest Always
 
-            Pass {
+        Pass {
             Name "Forward"
-
-                Tags { "LightMode" = "UniversalForward" }
+            Tags { "LightMode" = "UniversalForward" }
 
             HLSLPROGRAM
 
-#pragma vertex vert
-#pragma fragment frag
+            #pragma vertex vert
+            #pragma fragment frag
+            #pragma multi_compile_instancing
 
-#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+            #include "VolumeCommon.hlsl"
 
-                sampler3D _FlameTex;
+            sampler3D _FlameTex;
             sampler3D _SmokeTex;
 
             float _Density;
-
             float _SmokeExtinction;
+            float _FlameThreshold;
+            float _FlameSharpness;
+            float _Emission;
+            float _FlameOpacity;
 
-            float2 RayBoxIntersection(
-                float3 rayOrigin,
-                float3 rayDir,
-                float3 boxMin,
-                float3 boxMax)
+            float4 _ColorEdge;
+            float4 _ColorBody;
+            float4 _ColorCore;
+            float4 _ColorHot;
+            float  _CoreStart;
+            float  _HotStart;
+
+            // Edge -> body -> core -> hottest, all from the material.
+            float3 FlameColor(float t)
             {
-                float3 invDir = 1.0 / rayDir;
+                float coreStart = saturate(_CoreStart);
+                float hotStart  = max(saturate(_HotStart), coreStart + 0.01);
 
-                float3 t0 = (boxMin - rayOrigin) * invDir;
-                float3 t1 = (boxMax - rayOrigin) * invDir;
-
-                float3 tmin = min(t0, t1);
-                float3 tmax = max(t0, t1);
-
-                float nearHit =
-                    max(max(tmin.x, tmin.y), tmin.z);
-
-                float farHit =
-                    min(min(tmax.x, tmax.y), tmax.z);
-
-                return float2(nearHit, farHit);
+                float3 c = lerp(_ColorEdge.rgb, _ColorBody.rgb, saturate(t / max(coreStart, 0.01)));
+                c = lerp(c, _ColorCore.rgb, saturate((t - coreStart) / max(hotStart - coreStart, 0.01)));
+                c = lerp(c, _ColorHot.rgb,  saturate((t - hotStart) / max(1.0 - hotStart, 0.01)));
+                return c;
             }
 
-            struct appdata {
-                float4 vertex : POSITION;
-            };
+            float4 frag(v2f i) : SV_Target
+            {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
 
-            struct v2f {
-                float4 pos : SV_POSITION;
-                float3 localPos : TEXCOORD0;
-                float3 worldPos : TEXCOORD1;
-                float4 screenPos : TEXCOORD2;
-            };
-
-            v2f vert(appdata v) {
-                v2f o;
-
-                o.pos = TransformObjectToHClip(v.vertex.xyz);
-
-                o.localPos = v.vertex.xyz + 0.5;
-
-                o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
-
-                o.screenPos = ComputeScreenPos(o.pos);
-
-                return o;
-            }
-
-            float4 frag(v2f i) : SV_Target {
-                float3 rayOrigin =
-                    mul(unity_WorldToObject,
-                        float4(_WorldSpaceCameraPos,1)).xyz
-                    + 0.5;
-
-                float3 rayDir =
-                    normalize(i.localPos - rayOrigin);
-
-                float2 hit =
-                    RayBoxIntersection(
-                        rayOrigin,
-                        rayDir,
-                        float3(0,0,0),
-                        float3(1,1,1));
-
-                if (hit.x > hit.y)
-                {
+                MarchSetup m;
+                if (!SetupMarch(i, m))
                     discard;
-                }
 
-                float entryDistance =
-                    max(hit.x, 0);
-
-                float exitDistance =
-                    hit.y;
-
-                float travelDistance =
-                    exitDistance - entryDistance;
-
-                float3 samplePos =
-                    rayOrigin +
-                    rayDir * entryDistance;
-
-                float stepSize = travelDistance / 512.0;
-
+                float3 p = m.startPos;
                 float3 accumColor = 0;
-
-                float accumAlpha = 0;
-
-                float accumulatedSmoke = 0;
+                float  transmittance = 1.0;
 
                 [loop]
-                for (int step = 0; step < 512; step++) {
-                    // Same depth occlusion test as HeatVolume
-                    float marchedDistance =
-                        step * stepSize;
+                for (int s = 0; s < m.steps; s++)
+                {
+                    // tex3Dlod: no derivatives inside a variable-length loop,
+                    // and cheaper on mobile.
+                    float flame = tex3Dlod(_FlameTex, float4(p, 0)).r;
+                    float smoke = tex3Dlod(_SmokeTex, float4(p, 0)).r;
 
-                    if (marchedDistance >= travelDistance)
+                    transmittance *= exp(-smoke * _SmokeExtinction * m.stepWorld);
+
+                    float f = saturate((flame - _FlameThreshold) /
+                                       max(1.0 - _FlameThreshold, 1e-3));
+                    f = pow(f, _FlameSharpness);
+
+                    if (f > 0.0)
                     {
+                        accumColor += FlameColor(f) * f * _Emission * _Density *
+                                      m.stepWorld * transmittance;
+
+                        transmittance *= exp(-f * _FlameOpacity * m.stepWorld);
+                    }
+
+                    if (transmittance < 0.01)
                         break;
-                    }
 
-                    float3 sampleLocal = samplePos - 0.5;
-
-                    float3 sampleWorld =
-                        mul(unity_ObjectToWorld, float4(sampleLocal, 1)).xyz;
-
-                    float4 clipPos = TransformWorldToHClip(sampleWorld);
-
-                    float2 sampleUV = clipPos.xy / clipPos.w;
-
-                    sampleUV = sampleUV * 0.5 + 0.5;
-
-                    sampleUV.y = 1.0 - sampleUV.y;
-
-                    sampleUV = saturate(sampleUV);
-
-                    float rawSceneDepth = SampleSceneDepth(sampleUV);
-
-                    float sceneDepth =
-                        LinearEyeDepth(rawSceneDepth, _ZBufferParams);
-
-                    float sampleEyeDepth = -TransformWorldToView(sampleWorld).z;
-
-                    bool occluded = sampleEyeDepth > sceneDepth + 0.02;
-
-                    if (occluded) {
-                        samplePos += rayDir * stepSize;
-
-                        continue;
-                    }
-
-                    float flame = tex3D(_FlameTex, samplePos).r;
-
-                    float smoke = tex3D(_SmokeTex, samplePos).r;
-
-                    accumulatedSmoke += smoke * stepSize;
-
-                    flame = smoothstep(0.05, 1.0, flame);
-
-                    float smokeAttenuation = exp(-smoke * 2.0);
-
-                    float intensity = saturate(pow(flame, 0.5));
-
-                    float transmittance =
-                        exp(-accumulatedSmoke * _SmokeExtinction);
-
-                    intensity *= transmittance;
-
-                    intensity *= smokeAttenuation;
-
-                    float3 color;
-
-                    if (intensity < 0.3) {
-                        color = lerp(float3(0.8, 0.05, 0.0),
-                                     float3(1.0, 0.25, 0.0), intensity / 0.3);
-                    } else if (intensity < 0.7) {
-                        color =
-                            lerp(float3(1.0, 0.25, 0.0), float3(1.0, 0.8, 0.0),
-                                 (intensity - 0.3) / 0.4);
-                    } else {
-                        color =
-                            lerp(float3(1.0, 0.8, 0.0), float3(1.0, 1.0, 1.0),
-                                 (intensity - 0.7) / 0.3);
-                    }
-
-                    float alpha = intensity * 0.08 * _Density;
-
-                    accumColor += color * alpha * 4.0 * (1 - accumAlpha);
-
-                    accumAlpha += alpha * (1 - accumAlpha);
-
-                    if (accumAlpha > 0.99) {
-                        break;
-                    }
-
-                    samplePos += rayDir * stepSize;
+                    p += m.rayDir * m.stepSize;
                 }
 
-                return float4(accumColor, accumAlpha);
+                return float4(accumColor, 1.0 - transmittance);
             }
 
             ENDHLSL

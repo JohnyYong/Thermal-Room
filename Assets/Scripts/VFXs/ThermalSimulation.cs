@@ -8,7 +8,10 @@ using UnityEngine.InputSystem;
 using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
 
-public class ThermalSimulation : MonoBehaviour
+// Runtime ignition (RegisterRuntimeBurningObject, StopRuntimeIgnitionSpreads)
+// lives in the separate runtime-ignition file -- the other half of this
+// partial class.
+public partial class ThermalSimulation : MonoBehaviour
 {
     #region Parameters and Variables
     private static ThermalSimulation _instance;
@@ -209,13 +212,37 @@ public class ThermalSimulation : MonoBehaviour
 
     public float burnRate = 1.0f;
     public float burnHeat = 1300f;
+
+    [Tooltip("Temperature a burning surface levels off at, deg C. Real burning " +
+             "wood surfaces sit around 600-900 C; flame gas is set separately " +
+             "by Flame Gas Temp. Without this, burning voxels climbed past 4000 C.")]
+    public float maxBurnTemp = 850f;
     public float flameAirHeat = 100f;
 
     public float smokeGenerationRate = 1.0f;
     public float smokeDecayRate = 0.01f;
     public float smokeDiffusionRate = 1f;
 
-    public int pressureIterations = 50;
+    [Tooltip("Jacobi iterations for the pressure solve. Each one is a full-grid " +
+             "dispatch. 10-15 is enough for a fire plume; 50 was desktop-only.")]
+    public int pressureIterations = 15;
+
+    [Header("Performance")]
+    [Tooltip("Simulation steps per second. The sim runs from Update at this " +
+             "rate and NEVER more than once per frame. It used to run in " +
+             "FixedUpdate: a slow frame made Unity run several catch-up " +
+             "FixedUpdates the next frame, each a full sim step, which made " +
+             "that frame slower still -- the spiral that locked up Quest. " +
+             "30 is plenty for fire.")]
+    public float simulationHz = 30f;
+
+    [Tooltip("How far, in voxels, RadiationStep searches for burning voxels. " +
+             "The search is a cube, so cost grows with (2r+1)^3: 3 is 343 " +
+             "reads per surface voxel, 6 is 2197.")]
+    [Range(1, 6)]
+    public int radiationSearchRadius = 3;
+
+    float _simAccumulator;
 
     public Material volumeMaterial;
     public Material smokeVolumeMaterial;
@@ -251,41 +278,14 @@ public class ThermalSimulation : MonoBehaviour
     public bool igniteEverything;
     // DEBUG//
 
-    // When false, FixedUpdate skips the entire fire/thermal compute step
-    // (all ~70 dispatches per physics tick). Driven by DroneCamera so the
-    // sim only runs while the thermal view is actually being used. The
-    // GameObject/component stays enabled the whole time, so the singleton,
-    // the thermal clones, and RegisterRuntimeBurningObject all keep working
-    // regardless of this flag -- only the per-tick simulation work pauses.
+    // When false, the per-step fire/thermal compute work is skipped. Driven
+    // by DroneCamera so the sim only runs while the thermal view is
+    // actually being used. The GameObject/component stays enabled the whole
+    // time, so the singleton, the thermal clones, and
+    // RegisterRuntimeBurningObject all keep working regardless of this
+    // flag -- only the per-step simulation work pauses.
     // Set true if you ever want fire to keep spreading in the background.
     public bool simulationActive = true;
-
-    [Header("Performance")]
-    [Range(1, 4)]
-    [Tooltip("Run the thermal / Navier-Stokes step every Nth physics tick with " +
-             "an N-times larger time step. 2 halves the GPU cost of this sim. " +
-             "The smoke grid still steps every tick and simply reuses the " +
-             "latest velocity field, so the visible plume stays smooth.")]
-    public int tickDivider = 2;
-
-    int _tickCounter;
-
-    // Set by SmokeSim when it drives this sim (cluster lockstep mode). In
-    // that mode FixedUpdate does nothing and SmokeSim calls ExternalTick
-    // once per stepped frame, so every cluster node runs exactly the same
-    // sequence of thermal steps in the same order as the smoke steps.
-    [System.NonSerialized] public bool externallyDriven;
-    float _externalBaseDt = -1f;
-
-    // Time step actually used by one thermal tick.
-    float SimDt => (_externalBaseDt > 0f ? _externalBaseDt : Time.fixedDeltaTime)
-                   * Mathf.Max(1, tickDivider);
-
-    public void ExternalTick(float baseDt)
-    {
-        _externalBaseDt = baseDt;
-        Tick();
-    }
 
     [Header("Room Shape & Openings")]
     public Collider volumeCollider; //The room shape
@@ -305,9 +305,9 @@ public class ThermalSimulation : MonoBehaviour
 
     // Cached fill textures used by ResetSimulation so repeated resets don't
     // allocate new full-grid textures every press.
-    Texture3D _zeroScalarTex;
-    Texture3D _ambientScalarTex;
-    Texture3D _zeroVectorTex;
+    // Keyed by format and value: fields now differ in precision, and
+    // CopyTexture needs the source format to match the target exactly.
+    readonly Dictionary<(TextureFormat, float), Texture3D> _fillTextures = new();
     #endregion
 
 
@@ -407,28 +407,28 @@ public class ThermalSimulation : MonoBehaviour
 
         runtimeVoxelBuffer = new ComputeBuffer(100000, sizeof(uint) * 4);
 
-        temperatureA = CreateVolume();
-        temperatureB = CreateVolume();
+        temperatureA = CreateVolume(true);
+        temperatureB = CreateVolume(true);
         velocityA = CreateVectorVolume();
         velocityB = CreateVectorVolume();
-        divergence = CreateVolume();
-        pressureA = CreateVolume();
-        pressureB = CreateVolume();
+        divergence = CreateVolume(true);
+        pressureA = CreateVolume(true);
+        pressureB = CreateVolume(true);
         obstacleVolume = CreateVolume();
         materialVolume = CreateVolume();
         openingVolume = CreateVolume();
 
-        solidTemperatureA = CreateVolume();
-        solidTemperatureB = CreateVolume();
+        solidTemperatureA = CreateVolume(true);
+        solidTemperatureB = CreateVolume(true);
 
-        fuelA = CreateVolume();
-        fuelB = CreateVolume();
+        fuelA = CreateVolume(true);
+        fuelB = CreateVolume(true);
 
         burningA = CreateVolume();
         burningB = CreateVolume();
 
-        suppressantA = CreateVolume();
-        suppressantB = CreateVolume();
+        suppressantA = CreateVolume(true);
+        suppressantB = CreateVolume(true);
 
         curlA = CreateVectorVolume();
 
@@ -478,10 +478,49 @@ public class ThermalSimulation : MonoBehaviour
         Debug.Log($"Thermal Grid: {gridX} x {gridY} x {gridZ}");
     }
 
-    RenderTexture CreateVolume()
+    // -------------------------------------------------------------------
+    // Texture precision.
+    //
+    // Most fields are stored as 16-bit half floats: it halves the memory
+    // bandwidth every kernel and shader pays, which is what limits a mobile
+    // GPU, and Quest drivers can filter half-float 3D textures where they
+    // often can't filter 32-bit ones.
+    //
+    // Fields that accumulate SMALL increments onto LARGE values stay 32-bit.
+    // Half has ~3 significant digits: at 300 C the smallest step it can
+    // represent is 0.25 C, so a solid gaining 0.02 C per step would simply
+    // never heat up. Temperatures, fuel, suppressant and the pressure solve
+    // are kept precise for that reason.
+    // -------------------------------------------------------------------
+    static RenderTextureFormat HalfOr(RenderTextureFormat half, RenderTextureFormat full)
     {
+        return SystemInfo.SupportsRandomWriteOnRenderTextureFormat(half) ? half : full;
+    }
+
+    // Texture3D format matching a RenderTexture, so Graphics.CopyTexture
+    // between them is legal (it requires identical formats).
+    static TextureFormat TexFormatFor(RenderTexture rt)
+    {
+        switch (rt.format)
+        {
+            case RenderTextureFormat.RHalf:     return TextureFormat.RHalf;
+            case RenderTextureFormat.ARGBHalf:  return TextureFormat.RGBAHalf;
+            case RenderTextureFormat.ARGBFloat: return TextureFormat.RGBAFloat;
+            default:                            return TextureFormat.RFloat;
+        }
+    }
+
+    RenderTexture CreateVolume(bool precise = false)
+    {
+        RenderTextureFormat format = precise
+            ? RenderTextureFormat.RFloat
+            : HalfOr(RenderTextureFormat.RHalf, RenderTextureFormat.RFloat);
+
         RenderTexture rt =
-            new RenderTexture(gridX, gridY, 0, RenderTextureFormat.RFloat);
+            new RenderTexture(gridX, gridY, 0, format);
+
+        // Smooth between voxels when the heat/thermal shaders sample these.
+        rt.filterMode = FilterMode.Bilinear;
 
         rt.dimension = TextureDimension.Tex3D;
 
@@ -499,8 +538,8 @@ public class ThermalSimulation : MonoBehaviour
     // Uploads every active heat source (the legacy single `fireSource`
     // Transform, if assigned, plus any registered IMobileFireSource) into
     // one buffer that both HeatStep and RadiationStep read from, sampling
-    // each source's CURRENT world position fresh this frame. Called once
-    // per FixedUpdate before those two dispatches.
+    // each source's CURRENT world position fresh this step. Called once
+    // per step before those two dispatches.
     void BuildFireSourceBuffer()
     {
         int count = 0;
@@ -545,7 +584,7 @@ public class ThermalSimulation : MonoBehaviour
             _loggedFireSourceOverflow = false;
         }
 
-        // Upload the whole fixed-size array every frame (a few hundred
+        // Upload the whole fixed-size array every step (a few hundred
         // bytes -- trivial) rather than a partial range, so we don't have
         // to special-case count == 0. Unused slots are simply never read,
         // since the kernels loop exactly `count` times.
@@ -556,28 +595,32 @@ public class ThermalSimulation : MonoBehaviour
         simulation.SetInt("FireSourceCount", count);
     }
 
-    void FixedUpdate()
+    // -------------------------------------------------------------------
+    // Stepping.
+    //
+    // Runs from Update at simulationHz, at most ONE step per frame. When a
+    // frame runs long, the backlog is dropped rather than caught up -- the
+    // sim simply runs a little slow for that moment, instead of piling
+    // extra full-grid steps onto an already late frame.
+    // -------------------------------------------------------------------
+    void Update()
     {
-        if (externallyDriven) return;
-        _externalBaseDt = -1f;
-        Tick();
+        if (!IsInitialized) return;
+
+        float dt = 1f / Mathf.Max(simulationHz, 1f);
+
+        _simAccumulator += Time.deltaTime;
+        if (_simAccumulator < dt) return;
+
+        _simAccumulator = Mathf.Min(_simAccumulator - dt, dt);
+
+        StepSimulation(dt);
     }
 
-    void Tick()
+    void StepSimulation(float dt)
     {
-        // Run the whole thermal/fluid step only every Nth physics tick, with
-        // a proportionally larger time step (SimDt). Everything below uses
-        // SimDt rather than Time.fixedDeltaTime, so heat, buoyancy and
-        // advection still advance at real-world speed -- just in fewer,
-        // larger steps.
-        if (++_tickCounter < Mathf.Max(1, tickDivider)) return;
-        _tickCounter = 0;
-
         // Char globals bound before the gate so char stays visible in normal
         // view even while the sim is paused.
-
-        //Debug.Log($"[ThermalSimulation] Created {thermalSurfaceRenderers.Length} thermal clones. " +
-        //   $"Total '_Thermal' objects in scene: {GameObject.FindObjectsByType<Renderer>(FindObjectsSortMode.None).Count(r => r.name.EndsWith("_Thermal"))}");
 
         Bounds bounds = GetSimulationBounds();
 
@@ -590,10 +633,8 @@ public class ThermalSimulation : MonoBehaviour
         // Char accumulation only depends on which voxels are currently
         // burning (BurningIn) and where obstacles are -- it doesn't need
         // the heat/fluid pipeline below, so it's dispatched here, ahead of
-        // the simulationActive gate. This is what actually makes char keep
-        // building while the player isn't in thermal view; previously this
-        // dispatch lived below the `return` and never ran until the sim
-        // was active, so charVolume stayed all zeros until then.
+        // the simulationActive gate, and keeps building while the player
+        // isn't in thermal view.
         simulation.SetTexture(charAccumKernel, "BurningIn", burningA);
 
         simulation.SetTexture(charAccumKernel, "Obstacle", obstacleVolume);
@@ -606,15 +647,19 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("CharFullTemp", charFullTemp);
         simulation.SetInt("UseTimeForBurn", useTimeForBurn ? 1 : 0);
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.Dispatch(charAccumKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
                             Mathf.CeilToInt(gridZ / 8f));
 
+        // The visible fire comes from SmokeSim, which keeps running while
+        // this sim is paused -- so the materials must point at its fields
+        // even when the early-out below is taken.
+        BindVisibleFireTextures();
+
         // Paused while not in thermal view (set by DroneCamera). Skips all
-        // fire/thermal compute dispatches for this tick -- the main FPS win
-        // when the thermal system isn't being used.
+        // fire/thermal compute dispatches for this step.
         if (!simulationActive)
             return;
 
@@ -639,7 +684,7 @@ public class ThermalSimulation : MonoBehaviour
             simulation.SetTexture(injectFineKernel, "FineFireIn", smokeSim.FireVolume);
             simulation.SetTexture(injectFineKernel, "FineSmokeIn", smokeSim.SmokeVolume);
 
-            simulation.SetFloat("DeltaTime", SimDt);
+            simulation.SetFloat("DeltaTime", dt);
 
             simulation.Dispatch(injectFineKernel, Mathf.CeilToInt(gridX / 8f),
                                 Mathf.CeilToInt(gridY / 8f),
@@ -658,7 +703,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(heatKernel, "TemperatureOut", temperatureB);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.SetFloat("AmbientTemp", 20);
 
@@ -666,8 +711,8 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("DiffusionRate", diffusionRate);
 
-        // Rebuilds and uploads FireSources once per tick -- covers both
-        // HeatStep (here) and RadiationStep (later this same tick) with
+        // Rebuilds and uploads FireSources once per step -- covers both
+        // HeatStep (here) and RadiationStep (later this same step) with
         // every source's current live position.
         BuildFireSourceBuffer();
 
@@ -709,7 +754,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("AmbientTemp", 20);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.SetTexture(buoyancyKernel, "Obstacle", obstacleVolume);
 
@@ -725,7 +770,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(advectVelocityKernel, "VelocityOut", velocityB);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.SetTexture(advectVelocityKernel, "Obstacle", obstacleVolume);
 
@@ -779,7 +824,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(advectTemperatureKernel, "VelocityIn", velocityA);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.SetTexture(advectTemperatureKernel, "Obstacle",
                               obstacleVolume);
@@ -855,6 +900,8 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("BurningRadiationPower", burningRadiationPower);
 
+        simulation.SetInt("RadiationSearchRadius", radiationSearchRadius);
+
         simulation.SetTexture(radiationKernel, "BurningIn", burningA);
 
         simulation.Dispatch(radiationKernel, Mathf.CeilToInt(gridX / 8f),
@@ -879,7 +926,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("SolidHeatTransferRate", solidHeatTransferRate);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.SetFloat("SolidConductionRate", solidConductionRate);
 
@@ -907,7 +954,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("SolidDiffusionRate", solidDiffusionRate);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.SetTexture(solidConductionKernel, "MaterialVolume",
                               materialVolume);
@@ -937,7 +984,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("SolidCoolingRate", solidCoolingRate);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.SetTexture(solidToAirKernel, "MaterialVolume",
                               materialVolume);
@@ -968,6 +1015,8 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("BurnHeat", burnHeat);
 
+        simulation.SetFloat("MaxBurnTemp", maxBurnTemp);
+
 
         simulation.SetInt("InfiniteFuel", infiniteFuel ? 1 : 0);
 
@@ -982,7 +1031,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(combustionKernel, "Obstacle", obstacleVolume);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.Dispatch(combustionKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -1026,7 +1075,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat(
             "DeltaTime",
-            SimDt);
+            dt);
 
         simulation.Dispatch(
             suppressantDecayKernel,
@@ -1043,7 +1092,7 @@ public class ThermalSimulation : MonoBehaviour
         // whenever SmokeSim is driving. Running both would mean two
         // independent smoke fields on two grids, which is exactly the
         // divergence this coupling exists to eliminate: InjectFineFieldsStep
-        // already wrote the downsampled fine smoke into smokeA this tick,
+        // already wrote the downsampled fine smoke into smokeA this step,
         // and these dispatches would overwrite it.
         // -----------------------------------------------------------------
         if (!HasFineFields())
@@ -1084,7 +1133,7 @@ public class ThermalSimulation : MonoBehaviour
 
             simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
 
-            simulation.SetFloat("DeltaTime", SimDt);
+            simulation.SetFloat("DeltaTime", dt);
 
             simulation.SetFloat("SmokeDiffusionRate", smokeDiffusionRate);
 
@@ -1115,7 +1164,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetFloat("FlameAirHeat", flameAirHeat);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.Dispatch(combustionToAirKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -1161,7 +1210,7 @@ public class ThermalSimulation : MonoBehaviour
 
         simulation.SetTexture(advectFlameKernel, "Obstacle", obstacleVolume);
 
-        simulation.SetFloat("DeltaTime", SimDt);
+        simulation.SetFloat("DeltaTime", dt);
 
         simulation.Dispatch(advectFlameKernel, Mathf.CeilToInt(gridX / 8f),
                             Mathf.CeilToInt(gridY / 8f),
@@ -1207,21 +1256,47 @@ public class ThermalSimulation : MonoBehaviour
 
         Shader.SetGlobalTexture("_ObstacleTex", obstacleVolume);
 
-
         volumeMaterial.SetTexture("_TemperatureTex", temperatureA);
-
-        simulation.SetFloat("SmokeDecayRate", smokeDecayRate);
-        smokeVolumeMaterial.SetTexture("_SmokeTex", smokeA);
 
         Shader.SetGlobalTexture("_BurningTex", burningA);
         Shader.SetGlobalTexture("_FuelTex", fuelA);
 
-        fireVolumeMaterial.SetTexture("_FlameTex", flameA);
-        fireVolumeMaterial.SetTexture("_SmokeTex", smokeA);
-        smokeVolumeMaterial.SetTexture("_FlameTex", flameA);
-        smokeVolumeMaterial.SetTexture("_TemperatureTex", temperatureA);
+        // Swaps above changed which buffers are current; rebind.
+        BindVisibleFireTextures();
+
         fireHeatVolumeMaterial.SetTexture("_FireHeatTex", flameHeatA);
     }
+
+    // -------------------------------------------------------------------
+    // What the player SEES. When SmokeSim is running it owns the visible
+    // fire and smoke, so the volume materials show its fine fields; the
+    // coarse flame/smoke here are an approximation used for heat and as a
+    // fallback only. Both grids share one world box, so the shaders' 0..1
+    // box coordinates line up with either.
+    // -------------------------------------------------------------------
+    void BindVisibleFireTextures()
+    {
+        bool fine = HasFineFields();
+        RenderTexture flame = fine ? smokeSim.VisibleFireVolume : flameA;
+        RenderTexture smoke = fine ? smokeSim.SmokeVolume : smokeA;
+
+        // Fire and smoke are drawn by ONE material now (FireSmokeVolume),
+        // assigned to fireVolumeMaterial. It needs all three fields.
+        if (fireVolumeMaterial)
+        {
+            fireVolumeMaterial.SetTexture("_FlameTex", flame);
+            fireVolumeMaterial.SetTexture("_SmokeTex", smoke);
+            fireVolumeMaterial.SetTexture("_TemperatureTex", temperatureA);
+        }
+
+        if (smokeVolumeMaterial)
+        {
+            smokeVolumeMaterial.SetTexture("_SmokeTex", smoke);
+            smokeVolumeMaterial.SetTexture("_FlameTex", flame);
+            smokeVolumeMaterial.SetTexture("_TemperatureTex", temperatureA);
+        }
+    }
+
     void InitializeSolidTemperature()
     {
         bool testVoxel = true;
@@ -1244,7 +1319,7 @@ public class ThermalSimulation : MonoBehaviour
         }
 
         Texture3D initTex =
-            new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+            new Texture3D(gridX, gridY, gridZ, TexFormatFor(solidTemperatureA), false);
 
         initTex.SetPixels(pixels);
 
@@ -1260,7 +1335,8 @@ public class ThermalSimulation : MonoBehaviour
     RenderTexture CreateVectorVolume()
     {
         RenderTexture rt =
-            new RenderTexture(gridX, gridY, 0, RenderTextureFormat.ARGBFloat);
+            new RenderTexture(gridX, gridY, 0,
+                HalfOr(RenderTextureFormat.ARGBHalf, RenderTextureFormat.ARGBFloat));
 
         rt.dimension = TextureDimension.Tex3D;
 
@@ -1277,8 +1353,8 @@ public class ThermalSimulation : MonoBehaviour
 
     // Reads any Tex3D<float> volume (charVolume, burningA, temperatureA,
     // etc.) back to the CPU with the full depth included. Do not call
-    // AsyncGPUReadback.Request() directly on a 3D RenderTexture -- see the
-    // note on volumeReadBuffer above.
+    // AsyncGPUReadback.Request() directly on a 3D RenderTexture -- it can
+    // return only the z=0 slice on some backends.
     public void RequestVolumeReadback(RenderTexture volume, Action<NativeArray<float>> onComplete)
     {
         simulation.SetTexture(copyVolumeKernel, "CopySource", volume);
@@ -1322,9 +1398,9 @@ public class ThermalSimulation : MonoBehaviour
         foreach (var rt in all)
             if (rt != null) rt.Release();
 
-        if (_zeroScalarTex) Destroy(_zeroScalarTex);
-        if (_ambientScalarTex) Destroy(_ambientScalarTex);
-        if (_zeroVectorTex) Destroy(_zeroVectorTex);
+        foreach (var tex in _fillTextures.Values)
+            if (tex) Destroy(tex);
+        _fillTextures.Clear();
 
         if (_instance == this) _instance = null;
     }
@@ -1372,7 +1448,7 @@ public class ThermalSimulation : MonoBehaviour
             MeshCollider meshCollider = collider as MeshCollider;
             bool nonConvexMesh = meshCollider != null && !meshCollider.convex;
 
-            //Voxel range covering this collider's world-space  
+            //Voxel range covering this collider's world-space
             Bounds b = collider.bounds;
             Vector3 minV = (b.min - simMin) / cellSize;
             Vector3 maxV = (b.max - simMin) / cellSize;
@@ -1556,7 +1632,7 @@ public class ThermalSimulation : MonoBehaviour
         }
 
         Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+            new Texture3D(gridX, gridY, gridZ, TexFormatFor(openingVolume), false);
 
         temp.SetPixels(pixels);
         temp.Apply();
@@ -1578,7 +1654,7 @@ public class ThermalSimulation : MonoBehaviour
         }
 
         Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+            new Texture3D(gridX, gridY, gridZ, TexFormatFor(obstacleVolume), false);
 
         temp.SetPixels(pixels);
 
@@ -1601,7 +1677,7 @@ public class ThermalSimulation : MonoBehaviour
         }
 
         Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+            new Texture3D(gridX, gridY, gridZ, TexFormatFor(materialVolume), false);
 
         temp.SetPixels(pixels);
 
@@ -1624,7 +1700,7 @@ public class ThermalSimulation : MonoBehaviour
         }
 
         Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+            new Texture3D(gridX, gridY, gridZ, TexFormatFor(fuelA), false);
 
         temp.SetPixels(pixels);
 
@@ -1649,7 +1725,7 @@ public class ThermalSimulation : MonoBehaviour
         }
 
         Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+            new Texture3D(gridX, gridY, gridZ, TexFormatFor(burningA), false);
 
         temp.SetPixels(pixels);
 
@@ -1665,9 +1741,10 @@ public class ThermalSimulation : MonoBehaviour
     // -------------------------------------------------------------------
     // Fine/coarse coupling.
     //
-    // The box-average ratio is coarseCell/fineCell. At 0.3 and 0.1 that is
-    // exactly 3, so the 3x3x3 taps land on fine cell centres and the average
-    // is exact. Non-integer ratios still work, just approximately.
+    // The box-average ratio is coarseCell/fineCell. When that is a whole
+    // number (0.3 / 0.15 = 2, 0.3 / 0.1 = 3) the taps land on fine cell
+    // centres and the average is exact. Non-integer ratios still work,
+    // just approximately.
     // -------------------------------------------------------------------
     bool HasFineFields()
     {
@@ -1860,8 +1937,6 @@ public class ThermalSimulation : MonoBehaviour
 
         List<Collider> colliders = new List<Collider>();
 
-        Bounds volumeBounds = GetSimulationBounds();
-
         foreach (var opening in openings)
         {
             Collider col = opening.Collider;
@@ -1930,7 +2005,7 @@ public class ThermalSimulation : MonoBehaviour
     public void ResetChar()
     {
         Color[] pixels = new Color[gridX * gridY * gridZ];
-        var tex = new Texture3D(gridX, gridY, gridZ, TextureFormat.RFloat, false);
+        var tex = new Texture3D(gridX, gridY, gridZ, TexFormatFor(charVolume), false);
         tex.SetPixels(pixels);
         tex.Apply();
         Graphics.CopyTexture(tex, charVolume);
@@ -1950,20 +2025,32 @@ public class ThermalSimulation : MonoBehaviour
         return tex;
     }
 
+    void FillVolume(RenderTexture rt, float value)
+    {
+        TextureFormat format = TexFormatFor(rt);
+
+        if (!_fillTextures.TryGetValue((format, value), out Texture3D tex) || tex == null)
+        {
+            tex = MakeFilledVolume(format, value);
+            _fillTextures[(format, value)] = tex;
+        }
+
+        Graphics.CopyTexture(tex, rt);
+    }
+
     /// Puts the whole thermal sim back to its start-of-scene state:
     /// air/solid temperatures, fluid, smoke, flame, suppressant, fuel,
     /// burning voxels, runtime ignitions and char. Hook this to a reset button.
     public void ResetSimulation(float ambientTemp = 20f)
     {
+        // A runtime fire still spreading would re-light the cleared grid.
+        StopRuntimeIgnitionSpreads();
+
         if (!IsInitialized) return;
 
-        if (_zeroScalarTex == null) _zeroScalarTex = MakeFilledVolume(TextureFormat.RFloat, 0f);
-        if (_ambientScalarTex == null) _ambientScalarTex = MakeFilledVolume(TextureFormat.RFloat, ambientTemp);
-        if (_zeroVectorTex == null) _zeroVectorTex = MakeFilledVolume(TextureFormat.RGBAFloat, 0f);
-
         // Air temperature back to ambient (both ping-pong buffers)
-        Graphics.CopyTexture(_ambientScalarTex, temperatureA);
-        Graphics.CopyTexture(_ambientScalarTex, temperatureB);
+        FillVolume(temperatureA, ambientTemp);
+        FillVolume(temperatureB, ambientTemp);
 
         // Fluid, smoke, flame and suppressant fields back to zero
         RenderTexture[] scalars =
@@ -1973,11 +2060,11 @@ public class ThermalSimulation : MonoBehaviour
             flameHeatA, flameHeatB,
             suppressantA, suppressantB
         };
-        foreach (var rt in scalars) Graphics.CopyTexture(_zeroScalarTex, rt);
+        foreach (var rt in scalars) FillVolume(rt, 0f);
 
-        Graphics.CopyTexture(_zeroVectorTex, velocityA);
-        Graphics.CopyTexture(_zeroVectorTex, velocityB);
-        Graphics.CopyTexture(_zeroVectorTex, curlA);
+        FillVolume(velocityA, 0f);
+        FillVolume(velocityB, 0f);
+        FillVolume(curlA, 0f);
 
         // Solid temperatures back to ambient
         InitializeSolidTemperature();
@@ -2002,8 +2089,8 @@ public class ThermalSimulation : MonoBehaviour
     }
 
     /// Binds the current simulation textures to the thermal surface globals
-    /// and the volume materials. FixedUpdate does this every tick while the
-    /// sim is active; this covers the paused case.
+    /// and the volume materials. StepSimulation does this every step while
+    /// the sim is active; this covers the paused case.
     void RebindDisplayTextures()
     {
         Bounds bounds = GetSimulationBounds();
@@ -2018,18 +2105,7 @@ public class ThermalSimulation : MonoBehaviour
 
         if (volumeMaterial) volumeMaterial.SetTexture("_TemperatureTex", temperatureA);
 
-        if (smokeVolumeMaterial)
-        {
-            smokeVolumeMaterial.SetTexture("_SmokeTex", smokeA);
-            smokeVolumeMaterial.SetTexture("_FlameTex", flameA);
-            smokeVolumeMaterial.SetTexture("_TemperatureTex", temperatureA);
-        }
-
-        if (fireVolumeMaterial)
-        {
-            fireVolumeMaterial.SetTexture("_FlameTex", flameA);
-            fireVolumeMaterial.SetTexture("_SmokeTex", smokeA);
-        }
+        BindVisibleFireTextures();
 
         if (fireHeatVolumeMaterial) fireHeatVolumeMaterial.SetTexture("_FireHeatTex", flameHeatA);
     }
@@ -2057,178 +2133,6 @@ public class ThermalSimulation : MonoBehaviour
         thermalSurfaceRenderers = new Renderer[0];
     }
     #endregion
-
-    public void RegisterRuntimeBurningObject(
-        Collider collider,
-        ThermalMaterial material)
-    {
-        Debug.Log("Making out voxels");
-
-        List<BurningVoxel> voxels =
-            new List<BurningVoxel>();
-
-        Bounds bounds = collider.bounds;
-
-        Vector3 minVoxel =
-            WorldToVoxel(bounds.min);
-
-        Vector3 maxVoxel =
-            WorldToVoxel(bounds.max);
-
-        int minX =
-            Mathf.Clamp(
-                Mathf.FloorToInt(minVoxel.x),
-                0,
-                gridX - 1);
-
-        int minY =
-            Mathf.Clamp(
-                Mathf.FloorToInt(minVoxel.y),
-                0,
-                gridY - 1);
-
-        int minZ =
-            Mathf.Clamp(
-                Mathf.FloorToInt(minVoxel.z),
-                0,
-                gridZ - 1);
-
-        int maxX =
-            Mathf.Clamp(
-                Mathf.CeilToInt(maxVoxel.x),
-                0,
-                gridX - 1);
-
-        int maxY =
-            Mathf.Clamp(
-                Mathf.CeilToInt(maxVoxel.y),
-                0,
-                gridY - 1);
-
-        int maxZ =
-            Mathf.Clamp(
-                Mathf.CeilToInt(maxVoxel.z),
-                0,
-                gridZ - 1);
-
-        for (int z = minZ; z <= maxZ; z++)
-        {
-            for (int y = minY; y <= maxY; y++)
-            {
-                for (int x = minX; x <= maxX; x++)
-                {
-                    Vector3 voxelCenter =
-                        VoxelToWorld(
-                            new Vector3(
-                                x + 0.5f,
-                                y + 0.5f,
-                                z + 0.5f));
-
-                    if (!IsVoxelInsideCollider(collider, voxelCenter))
-                        continue;
-
-                    BurningVoxel voxel =
-                        new BurningVoxel();
-
-                    voxel.x = (uint)x;
-                    voxel.y = (uint)y;
-                    voxel.z = (uint)z;
-
-                    voxels.Add(voxel);
-
-                    Debug.DrawRay(
-                    voxelCenter,
-                    Vector3.up * 0.2f,
-                    Color.red,
-                    30f);
-                }
-            }
-        }
-
-
-        Debug.Log($"Grid: {gridX}x{gridY}x{gridZ} | SimBounds: {GetSimulationBounds()} | " +
-          $"ColliderBounds: {bounds} | VoxelRange: ({minX},{minY},{minZ}) to ({maxX},{maxY},{maxZ})");
-
-        if (voxels.Count == 0)
-        {
-            Debug.Log("No voxels found");
-            return;
-        }
-
-        runtimeVoxelBuffer.SetData(voxels);
-
-        simulation.SetBuffer(
-            runtimeIgniteKernel,
-            "RuntimeVoxels",
-            runtimeVoxelBuffer);
-
-        simulation.SetInt(
-            "RuntimeVoxelCount",
-            voxels.Count);
-
-        simulation.SetFloat(
-            "RuntimeFuel",
-            material.fuelAmount);
-
-        simulation.SetFloat(
-            "RuntimeMaterial",
-            (float)material.materialType);
-
-        simulation.SetTexture(
-            runtimeIgniteKernel,
-            "MaterialVolume",
-            materialVolume);
-
-        simulation.SetTexture(
-            runtimeIgniteKernel,
-            "FuelOut",
-            fuelA);
-
-        simulation.SetTexture(
-            runtimeIgniteKernel,
-            "BurningOut",
-            burningA);
-
-        simulation.SetTexture(
-            runtimeIgniteKernel,
-            "ObstacleOut",
-            obstacleVolume);
-
-        simulation.Dispatch(
-            runtimeIgniteKernel,
-            Mathf.CeilToInt(
-                voxels.Count / 64f),
-            1,
-            1);
-
-        RequestVolumeReadback(burningA, data =>
-        {
-            int gx = gridX;
-            int gy = gridY;
-
-            int Index(int x, int y, int z)
-            {
-                return x + gx * (y + gy * z);
-            }
-
-            float max = 0f;
-            int burningCount = 0;
-
-            foreach (float v in data)
-            {
-                if (v > max)
-                    max = v;
-
-                if (v > 0.5f)
-                    burningCount++;
-            }
-
-            Debug.Log($"Burning MAX = {max}, Burning Voxels = {burningCount}");
-        });
-
-        Debug.Log(
-            $"Injected {voxels.Count} voxels");
-    }
 
     public void Extinguish(Collider collider, float strength)
     {
@@ -2318,4 +2222,4 @@ public class ThermalSimulation : MonoBehaviour
             1,
             1);
     }
-}
+}

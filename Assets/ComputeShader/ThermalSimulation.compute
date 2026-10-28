@@ -116,8 +116,19 @@ float SolidCoolingRate;
 float BurningRadiationRange;
 float BurningRadiationPower;
 
+// Cap, in voxels, on how far RadiationStep searches for burning voxels.
+// The search is a cube, so cost grows with (2r+1)^3: 6 is 2197 reads per
+// surface voxel per step, 3 is 343. Set from C# (radiationSearchRadius).
+int RadiationSearchRadius;
+
 float BurnRate;
 float BurnHeat;
+
+// Temperature a burning surface levels off at, deg C. Without this cap the
+// combustion term added BurnHeat (~1300 C/s) every step with almost nothing
+// taking heat away, so a burning voxel climbed past 4000 C. A real wood
+// fire's burning surface sits around 600-900 C.
+float MaxBurnTemp;
 
 float FlameAirHeat;
 
@@ -132,6 +143,11 @@ float VorticityStrength;
 // Advection converts to voxels at the point of use by dividing by
 // CellSize; divergence/pressure/projection are unit-agnostic because
 // they scale velocity and pressure together.
+//
+// EVERY backward trace must divide by CellSize. AdvectFlameStep and
+// AdvectSmokeStep used to skip it, so at 0.2 m cells flame and smoke
+// moved 5x slower than the air carrying them -- the coarse flame sat
+// where it was generated as a blob instead of rising.
 // ===================================================================
 float CellSize;             // metres per voxel of THIS grid
 
@@ -191,6 +207,15 @@ uint RuntimeVoxelCount;
 
 float RuntimeFuel;
 float RuntimeMaterial;
+
+// 0 = register the voxels as a solid fuel object WITHOUT igniting them.
+// 1 = ignite them: burning only, fuel/material/obstacle left as they are.
+//
+// Splitting the two lets C# make the whole object solid at once but light
+// it progressively from an ignition point. Lighting every voxel in the same
+// frame releases the object's full heat instantly, and the starting plume
+// balloons into a dome before the fire settles into flames.
+int RuntimeIgniteMode;
 
 bool CanIgniteVoxel(int3 voxel)
 {
@@ -376,9 +401,14 @@ void RuntimeIgnite(uint id : SV_DispatchThreadID)
     // check and silently ignited nothing. Runtime-spawned solids need to
     // become real obstacle voxels here too, not just re-confirm existing
     // ones.
-    ObstacleOut[p] = 1.0;
-    MaterialVolume[p] = RuntimeMaterial;
-    FuelOut[p] = RuntimeFuel;
+    if (RuntimeIgniteMode == 0)
+    {
+        ObstacleOut[p] = 1.0;
+        MaterialVolume[p] = RuntimeMaterial;
+        FuelOut[p] = RuntimeFuel;
+        return;
+    }
+
     BurningOut[p] = 1.0;
 }
 
@@ -1043,7 +1073,8 @@ void RadiationStep(uint3 id : SV_DispatchThreadID)
     //     (int)ceil(BurningRadiationRange);
 
     // capped
-    int searchRadius = min((int) ceil(BurningRadiationRange), 6);
+    int searchRadius = min((int) ceil(BurningRadiationRange),
+                           clamp(RadiationSearchRadius, 1, 6));
 
     for (int z = -searchRadius; z <= searchRadius; z++)
     {
@@ -1195,7 +1226,14 @@ void CombustionStep(uint3 id : SV_DispatchThreadID)
             burning = 0;
         }
 
-        temp += BurnHeat * burning * DeltaTime;
+        // Heat toward MaxBurnTemp and level off there, rather than climbing
+        // forever. Approach slows near the cap so it settles smoothly.
+        if (temp < MaxBurnTemp)
+        {
+            float headroom = saturate((MaxBurnTemp - temp) / max(MaxBurnTemp, 1.0));
+            temp = min(temp + BurnHeat * burning * DeltaTime * max(headroom, 0.05),
+                       MaxBurnTemp);
+        }
 
         int3 neighbors[6] =
         {
@@ -1402,7 +1440,10 @@ void AdvectSmokeStep(uint3 id : SV_DispatchThreadID)
 
     float3 currentPos = float3(id);
 
-    float3 previousPos = currentPos - velocity.xyz * DeltaTime;
+    // Velocity is m/s; convert to voxels for the backward trace. This
+    // division was missing, so smoke moved 1/CellSize times slower than
+    // the air (5x at 0.2 m cells).
+    float3 previousPos = currentPos - velocity.xyz * DeltaTime / CellSize;
 
     float smoke = SampleSmoke(previousPos);
 
@@ -1637,22 +1678,26 @@ void AdvectFlameStep(uint3 id : SV_DispatchThreadID)
 
     float flameHere = FlameIn[id];
 
-    float3 velocity = VelocityIn[id].xyz;
+    // Velocity is stored in m/s; the extra rise and jitter below were
+    // always in voxels/s, so convert first and keep them as they were.
+    // The trace used to skip the /CellSize entirely, so the coarse flame
+    // moved 5x slower than the air at 0.2 m cells and sat as a blob.
+    float3 velVox = VelocityIn[id].xyz / CellSize;
 
     // Flames naturally rise faster than smoke
-    velocity.y += flameHere * 4.0;
+    velVox.y += flameHere * 4.0;
 
     // Small random sideways motion
     float random =
         frac(sin(dot(float3(id), float3(12.9898, 78.233, 37.719))) * 43758.5453);
 
-    velocity.x += (random - 0.5) * flameHere * 0.5;
-    velocity.z += (0.5 - random) * flameHere * 0.5;
+    velVox.x += (random - 0.5) * flameHere * 0.5;
+    velVox.z += (0.5 - random) * flameHere * 0.5;
 
     float3 currentPos = float3(id);
 
     float3 previousPos =
-        currentPos - velocity * DeltaTime;
+        currentPos - velVox * DeltaTime;
 
     float flame =
         SampleFlame(previousPos);
