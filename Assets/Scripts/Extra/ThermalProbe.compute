@@ -1,7 +1,8 @@
-// Samples ThermalSimulation's volumes at a single raycast hit.
+// Samples ThermalSimulation's volumes for a small CONE of rays -- the spot a
+// real thermal camera's spot meter measures -- in one dispatch.
+//
 // Separate from the main simulation shader so it doesn't touch it, and so it
-// doesn't share ThermalSimulation's volumeReadBuffer (which is also used by
-// RegisterRuntimeBurningObject's readback).
+// doesn't share ThermalSimulation's volumeReadBuffer.
 
 #pragma kernel Probe
 
@@ -10,16 +11,27 @@ Texture3D<float> AirTemp;     // ThermalSimulation.GetTemperatureVolume()       
 Texture3D<float> Obstacle;    // ThermalSimulation.GetObstacleVolume()          (1 = solid)
 Texture3D<float> FlameHeat;   // ThermalSimulation.GetFireHeatVolume()          (FlameHeatStep output)
 
+// One entry per ray. All float4 so the C# struct layout can't drift.
+struct ProbeRay
+{
+    float4 surfaceVoxel;   // xyz: voxel-space point just inside the hit surface; w: 1 = valid ray
+    float4 airVoxel;       // xyz: voxel-space point just in front of the surface
+    float4 startVoxel;     // xyz: camera position in voxel space; w: hit distance in voxels
+    float4 dirVoxel;       // xyz: normalised direction (voxel space is uniformly scaled world space)
+};
+
+StructuredBuffer<ProbeRay> Rays;
+int RayCount;
+
+// 5 floats per ray:
 // 0 surface temp, 1 max surface temp in 3x3x3, 2 solid voxel count,
-// 3 air temp just in front of the surface, 4 max fire heat along the ray
+// 3 air temp just in front of the surface, 4 max fire heat along the ray.
+// Invalid rays (no thermal hit) write -9999 / 0.
 RWStructuredBuffer<float> Result;
 
-int3   GridSize;
-float3 SurfaceVoxel;     // voxel-space point just inside the hit surface
-float3 AirVoxel;         // voxel-space point just in front of the hit surface
-float3 RayStartVoxel;    // camera position in voxel space
-float3 RayDirVoxel;      // normalised (voxel space is uniformly scaled world space)
-float  RayLengthVoxels;  // hit distance / cellSize
+int3 GridSize;
+
+static const float NoValue = -9999.0;
 
 bool InGrid(int3 v)
 {
@@ -31,10 +43,26 @@ int3 ClampToGrid(int3 v)
     return clamp(v, int3(0, 0, 0), GridSize - 1);
 }
 
-[numthreads(1, 1, 1)]
+[numthreads(16, 1, 1)]
 void Probe(uint3 id : SV_DispatchThreadID)
 {
-    int3 centre = ClampToGrid((int3)floor(SurfaceVoxel));
+    int r = (int)id.x;
+    if (r >= RayCount) return;
+
+    ProbeRay ray = Rays[r];
+    int o = r * 5;
+
+    if (ray.surfaceVoxel.w < 0.5)
+    {
+        Result[o + 0] = NoValue;
+        Result[o + 1] = NoValue;
+        Result[o + 2] = 0;
+        Result[o + 3] = NoValue;
+        Result[o + 4] = 0;
+        return;
+    }
+
+    int3 centre = ClampToGrid((int3)floor(ray.surfaceVoxel.xyz));
 
     // --- Surface temperature -------------------------------------------
     // Prefer the voxel the hit point lands in. If the bake put that voxel on
@@ -58,30 +86,28 @@ void Probe(uint3 id : SV_DispatchThreadID)
         maxT = max(maxT, t);
     }
 
-    float surface = -9999;
+    float surface = NoValue;
     if (Obstacle[centre] > 0.5)      surface = SolidTemp[centre];
     else if (count > 0)              surface = sum / count;
 
-    Result[0] = surface;
-    Result[1] = count > 0 ? maxT : -9999;
-    Result[2] = count;
+    Result[o + 0] = surface;
+    Result[o + 1] = count > 0 ? maxT : NoValue;
+    Result[o + 2] = count;
 
     // --- Air temperature at the surface --------------------------------
-    Result[3] = AirTemp[ClampToGrid((int3)floor(AirVoxel))];
+    Result[o + 3] = AirTemp[ClampToGrid((int3)floor(ray.airVoxel.xyz))];
 
     // --- Fire / hot gas along the line of sight ------------------------
-    // March the ray through the grid in half-voxel steps. Camera outside the
-    // grid is fine: out-of-grid samples are skipped.
     float fireMax = 0;
-    int steps = min((int)ceil(RayLengthVoxels * 2.0), 1024);
+    int steps = min((int)ceil(ray.startVoxel.w * 2.0), 1024);
 
     for (int i = 0; i < steps; i++)
     {
-        int3 v = (int3)floor(RayStartVoxel + RayDirVoxel * (i * 0.5));
+        int3 v = (int3)floor(ray.startVoxel.xyz + ray.dirVoxel.xyz * (i * 0.5));
         if (!InGrid(v)) continue;
         if (Obstacle[v] > 0.5) continue;   // only gas cells
         fireMax = max(fireMax, FlameHeat[v]);
     }
 
-    Result[4] = fireMax;
+    Result[o + 4] = fireMax;
 }

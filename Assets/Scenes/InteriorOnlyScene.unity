@@ -26051,10 +26051,10 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!4 &1212830404 stripped
-Transform:
-  m_CorrespondingSourceObject: {fileID: 8969239353734813536, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
-  m_PrefabInstance: {fileID: 1919553089}
+--- !u!20 &1211451413 stripped
+Camera:
+  m_CorrespondingSourceObject: {fileID: 351670811637454224, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+  m_PrefabInstance: {fileID: 486333718}
   m_PrefabAsset: {fileID: 0}
 --- !u!1 &1226026636
 GameObject:
@@ -26303,16 +26303,16 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 334c76739fc196b4fbc6107e308d649a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::ThermalCameraProbe
-  sourceCamera: {fileID: 1502918170}
+  sourceCamera: {fileID: 1211451413}
   probeShader: {fileID: 7200000, guid: c4ff6a879179c9f42998e39abfb1c235, type: 3}
   maxDistance: 30
   hitLayers:
     serializedVersion: 2
     m_Bits: 4294967295
   thermalObjectsOnly: 0
-  ignoreRoot: {fileID: 1212830404}
+  ignoreRoot: {fileID: 1707153500}
   sampleInterval: 0.1
-  readout: {fileID: 586700175}
+  readout: {fileID: 80928940}
   onSurfaceTemperature:
     m_PersistentCalls:
       m_Calls: []
@@ -29974,11 +29974,6 @@ MonoBehaviour:
   combustible: 1
   igniteInstant: 1
   fuelAmount: 100
---- !u!20 &1502918170 stripped
-Camera:
-  m_CorrespondingSourceObject: {fileID: 351670811637454224, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
-  m_PrefabInstance: {fileID: 1919553089}
-  m_PrefabAsset: {fileID: 0}
 --- !u!1 &1527504055 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 7241455859189163582, guid: f11cc2dfa305de4488d2feef8aa3ad1f, type: 3}
@@ -32458,6 +32453,11 @@ MonoBehaviour:
   m_SelectedFaces: 
   m_SelectedEdges: []
   m_SelectedVertices: 
+--- !u!4 &1707153500 stripped
+Transform:
+  m_CorrespondingSourceObject: {fileID: 8969239353734813536, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
+  m_PrefabInstance: {fileID: 486333718}
+  m_PrefabAsset: {fileID: 0}
 --- !u!1 &1729487866
 GameObject:
   m_ObjectHideFlags: 0

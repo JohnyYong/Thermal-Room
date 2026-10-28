@@ -212,6 +212,11 @@ public partial class ThermalSimulation : MonoBehaviour
 
     public float burnRate = 1.0f;
     public float burnHeat = 1300f;
+
+    [Tooltip("Temperature a burning surface levels off at, deg C. Real burning " +
+             "wood surfaces sit around 600-900 C; flame gas is set separately " +
+             "by Flame Gas Temp. Without this, burning voxels climbed past 4000 C.")]
+    public float maxBurnTemp = 850f;
     public float flameAirHeat = 100f;
 
     public float smokeGenerationRate = 1.0f;
@@ -498,10 +503,10 @@ public partial class ThermalSimulation : MonoBehaviour
     {
         switch (rt.format)
         {
-            case RenderTextureFormat.RHalf: return TextureFormat.RHalf;
-            case RenderTextureFormat.ARGBHalf: return TextureFormat.RGBAHalf;
+            case RenderTextureFormat.RHalf:     return TextureFormat.RHalf;
+            case RenderTextureFormat.ARGBHalf:  return TextureFormat.RGBAHalf;
             case RenderTextureFormat.ARGBFloat: return TextureFormat.RGBAFloat;
-            default: return TextureFormat.RFloat;
+            default:                            return TextureFormat.RFloat;
         }
     }
 
@@ -513,6 +518,9 @@ public partial class ThermalSimulation : MonoBehaviour
 
         RenderTexture rt =
             new RenderTexture(gridX, gridY, 0, format);
+
+        // Smooth between voxels when the heat/thermal shaders sample these.
+        rt.filterMode = FilterMode.Bilinear;
 
         rt.dimension = TextureDimension.Tex3D;
 
@@ -1006,6 +1014,8 @@ public partial class ThermalSimulation : MonoBehaviour
         simulation.SetFloat("BurnRate", burnRate);
 
         simulation.SetFloat("BurnHeat", burnHeat);
+
+        simulation.SetFloat("MaxBurnTemp", maxBurnTemp);
 
 
         simulation.SetInt("InfiniteFuel", infiniteFuel ? 1 : 0);

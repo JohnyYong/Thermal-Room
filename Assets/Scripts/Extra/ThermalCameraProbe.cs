@@ -4,13 +4,20 @@ using UnityEngine;
 using UnityEngine.Events;
 using UnityEngine.Rendering;
 
-/// Fires a ray from the centre of a camera, finds the surface it hits, and
-/// reads that surface's temperature from ThermalSimulation.
+/// Spot meter for the thermal camera, modelled on a real one.
 ///
-/// The temperatures live on the GPU, so the value arrives a frame or two after
-/// the raycast (async readback -- a synchronous read would stall the VR frame).
-/// Read the latest value from SurfaceTemperature, or listen to
-/// onSurfaceTemperature.
+/// A real thermal camera's temperature reading doesn't come from a single
+/// point: each sensor pixel sees a small cone, so the spot it measures grows
+/// with distance (the "distance-to-spot ratio", D:S). A small hot object far
+/// away is averaged with its cooler surroundings and reads lower than it is.
+///
+/// This casts a small cone of rays from the centre of the camera, reads the
+/// thermal sim along each, and averages them -- in ONE compute dispatch and
+/// one async readback, so it costs about the same as the old single ray.
+///
+/// The values arrive a frame or two after the raycast (async readback -- a
+/// synchronous read would stall the VR frame). Read the latest from the
+/// properties, or listen to onSpotTemperature / onSurfaceTemperature.
 public class ThermalCameraProbe : MonoBehaviour
 {
     [Header("Setup")]
@@ -31,56 +38,102 @@ public class ThermalCameraProbe : MonoBehaviour
              "Leave empty to auto-find the XR Origin above the camera.")]
     [SerializeField] private Transform ignoreRoot;
 
+    [Header("Spot (cone)")]
+    [Tooltip("Distance-to-spot ratio. At D:S = 20, the spot is 1/20 of the " +
+             "distance across: 5 cm at 1 m, 50 cm at 10 m. Firefighting " +
+             "cameras are typically around 10-30. Higher = tighter spot.")]
+    [Min(1f)]
+    [SerializeField] private float distanceToSpotRatio = 20f;
+
+    [Tooltip("Rays across the spot. More = smoother average, a little more " +
+             "CPU for the raycasts. 1 = the old single-ray behaviour.")]
+    [Range(1, 32)]
+    [SerializeField] private int rayCount = 9;
+
     [Header("Sampling")]
     [Tooltip("Seconds between readings. 0.1 = 10 readings per second.")]
     [SerializeField] private float sampleInterval = 0.1f;
 
     [Tooltip("A readback that hasn't come back after this many seconds is " +
-             "given up on. Without this, one lost readback left the probe " +
-             "'pending' forever and the reading froze at its last value.")]
+             "given up on, so one lost readback can't freeze the reading.")]
     [SerializeField] private float readbackTimeout = 1f;
 
     [Header("Output")]
     [Tooltip("Optional text to show the reading on.")]
     [SerializeField] private TMP_Text readout;
 
-    [Tooltip("Show the raw numbers (surface, max, air, fire along the ray, " +
-             "whether the sim is running) on the readout instead of just the " +
-             "surface temperature. Turn on while debugging.")]
+    [Tooltip("Show spot average, min/max, the centre ray's raw numbers and " +
+             "whether the sim is running, instead of just the spot temperature.")]
     [SerializeField] private bool showDebugReadout = false;
 
+    [Tooltip("Fires with the spot temperature (deg C) on every reading.")]
+    public UnityEvent<float> onSpotTemperature;
+
+    [Tooltip("Kept for existing listeners: fires with the centre ray's solid " +
+             "surface temperature.")]
     public UnityEvent<float> onSurfaceTemperature;
 
-    // ---- Latest reading ----------------------------------------------------
+    // ---- Latest reading: the spot ------------------------------------------
     public bool HasReading { get; private set; }
 
-    /// Solid surface temperature at the hit point, deg C.
+    /// What the spot meter reads: the average apparent temperature across
+    /// the cone. Per ray, "apparent" is the hottest of the surface, the air
+    /// in front of it and any flame along the line of sight -- what a
+    /// thermal camera pixel would actually see.
+    public float SpotTemperature { get; private set; }
+
+    /// Hottest and coldest apparent temperature inside the spot.
+    public float SpotMax { get; private set; }
+    public float SpotMin { get; private set; }
+
+    /// Rays in the cone that hit something the thermal sim knows about.
+    public int SpotValidRays { get; private set; }
+
+    // ---- Latest reading: the centre ray (unchanged meanings) ---------------
+
+    /// Solid surface temperature at the centre hit, deg C.
     public float SurfaceTemperature { get; private set; }
 
-    /// Hottest solid voxel within one cell of the hit, deg C.
+    /// Hottest solid voxel within one cell of the centre hit, deg C.
     public float SurfaceMaxTemperature { get; private set; }
 
-    /// Gas temperature just in front of the surface, deg C.
+    /// Gas temperature just in front of the centre hit, deg C.
     public float AirTemperatureAtSurface { get; private set; }
 
-    /// Highest fire/hot-gas value between the camera and the surface
-    /// (raw FlameHeatStep output -- the same field the thermal image uses).
+    /// Highest fire/hot-gas value along the centre ray.
     public float FireHeatAlongRay { get; private set; }
-
-    /// What a thermal camera would actually report for this pixel: the
-    /// hottest of the surface, the air in front of it, and any flame or hot
-    /// gas in between. A real imager can't see "behind" a flame -- it reads
-    /// the flame. The surface value alone stays near ambient for anything
-    /// that isn't itself burning, which is why it can look like it never moves.
-    public float ApparentTemperature { get; private set; }
 
     public GameObject HitObject { get; private set; }
     public Vector3 HitPoint { get; private set; }
     public float HitDistance { get; private set; }
 
-    const int ResultCount = 5;
+    const int ResultsPerRay = 5;
+    const int MaxRays = 32;
+    const float NoValue = -9000f;   // anything below this is "no data"
 
+    // Must match ProbeRay in ThermalProbe.compute: 4 x float4.
+    struct ProbeRayGPU
+    {
+        public Vector4 surfaceVoxel;
+        public Vector4 airVoxel;
+        public Vector4 startVoxel;
+        public Vector4 dirVoxel;
+    }
+
+    ComputeBuffer _rayBuffer;
     ComputeBuffer _resultBuffer;
+    readonly ProbeRayGPU[] _rays = new ProbeRayGPU[MaxRays];
+
+    // Cone layout: unit-disk offsets, centre ray first.
+    Vector2[] _diskOffsets;
+    int _diskOffsetsFor = -1;
+
+    // Last cone, for gizmos.
+    readonly Vector3[] _gizmoEnds = new Vector3[MaxRays];
+    readonly bool[] _gizmoHit = new bool[MaxRays];
+    int _gizmoCount;
+    Vector3 _gizmoOrigin;
+
     int _kernel = -1;
     bool _pending;
     float _pendingSince;
@@ -89,9 +142,6 @@ public class ThermalCameraProbe : MonoBehaviour
     readonly RaycastHit[] _hits = new RaycastHit[32];
     static readonly IComparer<RaycastHit> ByDistance =
         Comparer<RaycastHit>.Create((a, b) => a.distance.CompareTo(b.distance));
-
-    Ray _lastRay;
-    bool _lastHit;
 
     void OnEnable()
     {
@@ -105,7 +155,8 @@ public class ThermalCameraProbe : MonoBehaviour
         }
 
         _kernel = probeShader.FindKernel("Probe");
-        _resultBuffer = new ComputeBuffer(ResultCount, sizeof(float));
+        _rayBuffer = new ComputeBuffer(MaxRays, sizeof(float) * 16);
+        _resultBuffer = new ComputeBuffer(MaxRays * ResultsPerRay, sizeof(float));
         _pending = false;
 
         // Auto-find the XR rig so the player's own colliders don't block the ray.
@@ -118,6 +169,8 @@ public class ThermalCameraProbe : MonoBehaviour
 
     void OnDisable()
     {
+        _rayBuffer?.Release();
+        _rayBuffer = null;
         _resultBuffer?.Release();
         _resultBuffer = null;
         _pending = false;
@@ -139,40 +192,105 @@ public class ThermalCameraProbe : MonoBehaviour
         Sample();
     }
 
-    /// Takes one reading now. Result arrives via the properties / event.
+    // Evenly spread points on the unit disk (Vogel / golden-angle spiral),
+    // with the first one exactly at the centre so ray 0 is the crosshair.
+    void EnsureDiskOffsets(int n)
+    {
+        if (_diskOffsetsFor == n && _diskOffsets != null) return;
+
+        _diskOffsets = new Vector2[n];
+        const float golden = 2.39996323f;
+
+        for (int i = 0; i < n; i++)
+        {
+            if (i == 0) { _diskOffsets[i] = Vector2.zero; continue; }
+
+            float r = Mathf.Sqrt((i + 0.5f) / n);
+            float a = i * golden;
+            _diskOffsets[i] = new Vector2(Mathf.Cos(a), Mathf.Sin(a)) * r;
+        }
+
+        _diskOffsetsFor = n;
+    }
+
+    /// Takes one reading now. Result arrives via the properties / events.
     public void Sample()
     {
         ThermalSimulation sim = ThermalSimulation.Instance;
-        if (sim == null || !sim.IsInitialized || sourceCamera == null || _resultBuffer == null)
+        if (sim == null || !sim.IsInitialized || sourceCamera == null ||
+            _rayBuffer == null || _resultBuffer == null)
             return;
 
-        Ray ray = sourceCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
-        _lastRay = ray;
+        int n = Mathf.Clamp(rayCount, 1, MaxRays);
+        EnsureDiskOffsets(n);
 
-        if (!TryGetHit(ray, out RaycastHit hit))
+        Ray centreRay = sourceCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
+        Vector3 fwd = centreRay.direction;
+        Vector3 right = sourceCamera.transform.right;
+        Vector3 up = Vector3.Cross(fwd, right).normalized;
+        right = Vector3.Cross(up, fwd).normalized;
+
+        // Cone half-angle from D:S: the spot's radius is distance / (2 * D:S).
+        float tanHalf = 0.5f / Mathf.Max(distanceToSpotRatio, 1f);
+
+        float cell = sim.CellSizePublic;
+        Vector3 startVoxel = sim.WorldToVoxel(centreRay.origin);
+
+        int validRays = 0;
+        bool centreHit = false;
+        RaycastHit centre = default;
+
+        _gizmoOrigin = centreRay.origin;
+        _gizmoCount = n;
+
+        for (int i = 0; i < n; i++)
         {
-            _lastHit = false;
+            Vector2 d = _diskOffsets[i];
+            Vector3 dir = (fwd + (right * d.x + up * d.y) * tanHalf).normalized;
+            Ray ray = new Ray(centreRay.origin, dir);
+
+            if (TryGetHit(ray, out RaycastHit hit))
+            {
+                // Just inside the surface for the solid, just in front for the air.
+                Vector3 sv = sim.WorldToVoxel(hit.point - hit.normal * (cell * 0.5f));
+                Vector3 av = sim.WorldToVoxel(hit.point + hit.normal * (cell * 0.75f));
+
+                _rays[i] = new ProbeRayGPU
+                {
+                    surfaceVoxel = new Vector4(sv.x, sv.y, sv.z, 1f),
+                    airVoxel = new Vector4(av.x, av.y, av.z, 0f),
+                    startVoxel = new Vector4(startVoxel.x, startVoxel.y, startVoxel.z, hit.distance / cell),
+                    dirVoxel = new Vector4(dir.x, dir.y, dir.z, 0f),
+                };
+
+                validRays++;
+                _gizmoEnds[i] = hit.point;
+                _gizmoHit[i] = true;
+
+                if (i == 0) { centreHit = true; centre = hit; }
+            }
+            else
+            {
+                _rays[i] = default;   // w = 0: the kernel writes "no data"
+                _gizmoEnds[i] = ray.origin + dir * maxDistance;
+                _gizmoHit[i] = false;
+            }
+        }
+
+        if (validRays == 0)
+        {
             ClearReading();
             return;
         }
 
-        _lastHit = true;
-
-        float cell = sim.CellSizePublic;
-
-        // Just inside the surface for the solid, just in front for the air.
-        Vector3 surfaceVoxel = sim.WorldToVoxel(hit.point - hit.normal * (cell * 0.5f));
-        Vector3 airVoxel = sim.WorldToVoxel(hit.point + hit.normal * (cell * 0.75f));
-        Vector3 startVoxel = sim.WorldToVoxel(ray.origin);
-
         sim.GetGridSize(out int gx, out int gy, out int gz);
 
+        _rayBuffer.SetData(_rays, 0, 0, n);
+
         probeShader.SetInts("GridSize", gx, gy, gz);
-        probeShader.SetVector("SurfaceVoxel", surfaceVoxel);
-        probeShader.SetVector("AirVoxel", airVoxel);
-        probeShader.SetVector("RayStartVoxel", startVoxel);
-        probeShader.SetVector("RayDirVoxel", ray.direction);   // voxel space is just scaled world space
-        probeShader.SetFloat("RayLengthVoxels", hit.distance / cell);
+        probeShader.SetInt("RayCount", n);
+        probeShader.SetBuffer(_kernel, "Rays", _rayBuffer);
+        probeShader.SetBuffer(_kernel, "Result", _resultBuffer);
 
         // Bound fresh every sample: these are ping-pong buffers, so the
         // texture that is "current" changes every sim step.
@@ -180,18 +298,17 @@ public class ThermalCameraProbe : MonoBehaviour
         probeShader.SetTexture(_kernel, "AirTemp", sim.GetTemperatureVolume());
         probeShader.SetTexture(_kernel, "Obstacle", sim.GetObstacleVolume());
         probeShader.SetTexture(_kernel, "FlameHeat", sim.GetFireHeatVolume());
-        probeShader.SetBuffer(_kernel, "Result", _resultBuffer);
 
-        probeShader.Dispatch(_kernel, 1, 1, 1);
+        probeShader.Dispatch(_kernel, Mathf.CeilToInt(n / 16f), 1, 1);
 
-        GameObject hitObject = hit.collider.gameObject;
-        Vector3 hitPoint = hit.point;
-        float hitDistance = hit.distance;
+        GameObject hitObject = centreHit ? centre.collider.gameObject : null;
+        Vector3 hitPoint = centreHit ? centre.point : Vector3.zero;
+        float hitDistance = centreHit ? centre.distance : 0f;
 
         _pending = true;
         _pendingSince = Time.unscaledTime;
 
-        AsyncGPUReadback.Request(_resultBuffer, request =>
+        AsyncGPUReadback.Request(_resultBuffer, n * ResultsPerRay * sizeof(float), 0, request =>
         {
             if (this == null) return;   // destroyed while waiting
             _pending = false;
@@ -203,29 +320,72 @@ public class ThermalCameraProbe : MonoBehaviour
             }
 
             var data = request.GetData<float>();
-
-            HitObject = hitObject;
-            HitPoint = hitPoint;
-            HitDistance = hitDistance;
-
-            bool foundSolid = data[2] > 0.5f && data[0] > -9000f;
-
-            HasReading = foundSolid;
-            SurfaceTemperature = foundSolid ? data[0] : float.NaN;
-            SurfaceMaxTemperature = foundSolid ? data[1] : float.NaN;
-            AirTemperatureAtSurface = data[3];
-            FireHeatAlongRay = data[4];
-
-            float apparent = foundSolid ? data[1] : float.NegativeInfinity;
-            if (data[3] > -9000f) apparent = Mathf.Max(apparent, data[3]);
-            apparent = Mathf.Max(apparent, data[4]);
-            ApparentTemperature = float.IsNegativeInfinity(apparent) ? float.NaN : apparent;
-
-            UpdateReadout();
-
-            if (HasReading)
-                onSurfaceTemperature?.Invoke(SurfaceTemperature);
+            Consume(data, n, centreHit, hitObject, hitPoint, hitDistance);
         });
+    }
+
+    void Consume(Unity.Collections.NativeArray<float> data, int n, bool centreHit,
+                 GameObject hitObject, Vector3 hitPoint, float hitDistance)
+    {
+        float sum = 0f;
+        float max = float.NegativeInfinity;
+        float min = float.PositiveInfinity;
+        int count = 0;
+
+        for (int i = 0; i < n; i++)
+        {
+            int o = i * ResultsPerRay;
+
+            float apparent = ApparentFor(data[o + 0], data[o + 1], data[o + 2],
+                                         data[o + 3], data[o + 4]);
+            if (float.IsNaN(apparent)) continue;
+
+            sum += apparent;
+            max = Mathf.Max(max, apparent);
+            min = Mathf.Min(min, apparent);
+            count++;
+        }
+
+        HitObject = hitObject;
+        HitPoint = hitPoint;
+        HitDistance = hitDistance;
+
+        SpotValidRays = count;
+        HasReading = count > 0;
+        SpotTemperature = count > 0 ? sum / count : float.NaN;
+        SpotMax = count > 0 ? max : float.NaN;
+        SpotMin = count > 0 ? min : float.NaN;
+
+        // Centre ray, same meanings as before.
+        bool centreSolid = centreHit && data[2] > 0.5f && data[0] > NoValue;
+        SurfaceTemperature = centreSolid ? data[0] : float.NaN;
+        SurfaceMaxTemperature = centreSolid ? data[1] : float.NaN;
+        AirTemperatureAtSurface = centreHit && data[3] > NoValue ? data[3] : float.NaN;
+        FireHeatAlongRay = centreHit ? data[4] : float.NaN;
+
+        UpdateReadout();
+
+        if (HasReading)
+            onSpotTemperature?.Invoke(SpotTemperature);
+
+        if (centreSolid)
+            onSurfaceTemperature?.Invoke(SurfaceTemperature);
+    }
+
+    // What one ray's pixel would read: hottest of the surface, the air in
+    // front of it and any flame along the line of sight. NaN = no data.
+    static float ApparentFor(float surface, float surfaceMax, float solidCount,
+                             float air, float fire)
+    {
+        float a = float.NegativeInfinity;
+
+        // The surface value itself, not the 3x3x3 max: the max picked up any
+        // burning voxel next to the hit and made every nearby reading spike.
+        if (solidCount > 0.5f && surface > NoValue) a = Mathf.Max(a, surface);
+        if (air > NoValue) a = Mathf.Max(a, air);
+        if (!float.IsNegativeInfinity(a)) a = Mathf.Max(a, fire);
+
+        return float.IsNegativeInfinity(a) ? float.NaN : a;
     }
 
     bool TryGetHit(Ray ray, out RaycastHit result)
@@ -260,7 +420,10 @@ public class ThermalCameraProbe : MonoBehaviour
     {
         HasReading = false;
         HitObject = null;
-        SurfaceTemperature = SurfaceMaxTemperature = ApparentTemperature = float.NaN;
+        SpotValidRays = 0;
+        SpotTemperature = SpotMax = SpotMin = float.NaN;
+        SurfaceTemperature = SurfaceMaxTemperature = float.NaN;
+        AirTemperatureAtSurface = FireHeatAlongRay = float.NaN;
         UpdateReadout();
     }
 
@@ -274,29 +437,29 @@ public class ThermalCameraProbe : MonoBehaviour
             bool running = sim != null && sim.simulationActive;
 
             readout.text =
-                $"{(HitObject ? HitObject.name : "no hit")}\n" +
-                $"surface {Fmt(SurfaceTemperature)}  max {Fmt(SurfaceMaxTemperature)}\n" +
-                $"air {Fmt(AirTemperatureAtSurface)}  fire {Fmt(FireHeatAlongRay)}\n" +
+                $"{(HitObject ? HitObject.name : "no centre hit")}\n" +
+                $"spot {Fmt(SpotTemperature)}  ({SpotValidRays}/{Mathf.Clamp(rayCount, 1, MaxRays)} rays)\n" +
+                $"min {Fmt(SpotMin)}  max {Fmt(SpotMax)}\n" +
+                $"centre: surf {Fmt(SurfaceTemperature)}  air {Fmt(AirTemperatureAtSurface)}  fire {Fmt(FireHeatAlongRay)}\n" +
                 $"sim {(running ? "RUNNING" : "PAUSED")}";
             return;
         }
 
-        readout.text = float.IsNaN(ApparentTemperature)
-            ? "-- °C"
-            : $"{ApparentTemperature:0.0} °C";
+        readout.text = HasReading ? $"{SpotTemperature:0.0} °C" : "-- °C";
     }
 
     static string Fmt(float v) =>
-        float.IsNaN(v) || v < -9000f ? "--" : v.ToString("0.0");
+        float.IsNaN(v) || v < NoValue ? "--" : v.ToString("0.0");
 
     void OnDrawGizmos()
     {
         if (!Application.isPlaying) return;
 
-        Gizmos.color = _lastHit ? Color.red : Color.grey;
-        float len = _lastHit ? HitDistance : maxDistance;
-        Gizmos.DrawLine(_lastRay.origin, _lastRay.origin + _lastRay.direction * len);
-
-        if (_lastHit) Gizmos.DrawWireSphere(HitPoint, 0.05f);
+        for (int i = 0; i < _gizmoCount; i++)
+        {
+            Gizmos.color = _gizmoHit[i] ? (i == 0 ? Color.red : new Color(1f, 0.5f, 0f)) : Color.grey;
+            Gizmos.DrawLine(_gizmoOrigin, _gizmoEnds[i]);
+            if (_gizmoHit[i]) Gizmos.DrawWireSphere(_gizmoEnds[i], 0.02f);
+        }
     }
 }

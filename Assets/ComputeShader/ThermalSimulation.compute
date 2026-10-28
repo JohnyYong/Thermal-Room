@@ -124,6 +124,12 @@ int RadiationSearchRadius;
 float BurnRate;
 float BurnHeat;
 
+// Temperature a burning surface levels off at, deg C. Without this cap the
+// combustion term added BurnHeat (~1300 C/s) every step with almost nothing
+// taking heat away, so a burning voxel climbed past 4000 C. A real wood
+// fire's burning surface sits around 600-900 C.
+float MaxBurnTemp;
+
 float FlameAirHeat;
 
 float VorticityStrength;
@@ -1220,7 +1226,14 @@ void CombustionStep(uint3 id : SV_DispatchThreadID)
             burning = 0;
         }
 
-        temp += BurnHeat * burning * DeltaTime;
+        // Heat toward MaxBurnTemp and level off there, rather than climbing
+        // forever. Approach slows near the cap so it settles smoothly.
+        if (temp < MaxBurnTemp)
+        {
+            float headroom = saturate((MaxBurnTemp - temp) / max(MaxBurnTemp, 1.0));
+            temp = min(temp + BurnHeat * burning * DeltaTime * max(headroom, 0.05),
+                       MaxBurnTemp);
+        }
 
         int3 neighbors[6] =
         {
