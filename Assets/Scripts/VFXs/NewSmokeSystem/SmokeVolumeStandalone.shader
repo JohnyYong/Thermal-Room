@@ -1,9 +1,9 @@
 Shader "Custom/SmokeVolumeStandalone"
 {
-    // The shader SmokeSim draws with (its smokeMaterial). Same property names
-    // as before, so the material and SmokeSim.BindRenderTextures need no
-    // changes. Rebuilt on VolumeCommon.hlsl for Quest, with sub-voxel flame
-    // detail to hide the sim grid.
+    //The shader SmokeSim draws with (its smokeMaterial). Same property names
+    //as before, so the material and SmokeSim.BindRenderTextures need no
+    //changes. Rebuilt on VolumeCommon.hlsl for Quest, with sub-voxel flame
+    //detail to hide the sim grid.
     Properties
     {
         _SmokeTex   ("Smoke",           3D)    = "" {}
@@ -18,34 +18,39 @@ Shader "Custom/SmokeVolumeStandalone"
         _FireColorMid    ("Fire Color (Mid)",  Color) = (1.0, 0.65, 0.1, 1)
         _FireColorHigh   ("Fire Color (Hot)",  Color) = (1.0, 1.0,  0.8, 1)
 
-        // Soot inside the reaction zone is incandescent -- emitting, not
-        // blocking. 1 = a fully luminous cell is completely transparent.
+        //Soot inside the reaction zone is incandescent -- emitting, not
+        //blocking. 1 = a fully luminous cell is completely transparent.
         _SootIncandescence ("Soot Incandescence", Range(0,1)) = 0.85
 
-        // Flame light scattered by nearby soot.
+        //Flame light scattered by nearby soot.
         _FireScatter ("Fire In-Scatter", Range(0,4)) = 1.2
 
+        [Header(Fire Lit Smoke)]
+        //Light from nearby flames on the smoke around them (SmokeSim.fireLitSmoke). 0 = off.
+        _FireGlow ("Fire Glow On Smoke", Range(0, 60)) = 8
+        _FireGlowColor ("Fire Glow Color", Color) = (1.0, 0.42, 0.12, 1)
+
         [Header(Flame Detail)]
-        // Bends the flame sideways before sampling it, metres. This is what
-        // hides the voxel grid: it curves the straight, blocky columns into
-        // wavering tongues. About one sim cell (0.2 m). 0 turns it off.
+        //Bends the flame sideways before sampling it, metres. This is what
+        //hides the voxel grid: it curves the straight, blocky columns into
+        //wavering tongues. About one sim cell (0.2 m). 0 turns it off.
         _DetailWarp("Warp Amount (m)", Range(0, 0.5)) = 0.18
-        // Size of the warp's swirls, metres.
+        //Size of the warp's swirls, metres.
         _DetailWarpScale("Warp Size (m)", Range(0.05, 1)) = 0.3
-        // Fine animated breakup of the flame edges. 0 turns it off.
+        //Fine animated breakup of the flame edges. 0 turns it off.
         _DetailStrength("Detail Strength", Range(0, 1.5)) = 0.8
-        // Size of the finest features, metres.
+        //Size of the finest features, metres.
         _DetailScale("Detail Size (m)", Range(0.02, 0.5)) = 0.08
-        // How fast the detail rises, metres per second.
+        //How fast the detail rises, metres per second.
         _DetailSpeed("Detail Rise Speed (m/s)", Range(0, 5)) = 1.5
-        // >1 stretches the detail into vertical streaks (tongues, not blobs).
+        //>1 stretches the detail into vertical streaks (tongues, not blobs).
         _DetailStretch("Detail Vertical Stretch", Range(1, 4)) = 2.0
-        // 1 = detail only eats into faint edges; 0 = breaks up everything.
+        //1 = detail only eats into faint edges; 0 = breaks up everything.
         _DetailCoreProtect("Protect Core", Range(0, 1)) = 0.4
 
         [Header(Performance)]
-        // Replaces the old fixed Ray Steps (128). Steps now follow how far
-        // the ray actually travels through the box.
+        //Replaces the old fixed Ray Steps (128). Steps now follow how far
+        //the ray actually travels through the box.
         _StepWorld("Step Length (m)", Range(0.03, 0.5)) = 0.1
         _MaxSteps("Max Steps", Range(8, 256)) = 64
         _DepthSlack("Depth Slack (m)", Float) = 0.02
@@ -55,7 +60,7 @@ Shader "Custom/SmokeVolumeStandalone"
     {
         Tags { "RenderPipeline"="UniversalPipeline" "Queue"="Transparent" "RenderType"="Transparent" }
 
-        // Premultiplied alpha: RGB is already transmittance-weighted.
+        //Premultiplied alpha: RGB is already transmittance-weighted.
         Blend One OneMinusSrcAlpha
         Cull Front
         ZWrite Off
@@ -88,6 +93,11 @@ Shader "Custom/SmokeVolumeStandalone"
             float _SootIncandescence;
             float _FireScatter;
 
+            sampler3D _FireGlowTex;
+            float  _FireGlow;
+            float4 _FireGlowColor;
+            float  _FireGlowEnabled;
+
             float _DetailWarp;
             float _DetailWarpScale;
             float _DetailStrength;
@@ -96,6 +106,15 @@ Shader "Custom/SmokeVolumeStandalone"
             float _DetailStretch;
             float _DetailCoreProtect;
 
+            //Empty-space map from SmokeSim (BuildOccupancy): one value per
+            //8x8x8 brick of the sim grid, 0 where nothing can be visible.
+            //_OccEnabled stays 0 unless SmokeSim has bound a current map,
+            //so a material used without the sim renders exactly as before.
+            #define OCC_BRICK 8
+            Texture3D<float> _OccTex;
+            float3 _OccGrid;      //sim grid size in voxels
+            float  _OccEnabled;
+
             float3 FireColor(float f)
             {
                 if (f < 0.5)
@@ -103,7 +122,7 @@ Shader "Custom/SmokeVolumeStandalone"
                 return lerp(_FireColorMid.rgb, _FireColorHigh.rgb, (f - 0.5) * 2.0);
             }
 
-            // Hash without sin(): sin-based hashes band on mobile GPUs.
+            //Hash without sin(): sin-based hashes band on mobile GPUs.
             float Hash13(float3 p3)
             {
                 p3 = frac(p3 * 0.1031);
@@ -130,7 +149,7 @@ Shader "Custom/SmokeVolumeStandalone"
                             lerp(lerp(n001, n101, f.x), lerp(n011, n111, f.x), f.y), f.z);
             }
 
-            // Sideways (xz) displacement for the fire lookup, world metres.
+            //Sideways (xz) displacement for the fire lookup, world metres.
             float3 FireWarp(float3 worldPos, float t)
             {
                 float3 q = worldPos / max(_DetailWarpScale, 1e-3);
@@ -141,7 +160,7 @@ Shader "Custom/SmokeVolumeStandalone"
                 return float3(wx, 0.0, wz) * (2.0 * _DetailWarp);
             }
 
-            // Two octaves of rising, stretched noise, roughly -0.5..0.5.
+            //Two octaves of rising, stretched noise, roughly -0.5..0.5.
             float FireDetail(float3 worldPos, float t)
             {
                 float3 q = worldPos / max(_DetailScale, 1e-3);
@@ -156,8 +175,8 @@ Shader "Custom/SmokeVolumeStandalone"
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
 
-                // Occlusion is resolved ONCE here (scene depth -> max ray
-                // length), instead of a world->view transform every step.
+                //Occlusion is resolved ONCE here (scene depth -> max ray
+                //length), instead of a world->view transform every step.
                 MarchSetup m;
                 if (!SetupMarch(i, m))
                     discard;
@@ -168,21 +187,50 @@ Shader "Custom/SmokeVolumeStandalone"
                 float3 wStep = mul((float3x3)unity_ObjectToWorld, m.rayDir * m.stepSize);
                 float  t     = fmod(_Time.y, 1000.0);
 
-                // Step length as a fraction of the box, matching the units
-                // the material's brightness and density were tuned in.
+                //Step length as a fraction of the box, matching the units
+                //the material's brightness and density were tuned in.
                 float stepUvw = m.stepSize;
 
                 float3 accum = 0;
                 float  transmittance = 1.0;
 
+                //Ray step in sim voxels, and how many bricks there are.
+                float3 dv     = m.rayDir * m.stepSize * _OccGrid;
+                float3 invDv  = 1.0 / (abs(dv) > 1e-8 ? dv : 1e-8);
+                int3   bricks = (int3)ceil(_OccGrid / OCC_BRICK);
+
                 [loop]
                 for (int s = 0; s < m.steps; s++)
                 {
+                    //--- empty-space skipping ---
+                    //In an empty brick every sample adds exactly nothing, so
+                    //jump to the first sample past the brick. The samples
+                    //that are visited stay at the same positions as before.
+                    if (_OccEnabled > 0.5)
+                    {
+                        float3 v = pos * _OccGrid;
+                        int3   b = (int3)floor(v / OCC_BRICK);
+
+                        if (all(b >= 0) && all(b < bricks) && _OccTex.Load(int4(b, 0)) < 0.5)
+                        {
+                            float3 bmin = (float3)b * OCC_BRICK;
+                            float3 exitV = (dv > 0.0) ? bmin + OCC_BRICK : bmin;
+                            float3 tAxis = (exitV - v) * invDv;
+                            float  n = min(tAxis.x, min(tAxis.y, tAxis.z));
+                            int    k = max(1, (int)ceil(n));
+
+                            s   += k - 1;               //the loop adds the last one
+                            pos += m.rayDir * (m.stepSize * k);
+                            wp  += wStep * k;
+                            continue;
+                        }
+                    }
+
                     float4 uvw    = float4(pos, 0);
                     float  smokeD = tex3Dlod(_SmokeTex, uvw).r;
                     float  fireD  = tex3Dlod(_FireTex,  uvw).r;
 
-                    // --- flame detail: only near flame, so empty air is free ---
+                    //--- flame detail: only near flame, so empty air is free ---
                     if (fireD > 0.002)
                     {
                         if (_DetailWarp > 0.0)
@@ -198,23 +246,23 @@ Shader "Custom/SmokeVolumeStandalone"
                         }
                     }
 
-                    // --- emission: passes through only what is in front ---
+                    //--- emission: passes through only what is in front ---
                     if (fireD > 0.001)
                     {
                         float edgeBoost = smoothstep(0.0, 0.15, fireD);
 
-                        // stepUvw, not metres: _FireBrightness and _Density
-                        // were tuned against the old shader, whose step was
-                        // a fraction of the BOX (0..1). The box is room-sized,
-                        // so a step in metres is several times larger and
-                        // blew everything out to saturated yellow.
+                        //stepUvw, not metres: _FireBrightness and _Density
+                        //were tuned against the old shader, whose step was
+                        //a fraction of the BOX (0..1). The box is room-sized,
+                        //so a step in metres is several times larger and
+                        //blew everything out to saturated yellow.
                         float3 fc = FireColor(fireD) * fireD
                                   * _FireBrightness * stepUvw * edgeBoost;
 
                         accum += fc * transmittance;
                     }
 
-                    // --- absorption: affects everything behind ---
+                    //--- absorption: affects everything behind ---
                     if (smokeD > 0.005)
                     {
                         float3 sc = lerp(_SmokeColorLow.rgb, _SmokeColorHigh.rgb,
@@ -222,12 +270,16 @@ Shader "Custom/SmokeVolumeStandalone"
 
                         float sa = saturate(smokeD * stepUvw * _Density * 4.0);
 
-                        // Glowing soot in the reaction zone does not occlude.
+                        //Glowing soot in the reaction zone does not occlude.
                         sa *= saturate(1.0 - fireD * _SootIncandescence);
 
-                        // In-scattering: soot next to a flame is lit by it.
+                        //In-scattering: soot next to a flame is lit by it.
                         if (fireD > 0.001)
                             sc += FireColor(fireD) * fireD * _FireScatter;
+
+                        //Lit by flames nearby too, not just in this cell
+                        if (_FireGlowEnabled > 0.5)
+                            sc += _FireGlowColor.rgb * (tex3Dlod(_FireGlowTex, uvw).r * _FireGlow);
 
                         accum += sc * sa * transmittance;
                         transmittance *= (1.0 - sa);

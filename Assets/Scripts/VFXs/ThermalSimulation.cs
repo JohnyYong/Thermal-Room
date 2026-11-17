@@ -458,6 +458,11 @@ public partial class ThermalSimulation : MonoBehaviour
         FindOpenings();
         BuildObstacleVolume();
         InitializeSolidTemperature();
+
+        //Air starts at ambient too. Fresh RTs are 0, so the room used to read 0 C until it slowly "warmed" to 20.
+        FillVolume(temperatureA, 20f);
+        FillVolume(temperatureB, 20f);
+
         CreateThermalClones();
 
         IsInitialized = true;
@@ -1297,39 +1302,11 @@ public partial class ThermalSimulation : MonoBehaviour
         }
     }
 
+    // Every solid starts at ambient (20 C).
     void InitializeSolidTemperature()
     {
-        bool testVoxel = true;
-
-        Color[] pixels = new Color[gridX * gridY * gridZ];
-
-        for (int i = 0; i < pixels.Length; i++)
-        {
-            float temp = obstacleData[i] > 0.5f ? 20f : 20f;
-
-            if (!testVoxel && obstacleData[i] > 0.5f)
-            {
-                temp = 1000f;
-                testVoxel = true;
-
-                Debug.Log("Injected test voxel");
-            }
-
-            pixels[i] = new Color(temp, temp, temp, temp);
-        }
-
-        Texture3D initTex =
-            new Texture3D(gridX, gridY, gridZ, TexFormatFor(solidTemperatureA), false);
-
-        initTex.SetPixels(pixels);
-
-        initTex.Apply();
-
-        Graphics.CopyTexture(initTex, solidTemperatureA);
-
-        Graphics.CopyTexture(initTex, solidTemperatureB);
-
-        Destroy(initTex);
+        FillVolume(solidTemperatureA, 20f);
+        FillVolume(solidTemperatureB, 20f);
     }
 
     RenderTexture CreateVectorVolume()
@@ -1440,6 +1417,13 @@ public partial class ThermalSimulation : MonoBehaviour
         // exterior, mark it solid before the per-object obstacle pass below.
         MarkExteriorAsObstacle(simMin);
 
+        // Answer every "does this voxel's sphere touch this mesh?" question
+        // up front, in parallel across all CPU cores. The pass below then
+        // walks the colliders in the same order as always and just reads
+        // the answers, so which collider claims a voxel is unchanged.
+        bool[] meshInside = QueryMeshOccupancy(simMin);
+        int q = 0;
+
         for (int c = 0; c < obstacleColliders.Length; c++)
         {
             Collider collider = obstacleColliders[c];
@@ -1470,6 +1454,11 @@ public partial class ThermalSimulation : MonoBehaviour
                     for (int x = minX; x <= maxX; x++)
                     {
                         int index = x + gridX * (y + gridY * z);
+
+                        // One precomputed answer per voxel of every
+                        // non-convex mesh's range, assigned or not.
+                        bool meshHit = nonConvexMesh && meshInside[q++];
+
                         if (assigned[index]) continue;
 
                         Vector3 voxelPos = simMin +
@@ -1478,18 +1467,7 @@ public partial class ThermalSimulation : MonoBehaviour
                         bool inside;
                         if (nonConvexMesh)
                         {
-                            inside = false;
-                            Collider[] hits = Physics.OverlapSphere(
-                                voxelPos, cellSize * 0.45f);
-
-                            foreach (var hit in hits)
-                            {
-                                if (hit == meshCollider)
-                                {
-                                    inside = true;
-                                    break;
-                                }
-                            }
+                            inside = meshHit;
                         }
                         else
                         {
@@ -1544,6 +1522,116 @@ public partial class ThermalSimulation : MonoBehaviour
         UploadFuelVolume();
         UploadBurningVolume();
         UploadOpeningVolume();
+    }
+
+    // Reused result buffer for SphereTouches: one OverlapSphere per voxel
+    // used to allocate a new array every call (~160k arrays per Rebake).
+    static readonly Collider[] _overlapHits = new Collider[64];
+
+    // True if a sphere at `centre` touches `target`. Same answer as checking
+    // Physics.OverlapSphere(centre, radius) for target, but only queries the
+    // target's own layer (target is returned exactly when it overlaps, other
+    // layers can't change that) and doesn't allocate. If the buffer fills,
+    // it falls back to the allocating query so no hit can be missed.
+    static bool SphereTouches(Collider target, Vector3 centre, float radius)
+    {
+        int mask = 1 << target.gameObject.layer;
+        int n = Physics.OverlapSphereNonAlloc(centre, radius, _overlapHits, mask);
+
+        if (n == _overlapHits.Length)
+            return System.Array.IndexOf(Physics.OverlapSphere(centre, radius, mask), target) >= 0;
+
+        for (int i = 0; i < n; i++)
+            if (_overlapHits[i] == target) return true;
+
+        return false;
+    }
+
+    // Runs the sphere test for every voxel in the bounds of every non-convex
+    // mesh obstacle, as one batch of OverlapSphereCommands spread across the
+    // job workers. Same query as SphereTouches (verified identical), in the
+    // same collider/z/y/x order BuildObstacleVolume reads them back in. A
+    // query that fills its hit buffer is re-asked exactly on the main thread.
+    bool[] QueryMeshOccupancy(Vector3 simMin)
+    {
+        const int MaxHits = 16;
+        float radius = cellSize * 0.45f;
+
+        var points = new List<Vector3>();
+        var owners = new List<MeshCollider>();
+
+        for (int c = 0; c < obstacleColliders.Length; c++)
+        {
+            MeshCollider mc = obstacleColliders[c] as MeshCollider;
+            if (mc == null || mc.convex) continue;
+
+            Bounds b = mc.bounds;
+            Vector3 minV = (b.min - simMin) / cellSize;
+            Vector3 maxV = (b.max - simMin) / cellSize;
+
+            int minX = Mathf.Clamp(Mathf.FloorToInt(minV.x), 0, gridX - 1);
+            int minY = Mathf.Clamp(Mathf.FloorToInt(minV.y), 0, gridY - 1);
+            int minZ = Mathf.Clamp(Mathf.FloorToInt(minV.z), 0, gridZ - 1);
+            int maxX = Mathf.Clamp(Mathf.CeilToInt(maxV.x), 0, gridX - 1);
+            int maxY = Mathf.Clamp(Mathf.CeilToInt(maxV.y), 0, gridY - 1);
+            int maxZ = Mathf.Clamp(Mathf.CeilToInt(maxV.z), 0, gridZ - 1);
+
+            for (int z = minZ; z <= maxZ; z++)
+                for (int y = minY; y <= maxY; y++)
+                    for (int x = minX; x <= maxX; x++)
+                    {
+                        points.Add(simMin + new Vector3(x + 0.5f, y + 0.5f, z + 0.5f) * cellSize);
+                        owners.Add(mc);
+                    }
+        }
+
+        int n = points.Count;
+        var result = new bool[n];
+        if (n == 0) return result;
+
+        var commands = new Unity.Collections.NativeArray<OverlapSphereCommand>(
+            n, Unity.Collections.Allocator.TempJob);
+        var hits = new Unity.Collections.NativeArray<ColliderHit>(
+            n * MaxHits, Unity.Collections.Allocator.TempJob);
+
+        try
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var qp = new QueryParameters(1 << owners[i].gameObject.layer,
+                                             false, QueryTriggerInteraction.UseGlobal, false);
+                commands[i] = new OverlapSphereCommand(points[i], radius, qp);
+            }
+
+            OverlapSphereCommand.ScheduleBatch(commands, hits, 256, MaxHits).Complete();
+
+            for (int i = 0; i < n; i++)
+            {
+                int target = owners[i].GetInstanceID();
+                int used = 0;
+                bool inside = false;
+
+                for (int k = 0; k < MaxHits; k++)
+                {
+                    int id = hits[i * MaxHits + k].instanceID;
+                    if (id == 0) break;
+                    used++;
+                    if (id == target) inside = true;
+                }
+
+                if (used == MaxHits && !inside)
+                    inside = SphereTouches(owners[i], points[i], radius);
+
+                result[i] = inside;
+            }
+        }
+        finally
+        {
+            commands.Dispose();
+            hits.Dispose();
+        }
+
+        return result;
     }
 
     void MarkExteriorAsObstacle(Vector3 simMin)
@@ -1621,119 +1709,49 @@ public partial class ThermalSimulation : MonoBehaviour
         }
     }
 
-    void UploadOpeningVolume()
-    {
-        Color[] pixels = new Color[openingData.Length];
+    void UploadOpeningVolume() => UploadScalarVolume(openingData, openingVolume);
 
-        for (int i = 0; i < openingData.Length; i++)
+    void UploadObstacleVolume() => UploadScalarVolume(obstacleData, obstacleVolume);
+
+    void UploadMaterialVolume() => UploadScalarVolume(materialData, materialVolume);
+
+    void UploadFuelVolume() => UploadScalarVolume(fuelData, fuelA, fuelB);
+
+    void UploadBurningVolume() => UploadScalarVolume(burningData, burningA, burningB);
+
+    // Scratch buffer for half-float uploads, reused across uploads.
+    ushort[] _halfScratch;
+
+    // Uploads one float per voxel into `target` (and `target2`), writing the
+    // texture's own format directly. Replaces building a 16-byte Color per
+    // voxel and letting SetPixels convert it: a quarter of the memory and no
+    // per-upload garbage. Values are identical: RFloat takes the floats as
+    // they are, and everything stored in a half field here (0/1 flags and
+    // small integer material ids) is exactly representable in half.
+    void UploadScalarVolume(float[] data, RenderTexture target, RenderTexture target2 = null)
+    {
+        TextureFormat format = TexFormatFor(target);
+        var temp = new Texture3D(gridX, gridY, gridZ, format, false);
+
+        if (format == TextureFormat.RHalf)
         {
-            float v = openingData[i];
-            pixels[i] = new Color(v, v, v, v);
+            if (_halfScratch == null || _halfScratch.Length != data.Length)
+                _halfScratch = new ushort[data.Length];
+
+            for (int i = 0; i < data.Length; i++)
+                _halfScratch[i] = Mathf.FloatToHalf(data[i]);
+
+            temp.SetPixelData(_halfScratch, 0);
+        }
+        else
+        {
+            temp.SetPixelData(data, 0);   // RFloat
         }
 
-        Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TexFormatFor(openingVolume), false);
+        temp.Apply(false);
 
-        temp.SetPixels(pixels);
-        temp.Apply();
-
-        Graphics.CopyTexture(temp, openingVolume);
-
-        Destroy(temp);
-    }
-
-    void UploadObstacleVolume()
-    {
-        Color[] pixels = new Color[obstacleData.Length];
-
-        for (int i = 0; i < obstacleData.Length; i++)
-        {
-            float v = obstacleData[i];
-
-            pixels[i] = new Color(v, v, v, v);
-        }
-
-        Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TexFormatFor(obstacleVolume), false);
-
-        temp.SetPixels(pixels);
-
-        temp.Apply();
-
-        Graphics.CopyTexture(temp, obstacleVolume);
-
-        Destroy(temp);
-    }
-
-    void UploadMaterialVolume()
-    {
-        Color[] pixels = new Color[materialData.Length];
-
-        for (int i = 0; i < materialData.Length; i++)
-        {
-            float v = materialData[i];
-
-            pixels[i] = new Color(v, v, v, v);
-        }
-
-        Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TexFormatFor(materialVolume), false);
-
-        temp.SetPixels(pixels);
-
-        temp.Apply();
-
-        Graphics.CopyTexture(temp, materialVolume);
-
-        Destroy(temp);
-    }
-
-    void UploadFuelVolume()
-    {
-        Color[] pixels = new Color[fuelData.Length];
-
-        for (int i = 0; i < fuelData.Length; i++)
-        {
-            float v = fuelData[i];
-
-            pixels[i] = new Color(v, v, v, v);
-        }
-
-        Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TexFormatFor(fuelA), false);
-
-        temp.SetPixels(pixels);
-
-        temp.Apply();
-
-        Graphics.CopyTexture(temp, fuelA);
-
-        Graphics.CopyTexture(temp, fuelB);
-
-        Destroy(temp);
-    }
-
-    void UploadBurningVolume()
-    {
-        Color[] pixels = new Color[burningData.Length];
-
-        for (int i = 0; i < burningData.Length; i++)
-        {
-            float v = burningData[i];
-
-            pixels[i] = new Color(v, v, v, v);
-        }
-
-        Texture3D temp =
-            new Texture3D(gridX, gridY, gridZ, TexFormatFor(burningA), false);
-
-        temp.SetPixels(pixels);
-
-        temp.Apply();
-
-        Graphics.CopyTexture(temp, burningA);
-
-        Graphics.CopyTexture(temp, burningB);
+        Graphics.CopyTexture(temp, target);
+        if (target2 != null) Graphics.CopyTexture(temp, target2);
 
         Destroy(temp);
     }
@@ -2002,26 +2020,49 @@ public partial class ThermalSimulation : MonoBehaviour
         return false;
     }
 
-    public void ResetChar()
-    {
-        Color[] pixels = new Color[gridX * gridY * gridZ];
-        var tex = new Texture3D(gridX, gridY, gridZ, TexFormatFor(charVolume), false);
-        tex.SetPixels(pixels);
-        tex.Apply();
-        Graphics.CopyTexture(tex, charVolume);
-        Destroy(tex);
-    }
+    public void ResetChar() => FillVolume(charVolume, 0f);
 
     #region Reset & Cleanup
     Texture3D MakeFilledVolume(TextureFormat format, float value)
     {
-        Color[] pixels = new Color[gridX * gridY * gridZ];
-        Color c = new Color(value, value, value, value);
-        for (int i = 0; i < pixels.Length; i++) pixels[i] = c;
-
+        int voxels = gridX * gridY * gridZ;
         var tex = new Texture3D(gridX, gridY, gridZ, format, false);
-        tex.SetPixels(pixels);
-        tex.Apply();
+
+        switch (format)
+        {
+            case TextureFormat.RHalf:
+            {
+                var px = new ushort[voxels];
+                ushort h = Mathf.FloatToHalf(value);
+                for (int i = 0; i < px.Length; i++) px[i] = h;
+                tex.SetPixelData(px, 0);
+                break;
+            }
+            case TextureFormat.RGBAHalf:
+            {
+                var px = new ushort[voxels * 4];
+                ushort h = Mathf.FloatToHalf(value);
+                for (int i = 0; i < px.Length; i++) px[i] = h;
+                tex.SetPixelData(px, 0);
+                break;
+            }
+            case TextureFormat.RGBAFloat:
+            {
+                var px = new float[voxels * 4];
+                for (int i = 0; i < px.Length; i++) px[i] = value;
+                tex.SetPixelData(px, 0);
+                break;
+            }
+            default: // RFloat
+            {
+                var px = new float[voxels];
+                for (int i = 0; i < px.Length; i++) px[i] = value;
+                tex.SetPixelData(px, 0);
+                break;
+            }
+        }
+
+        tex.Apply(false);
         return tex;
     }
 

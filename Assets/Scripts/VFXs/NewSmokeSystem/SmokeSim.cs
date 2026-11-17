@@ -1,9 +1,10 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
-// Volumetric smoke + fire simulation with support for multiple emitters
-// sharing one voxel grid. Fire produces smoke as it burns. Both fields
-// are composited in a single raymarch shader pass.
+//Volumetric smoke + fire simulation with support for multiple emitters
+//sharing one voxel grid. Fire produces smoke as it burns. Both fields
+//are composited in a single raymarch shader pass.
 [ExecuteAlways]
 public class SmokeSim : MonoBehaviour
 {
@@ -227,6 +228,8 @@ public class SmokeSim : MonoBehaviour
 
     [Header("Rendering")]
     public Material smokeMaterial;
+    //Flames light the smoke around them, not just the smoke inside them. Strength/colour live on the material.
+    public bool fireLitSmoke = true;
 
     [Header("Performance")]
     [Tooltip("Simulation steps per second. Runs from Update, never more than " +
@@ -241,17 +244,17 @@ public class SmokeSim : MonoBehaviour
     public enum WindPreset
     {
         None,
-        North,          // +Z
-        South,          // -Z
-        East,           // +X
-        West,           // -X
-        Up,             // +Y (rare — updraft)
-        Down,           // -Y (rare — downdraft)
+        North,          //+Z
+        South,          //-Z
+        East,           //+X
+        West,           //-X
+        Up,             //+Y (rare — updraft)
+        Down,           //-Y (rare — downdraft)
         NorthEast,
         NorthWest,
         SouthEast,
         SouthWest,
-        Custom          // use windDirectionCustom instead
+        Custom          //use windDirectionCustom instead
     }
 
     [Header("Wind & Attractor")]
@@ -283,7 +286,7 @@ public class SmokeSim : MonoBehaviour
         }
     }
 
-    // ---- internals ----
+    //---- internals ----
     int gridX, gridY, gridZ;
     Vector3 origin;
 
@@ -291,20 +294,42 @@ public class SmokeSim : MonoBehaviour
     RenderTexture fireA, fireB;
     RenderTexture obstacle;
 
-    // Sheet-weighted copy of the flame field, used for rendering only.
-    // The simulation keeps stepping the physical field in fireA/fireB.
+    //Sheet-weighted copy of the flame field, used for rendering only.
+    //The simulation keeps stepping the physical field in fireA/fireB.
     RenderTexture fireEmission;
 
-    // 1x1x1 float4 stand-in bound to CoarseVelocity when no ThermalSimulation
-    // is driving. Unity validates every referenced texture at dispatch time
-    // regardless of whether the shader path actually reads it.
+    //1x1x1 float4 stand-in bound to CoarseVelocity when no ThermalSimulation
+    //is driving. Unity validates every referenced texture at dispatch time
+    //regardless of whether the shader path actually reads it.
     RenderTexture fallbackVelocity;
 
-    // 1x1x1 float stand-in bound to CoarseBurning / CoarseObstacle when the
-    // thermal sim isn't available, for the same reason as fallbackVelocity.
+    //1x1x1 float stand-in bound to CoarseBurning / CoarseObstacle when the
+    //thermal sim isn't available, for the same reason as fallbackVelocity.
     RenderTexture fallbackScalar;
 
-    int kEmit, kStep, kEmitFire, kStepFire, kClear, kFireEmission;
+    int kEmit, kStep, kEmitFire, kStepFire, kClear, kFireEmission, kOccupancy, kGlowDown, kGlowBlur;
+
+    //Fire glow: a blurred quarter-res copy of the flame (r) plus which cells are mostly wall (g),
+    //so the blur stops at walls instead of lighting smoke in the next room.
+    const int GlowDown = 4;
+    RenderTexture glowA, glowB;
+    int glowX, glowY, glowZ;
+
+    //Empty-space map for SmokeVolumeStandalone: one value per 8x8x8 brick,
+    //rebuilt every step. Lets the ray-marcher skip air that holds nothing.
+    const int OccBrick = 8;
+    RenderTexture occupancy;
+    int occX, occY, occZ;
+
+    static readonly int ID_SmokeTex   = Shader.PropertyToID("_SmokeTex");
+    static readonly int ID_FireTex    = Shader.PropertyToID("_FireTex");
+    static readonly int ID_VolumeMin  = Shader.PropertyToID("_VolumeMin");
+    static readonly int ID_VolumeSize = Shader.PropertyToID("_VolumeSize");
+    static readonly int ID_OccTex     = Shader.PropertyToID("_OccTex");
+    static readonly int ID_OccGrid    = Shader.PropertyToID("_OccGrid");
+    static readonly int ID_OccEnabled = Shader.PropertyToID("_OccEnabled");
+    static readonly int ID_GlowTex    = Shader.PropertyToID("_FireGlowTex");
+    static readonly int ID_GlowOn     = Shader.PropertyToID("_FireGlowEnabled");
     bool initialized;
 
     ComputeBuffer emitterBuffer;
@@ -313,9 +338,9 @@ public class SmokeSim : MonoBehaviour
     EmitterGPU[] emitterCPUCache;
     bool loggedOverflowOnce;
 
-    // Must match EmitterData in SmokeSim.compute exactly (field order and
-    // size). StructuredBuffer layout is positional; any mismatch corrupts
-    // every field silently.
+    //Must match EmitterData in SmokeSim.compute exactly (field order and
+    //size). StructuredBuffer layout is positional; any mismatch corrupts
+    //every field silently.
     struct EmitterGPU
     {
         public Vector3 center;
@@ -326,24 +351,24 @@ public class SmokeSim : MonoBehaviour
 
     const int MaxEmitters = 32;
 
-    // -------------------------------------------------------------------
-    // Runtime emitters.
+    //-------------------------------------------------------------------
+    //Runtime emitters.
     //
-    // There is exactly one smoke grid in the scene, so a fire spawned at
-    // play time cannot bring its own SmokeSim -- it registers an Emitter
-    // against this one instead. Mirrors ThermalSimulation's
-    // RegisterFireSource / _fireSources pattern so both sims are driven
-    // the same way.
+    //There is exactly one smoke grid in the scene, so a fire spawned at
+    //play time cannot bring its own SmokeSim -- it registers an Emitter
+    //against this one instead. Mirrors ThermalSimulation's
+    //RegisterFireSource / _fireSources pattern so both sims are driven
+    //the same way.
     //
-    // The list holds live Emitter objects and BuildEmitterBuffer re-reads
-    // them every sim step, so mutating radius/smokeRate/fireRate on a
-    // registered emitter takes effect next tick with no re-registration
-    // and no reinit.
-    // -------------------------------------------------------------------
+    //The list holds live Emitter objects and BuildEmitterBuffer re-reads
+    //them every sim step, so mutating radius/smokeRate/fireRate on a
+    //registered emitter takes effect next tick with no re-registration
+    //and no reinit.
+    //-------------------------------------------------------------------
     static SmokeSim _instance;
 
     public static SmokeSim Instance =>
-        _instance != null ? _instance : (_instance = FindObjectOfType<SmokeSim>());
+        _instance != null ? _instance : (_instance = FindFirstObjectByType<SmokeSim>());
 
     readonly List<Emitter> _runtimeEmitters = new List<Emitter>();
 
@@ -384,15 +409,15 @@ public class SmokeSim : MonoBehaviour
 
     void Init()
     {
-        // -----------------------------------------------------------------
-        // Grid alignment.
+        //-----------------------------------------------------------------
+        //Grid alignment.
         //
-        // Two simulations cannot agree unless they share a world-space
-        // origin. Everything downstream -- the fine->coarse box average,
-        // the coarse->fine velocity fetch, the thermal image lining up with
-        // the visible flame -- assumes fine voxel (i+0.5)*fineCell and
-        // coarse voxel (j+0.5)*coarseCell measure from the same point.
-        // -----------------------------------------------------------------
+        //Two simulations cannot agree unless they share a world-space
+        //origin. Everything downstream -- the fine->coarse box average,
+        //the coarse->fine velocity fetch, the thermal image lining up with
+        //the visible flame -- assumes fine voxel (i+0.5)*fineCell and
+        //coarse voxel (j+0.5)*coarseCell measure from the same point.
+        //-----------------------------------------------------------------
         if (matchThermalBounds && thermalSim != null)
         {
             Bounds tb = thermalSim.SimBounds;
@@ -415,6 +440,9 @@ public class SmokeSim : MonoBehaviour
         kClear = compute.FindKernel("Clear");
         kFireEmission = compute.FindKernel("FireEmission");
         kCopyVolume = compute.FindKernel("CopyVolumeToBuffer");
+        kOccupancy = compute.FindKernel("BuildOccupancy");
+        kGlowDown = compute.FindKernel("FireGlowDown");
+        kGlowBlur = compute.FindKernel("FireGlowBlur");
         volumeReadBuffer = new ComputeBuffer(gridX * gridY * gridZ, sizeof(float));
 
         smokeA = MakeVolume();
@@ -423,6 +451,23 @@ public class SmokeSim : MonoBehaviour
         fireB = MakeVolume();
         obstacle = MakeVolume();
         fireEmission = MakeVolume();
+
+        occX = Mathf.CeilToInt(gridX / (float)OccBrick);
+        occY = Mathf.CeilToInt(gridY / (float)OccBrick);
+        occZ = Mathf.CeilToInt(gridZ / (float)OccBrick);
+        occupancy = new RenderTexture(occX, occY, 0, RenderTextureFormat.RFloat);
+        occupancy.dimension = UnityEngine.Rendering.TextureDimension.Tex3D;
+        occupancy.volumeDepth = occZ;
+        occupancy.enableRandomWrite = true;
+        occupancy.filterMode = FilterMode.Point;
+        occupancy.wrapMode = TextureWrapMode.Clamp;
+        occupancy.Create();
+
+        glowX = Mathf.CeilToInt(gridX / (float)GlowDown);
+        glowY = Mathf.CeilToInt(gridY / (float)GlowDown);
+        glowZ = Mathf.CeilToInt(gridZ / (float)GlowDown);
+        glowA = MakeGlowVolume();
+        glowB = MakeGlowVolume();
 
         fallbackVelocity = new RenderTexture(1, 1, 0, RenderTextureFormat.ARGBFloat);
         fallbackVelocity.dimension = UnityEngine.Rendering.TextureDimension.Tex3D;
@@ -438,7 +483,7 @@ public class SmokeSim : MonoBehaviour
         fallbackScalar.wrapMode = TextureWrapMode.Clamp;
         fallbackScalar.Create();
         {
-            // Fresh RTs are undefined, not zero.
+            //Fresh RTs are undefined, not zero.
             RenderTexture prev = RenderTexture.active;
             RenderTexture.active = fallbackScalar;
             GL.Clear(false, true, Color.clear);
@@ -451,7 +496,7 @@ public class SmokeSim : MonoBehaviour
         ClearVolume(fireA);
         ClearVolume(fireB);
 
-        // 6 floats per emitter: center(3) + radius(1) + emitRate(1) + fireRate(1)
+        //6 floats per emitter: center(3) + radius(1) + emitRate(1) + fireRate(1)
         emitterBuffer = new ComputeBuffer(MaxEmitters, sizeof(float) * 6);
         emitterCPUCache = new EmitterGPU[MaxEmitters];
 
@@ -460,18 +505,22 @@ public class SmokeSim : MonoBehaviour
         transform.position = volumeCenter;
         transform.localScale = volumeSize;
 
+        //Bind now, not on the first step. Otherwise the material samples nothing for a frame or two
+        //and the whole volume flashes as a yellow fog.
+        BindRenderTextures();
+
         initialized = true;
     }
 
-    // -------------------------------------------------------------------
-    // Stepping.
+    //-------------------------------------------------------------------
+    //Stepping.
     //
-    // Runs from Update at simulationHz, at most ONE step per frame. It used
-    // to run in FixedUpdate: when a frame ran long, Unity ran several
-    // catch-up FixedUpdates the next frame, each a full sim step, which made
-    // that frame slower still. On Quest that spiral never recovers. Here a
-    // late frame just drops the backlog and the sim runs slightly slow.
-    // -------------------------------------------------------------------
+    //Runs from Update at simulationHz, at most ONE step per frame. It used
+    //to run in FixedUpdate: when a frame ran long, Unity ran several
+    //catch-up FixedUpdates the next frame, each a full sim step, which made
+    //that frame slower still. On Quest that spiral never recovers. Here a
+    //late frame just drops the backlog and the sim runs slightly slow.
+    //-------------------------------------------------------------------
     void Update()
     {
         if (!Application.isPlaying || !initialized || compute == null) return;
@@ -506,12 +555,26 @@ public class SmokeSim : MonoBehaviour
         BindRenderTextures();
     }
 
-    // Rebuilds the GPU emitter buffer from BOTH sources each tick: the
-    // Inspector list (authored, level-designer fires) and the runtime list
-    // (fires spawned by PlaceTool). Skips disabled/null entries. Uploads
-    // the full fixed-size array (~768 bytes) rather than a partial range --
-    // trivial cost, and it means the compute shader only ever reads the
-    // first `count` slots.
+    //Marks which bricks hold anything the ray-marcher would draw, from the
+    //exact textures bound to the material this step.
+    void BuildOccupancy(Texture smokeTex, Texture fireTex)
+    {
+        compute.SetTexture(kOccupancy, "OccSmokeIn", smokeTex);
+        compute.SetTexture(kOccupancy, "OccFireIn", fireTex);
+        compute.SetTexture(kOccupancy, "OccupancyOut", occupancy);
+        compute.SetInts("OccGridSize", occX, occY, occZ);
+        compute.Dispatch(kOccupancy,
+            Mathf.CeilToInt(occX / 4f),
+            Mathf.CeilToInt(occY / 4f),
+            Mathf.CeilToInt(occZ / 4f));
+    }
+
+    //Rebuilds the GPU emitter buffer from BOTH sources each tick: the
+    //Inspector list (authored, level-designer fires) and the runtime list
+    //(fires spawned by PlaceTool). Skips disabled/null entries. Uploads
+    //the full fixed-size array (~768 bytes) rather than a partial range --
+    //trivial cost, and it means the compute shader only ever reads the
+    //first `count` slots.
     void BuildEmitterBuffer()
     {
         int count = 0;
@@ -554,10 +617,10 @@ public class SmokeSim : MonoBehaviour
         emitterBuffer.SetData(emitterCPUCache);
         compute.SetBuffer(kEmit, "Emitters", emitterBuffer);
         compute.SetBuffer(kEmitFire, "Emitters", emitterBuffer);
-        // Step now needs the emitter list too, for the near-source anchor ramp.
+        //Step now needs the emitter list too, for the near-source anchor ramp.
         compute.SetBuffer(kStep, "Emitters", emitterBuffer);
-        // StepFire reaches the emitters through TransportOffset (buoyancy,
-        // entrainment, anchor) and FlameDilution.
+        //StepFire reaches the emitters through TransportOffset (buoyancy,
+        //entrainment, anchor) and FlameDilution.
         compute.SetBuffer(kStepFire, "Emitters", emitterBuffer);
         compute.SetInt("EmitterCount", count);
     }
@@ -574,13 +637,13 @@ public class SmokeSim : MonoBehaviour
         Swap(ref smokeA, ref smokeB);
     }
 
-    // -------------------------------------------------------------------
-    // Everything the fine grid needs to know about the coarse solver.
+    //-------------------------------------------------------------------
+    //Everything the fine grid needs to know about the coarse solver.
     //
-    // Velocity is exchanged in METRES PER SECOND. That is the only unit
-    // both grids can agree on, since they have different cell sizes -- a
-    // velocity in "voxels per second" means different things on each.
-    // -------------------------------------------------------------------
+    //Velocity is exchanged in METRES PER SECOND. That is the only unit
+    //both grids can agree on, since they have different cell sizes -- a
+    //velocity in "voxels per second" means different things on each.
+    //-------------------------------------------------------------------
     void UploadCouplingParams()
     {
         compute.SetFloat("CellSizeMeters", cellSize);
@@ -596,8 +659,8 @@ public class SmokeSim : MonoBehaviour
         compute.SetFloat("ReactionSheetScale", reactionSheetScale);
         compute.SetFloat("ReactionSheetWeight", reactionSheetWeight);
 
-        // Fuel bed shape. The noise scale is uploaded per VOXEL so the
-        // hot-spot size stays the same in metres whatever the cell size.
+        //Fuel bed shape. The noise scale is uploaded per VOXEL so the
+        //hot-spot size stays the same in metres whatever the cell size.
         compute.SetFloat("FireBedThickness", fireBedThickness);
         compute.SetFloat("FireBedBreakup", fireBedBreakup);
         compute.SetFloat("FireBedNoiseScale", cellSize / Mathf.Max(fireBedFeatureSize, 1e-3f));
@@ -624,9 +687,9 @@ public class SmokeSim : MonoBehaviour
         }
         else
         {
-            // No solver available. VelocityInfluence 0 makes the samples
-            // irrelevant, but the texture must STILL be bound or Unity
-            // refuses to dispatch the kernel at all. Any 3D texture will do.
+            //No solver available. VelocityInfluence 0 makes the samples
+            //irrelevant, but the texture must STILL be bound or Unity
+            //refuses to dispatch the kernel at all. Any 3D texture will do.
             compute.SetTexture(kStep, "CoarseVelocity", fallbackVelocity);
             compute.SetTexture(kStepFire, "CoarseVelocity", fallbackVelocity);
             compute.SetInts("CoarseGridSize", 1, 1, 1);
@@ -634,7 +697,7 @@ public class SmokeSim : MonoBehaviour
             compute.SetFloat("VelocityInfluence", 0f);
         }
 
-        // --- burning surfaces from the thermal sim ---
+        //--- burning surfaces from the thermal sim ---
         RenderTexture coarseBurning = null;
         RenderTexture coarseObstacle = null;
 
@@ -648,9 +711,9 @@ public class SmokeSim : MonoBehaviour
                         && coarseBurning != null
                         && coarseObstacle != null;
 
-        // Every kernel that reaches NearestPlume or BurningSurfaceWeight
-        // references these, so all four need them bound -- otherwise Unity
-        // refuses the dispatch and the ping-pong swap reads an empty field.
+        //Every kernel that reaches NearestPlume or BurningSurfaceWeight
+        //references these, so all four need them bound -- otherwise Unity
+        //refuses the dispatch and the ping-pong swap reads an empty field.
         BindCoarseScalar("CoarseBurning", useSurfaces ? coarseBurning : fallbackScalar);
         BindCoarseScalar("CoarseObstacle", useSurfaces ? coarseObstacle : fallbackScalar);
 
@@ -690,7 +753,7 @@ public class SmokeSim : MonoBehaviour
 
         compute.SetFloat("SmokeWarpClamp", Mathf.Max(0f, smokeWarpClamp));
         compute.SetFloat("SmokeShellSharpness", smokeShellSharpness);
-        // Inspector value is in metres; the shader works in voxels.
+        //Inspector value is in metres; the shader works in voxels.
         compute.SetFloat("SmokeAnchorRadius", smokeAnchorRadius / cellSize);
         compute.SetFloat("SmokeUseCurlNoise", smokeUseCurlNoise ? 1f : 0f);
 
@@ -723,12 +786,12 @@ public class SmokeSim : MonoBehaviour
         compute.SetTexture(kStepFire, "FireOut", fireB);
         compute.SetTexture(kStepFire, "Obstacle", obstacle);
 
-        // TransportOffset still references ShellMask -> ReadSmoke for the
-        // smoke path, so StepFire's compiled kernel touches SmokeIn even
-        // though fire now uses its own edge mask. Without this binding
-        // Unity refuses the dispatch outright, StepFire never runs, and the
-        // Swap below still executes -- so the fire field flips to a buffer
-        // nothing wrote and reads as empty.
+        //TransportOffset still references ShellMask -> ReadSmoke for the
+        //smoke path, so StepFire's compiled kernel touches SmokeIn even
+        //though fire now uses its own edge mask. Without this binding
+        //Unity refuses the dispatch outright, StepFire never runs, and the
+        //Swap below still executes -- so the fire field flips to a buffer
+        //nothing wrote and reads as empty.
         compute.SetTexture(kStepFire, "SmokeIn", smokeA);
 
         Dispatch(kStepFire);
@@ -742,10 +805,10 @@ public class SmokeSim : MonoBehaviour
         Dispatch(kClear);
     }
 
-    // Note: a failed Dispatch is silent apart from a console warning, and the
-    // ping-pong Swap that follows it is NOT skipped. A missing texture binding
-    // therefore shows up as a field that mysteriously empties, not as an error
-    // at the point of use. Check the console first when a field goes blank.
+    //Note: a failed Dispatch is silent apart from a console warning, and the
+    //ping-pong Swap that follows it is NOT skipped. A missing texture binding
+    //therefore shows up as a field that mysteriously empties, not as an error
+    //at the point of use. Check the console first when a field goes blank.
     void Dispatch(int kernel)
     {
         compute.Dispatch(kernel,
@@ -763,9 +826,9 @@ public class SmokeSim : MonoBehaviour
 
     RenderTexture MakeVolume()
     {
-        // Half floats: half the bandwidth of RFloat for every kernel and for
-        // the ray-marcher, and filterable on Quest. Smoke and fire are 0..1
-        // fields, well inside half's precision.
+        //Half floats: half the bandwidth of RFloat for every kernel and for
+        //the ray-marcher, and filterable on Quest. Smoke and fire are 0..1
+        //fields, well inside half's precision.
         var format = SystemInfo.SupportsRandomWriteOnRenderTextureFormat(RenderTextureFormat.RHalf)
             ? RenderTextureFormat.RHalf
             : RenderTextureFormat.RFloat;
@@ -809,7 +872,7 @@ public class SmokeSim : MonoBehaviour
         for (int i = 0; i < data.Length; i++)
             pixels[i] = new Color(data[i], 0, 0, 0);
 
-        // Must match the obstacle RenderTexture's format for CopyTexture.
+        //Must match the obstacle RenderTexture's format for CopyTexture.
         var texFormat = obstacle.format == RenderTextureFormat.RHalf
             ? TextureFormat.RHalf
             : TextureFormat.RFloat;
@@ -833,15 +896,90 @@ public class SmokeSim : MonoBehaviour
     void BindRenderTextures()
     {
         if (smokeMaterial == null) return;
-        smokeMaterial.SetTexture("_SmokeTex", smokeA);
-        // Reaction-sheet weighted flame turns the flame from a glowing blob
-        // into overlapping tongues, but it also DIMS the field, so it is off
-        // by default until the raw flame is confirmed visible.
+        //Reaction-sheet weighted flame turns the flame from a glowing blob
+        //into overlapping tongues, but it also DIMS the field, so it is off
+        //by default until the raw flame is confirmed visible.
         bool useSheet = useReactionSheet && fireEmission != null;
+        RenderTexture fireTex = useSheet ? fireEmission : fireA;
 
-        smokeMaterial.SetTexture("_FireTex", useSheet ? fireEmission : fireA);
-        smokeMaterial.SetVector("_VolumeMin", origin);
-        smokeMaterial.SetVector("_VolumeSize", volumeSize);
+        smokeMaterial.SetTexture(ID_SmokeTex, smokeA);
+        smokeMaterial.SetTexture(ID_FireTex, fireTex);
+        smokeMaterial.SetVector(ID_VolumeMin, origin);
+        smokeMaterial.SetVector(ID_VolumeSize, volumeSize);
+
+        BuildOccupancy(smokeA, fireTex);
+        smokeMaterial.SetTexture(ID_OccTex, occupancy);
+        smokeMaterial.SetVector(ID_OccGrid, new Vector3(gridX, gridY, gridZ));
+        smokeMaterial.SetFloat(ID_OccEnabled, 1f);
+
+        bool glow = fireLitSmoke && glowA != null;
+        if (glow)
+        {
+            BuildFireGlow(fireTex);
+            smokeMaterial.SetTexture(ID_GlowTex, glowB);
+        }
+        smokeMaterial.SetFloat(ID_GlowOn, glow ? 1f : 0f);
+    }
+
+    RenderTexture MakeGlowVolume()
+    {
+        var format = SystemInfo.SupportsRandomWriteOnRenderTextureFormat(RenderTextureFormat.RGHalf)
+            ? RenderTextureFormat.RGHalf
+            : RenderTextureFormat.ARGBHalf;
+        var rt = new RenderTexture(glowX, glowY, 0, format);
+        rt.dimension = TextureDimension.Tex3D;
+        rt.volumeDepth = glowZ;
+        rt.enableRandomWrite = true;
+        rt.filterMode = FilterMode.Bilinear; //smooth light, no blocky quarter-res cells
+        rt.wrapMode = TextureWrapMode.Clamp;
+        rt.Create();
+        return rt;
+    }
+
+    //Shrink the flame to quarter res, then blur it out a few metres along x, y and z.
+    //About 20k cells, a few hundredths of a ms. Ends up in glowB.
+    void BuildFireGlow(Texture fireTex)
+    {
+        compute.SetInts("GridSize", gridX, gridY, gridZ);
+        compute.SetInts("GlowGridSize", glowX, glowY, glowZ);
+        int gx = Mathf.CeilToInt(glowX / 4f), gy = Mathf.CeilToInt(glowY / 4f), gz = Mathf.CeilToInt(glowZ / 4f);
+
+        compute.SetTexture(kGlowDown, "GlowFireIn", fireTex);
+        compute.SetTexture(kGlowDown, "GlowObstacleIn", obstacle);
+        compute.SetTexture(kGlowDown, "GlowOut", glowA);
+        compute.Dispatch(kGlowDown, gx, gy, gz);
+
+        Blur(glowA, glowB, 1, 0, 0, gx, gy, gz);
+        Blur(glowB, glowA, 0, 1, 0, gx, gy, gz);
+        Blur(glowA, glowB, 0, 0, 1, gx, gy, gz);
+    }
+
+    void Blur(RenderTexture src, RenderTexture dst, int ax, int ay, int az, int gx, int gy, int gz)
+    {
+        compute.SetInts("GlowAxis", ax, ay, az);
+        compute.SetTexture(kGlowBlur, "GlowIn", src);
+        compute.SetTexture(kGlowBlur, "GlowOut", dst);
+        compute.Dispatch(kGlowBlur, gx, gy, gz);
+    }
+
+    //Smoke density at a world point, read back from the GPU without stalling.
+    //Fire lights use it to go dull and red once the room fills with smoke.
+    public bool RequestSmokeAt(Vector3 world, System.Action<float> done)
+    {
+        if (!initialized || smokeA == null || !SystemInfo.supportsAsyncGPUReadback) return false;
+
+        Vector3 v = (world - origin) / cellSize;
+        int x = Mathf.Clamp((int)v.x, 0, gridX - 1);
+        int y = Mathf.Clamp((int)v.y, 0, gridY - 1);
+        int z = Mathf.Clamp((int)v.z, 0, gridZ - 1);
+        bool half = smokeA.format == RenderTextureFormat.RHalf;
+
+        AsyncGPUReadback.Request(smokeA, 0, x, 1, y, 1, z, 1, r =>
+        {
+            if (r.hasError) { done(0f); return; }
+            done(half ? Mathf.HalfToFloat(r.GetData<ushort>()[0]) : r.GetData<float>()[0]);
+        });
+        return true;
     }
 
     void Swap<T>(ref T a, ref T b) { T t = a; a = b; b = t; }
@@ -853,6 +991,13 @@ public class SmokeSim : MonoBehaviour
         if (fireA != null) fireA.Release();
         if (fireB != null) fireB.Release();
         if (obstacle != null) obstacle.Release();
+        if (occupancy != null) occupancy.Release();
+        if (glowA != null) glowA.Release();
+        if (glowB != null) glowB.Release();
+        if (smokeMaterial != null) smokeMaterial.SetFloat(ID_GlowOn, 0f);
+        //The material is a project asset: don't leave it pointing at a
+        //map that no longer exists.
+        if (smokeMaterial != null) smokeMaterial.SetFloat(ID_OccEnabled, 0f);
         ReleaseCouplingTextures();
         if (emitterBuffer != null) emitterBuffer.Release();
         if (volumeReadBuffer != null) volumeReadBuffer.Release();
@@ -872,15 +1017,15 @@ public class SmokeSim : MonoBehaviour
             compute.SetFloats("AttractorCenter", attVoxel.x, attVoxel.y, attVoxel.z);
             compute.SetFloat("AttractorRadius", attractorRadius / cellSize);
 
-            // Scale the attractor Transform to size the opening: a 1 x 2 x 0.2
-            // cube standing in a doorway behaves like that doorway. Leave the
-            // scale at zero for the old point-attractor behaviour.
+            //Scale the attractor Transform to size the opening: a 1 x 2 x 0.2
+            //cube standing in a doorway behaves like that doorway. Leave the
+            //scale at zero for the old point-attractor behaviour.
             Vector3 half = attractorPoint.lossyScale * 0.5f / cellSize;
             compute.SetFloats("AttractorHalfExtents",
                               Mathf.Abs(half.x), Mathf.Abs(half.y), Mathf.Abs(half.z));
 
-            // Smoke inside the opening travels along the Transform's blue
-            // axis, so point it the way you want the smoke to go.
+            //Smoke inside the opening travels along the Transform's blue
+            //axis, so point it the way you want the smoke to go.
             Vector3 flow = attractorPoint.forward.normalized;
             compute.SetFloats("AttractorFlowDir", flow.x, flow.y, flow.z);
             compute.SetFloat("AttractorStrength", attractorStrength);
@@ -909,7 +1054,7 @@ public class SmokeSim : MonoBehaviour
                     ? new Color(1f, 0.3f, 0f, 1f)
                     : new Color(0.4f, 0.4f, 0.4f, 0.5f);
 
-                // Draw the actual emission footprint: a flat bed, not a ball.
+                //Draw the actual emission footprint: a flat bed, not a ball.
                 Vector3 c = e.transform.position;
                 float halfH = Mathf.Max(e.radius * fireBedThickness, cellSize * 0.75f);
                 Gizmos.DrawWireCube(c, new Vector3(e.radius * 2f, halfH * 2f, e.radius * 2f));
@@ -941,9 +1086,9 @@ public class SmokeSim : MonoBehaviour
 
 
     //For debug
-    // Reads any 3D scalar volume back to the CPU with the full depth.
-    // Avoids AsyncGPUReadback's z=0-only bug on Tex3D by copying into a
-    // linear ComputeBuffer first, then reading the buffer.
+    //Reads any 3D scalar volume back to the CPU with the full depth.
+    //Avoids AsyncGPUReadback's z=0-only bug on Tex3D by copying into a
+    //linear ComputeBuffer first, then reading the buffer.
     public void RequestVolumeReadback(RenderTexture volume, System.Action<Unity.Collections.NativeArray<float>> onComplete)
     {
         if (kCopyVolume < 0 || volumeReadBuffer == null)
@@ -968,7 +1113,7 @@ public class SmokeSim : MonoBehaviour
         });
     }
 
-    // Expose grid info so debug tools don't need reflection.
+    //Expose grid info so debug tools don't need reflection.
     public int GridX => gridX;
     public int GridY => gridY;
     public int GridZ => gridZ;
@@ -977,12 +1122,12 @@ public class SmokeSim : MonoBehaviour
     public RenderTexture SmokeVolume => smokeA;
     public RenderTexture FireVolume => fireA;
 
-    // Sheet-weighted flame, for rendering. Point the fire material's
-    // texture at this rather than at FireVolume.
+    //Sheet-weighted flame, for rendering. Point the fire material's
+    //texture at this rather than at FireVolume.
     public RenderTexture FireEmissionVolume => fireEmission;
 
-    // What should be DRAWN. The physical field (FireVolume) still drives the
-    // thermal coupling; this is the reaction-sheet version when that is on.
+    //What should be DRAWN. The physical field (FireVolume) still drives the
+    //thermal coupling; this is the reaction-sheet version when that is on.
     public RenderTexture VisibleFireVolume =>
         (useReactionSheet && fireEmission != null) ? fireEmission : fireA;
 
