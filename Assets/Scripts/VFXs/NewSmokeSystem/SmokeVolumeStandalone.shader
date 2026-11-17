@@ -115,6 +115,13 @@ Shader "Custom/SmokeVolumeStandalone"
             float3 _OccGrid;      //sim grid size in voxels
             float  _OccEnabled;
 
+            //Wall scorch from ThermalSimulation (ScorchStep). Globals, 0 when no thermal sim is running.
+            sampler3D _ScorchTex;
+            float  _ScorchEnabled;
+            float  _ScorchDarkness;
+            float3 _ThermalVolumeMin;
+            float3 _ThermalVolumeSize;
+
             float3 FireColor(float f)
             {
                 if (f < 0.5)
@@ -147,6 +154,26 @@ Shader "Custom/SmokeVolumeStandalone"
 
                 return lerp(lerp(lerp(n000, n100, f.x), lerp(n010, n110, f.x), f.y),
                             lerp(lerp(n001, n101, f.x), lerp(n011, n111, f.x), f.y), f.z);
+            }
+
+            //How much the wall behind this pixel lets through, 1 = clean, lower = sooted.
+            //Done here because this pass already knows where every wall pixel is (scene depth),
+            //so scorch costs one texture read instead of a second pass over the walls.
+            float ScorchKeep(float3 surfaceBox)
+            {
+                float3 world = mul(unity_ObjectToWorld, float4(surfaceBox - 0.5, 1)).xyz;
+                float3 uvw = (world - _ThermalVolumeMin) / _ThermalVolumeSize;
+                if (any(uvw < 0.0) || any(uvw > 1.0)) return 1.0;
+
+                float scorch = tex3Dlod(_ScorchTex, float4(uvw, 0)).r;
+                if (scorch < 0.002) return 1.0;
+
+                //Patchy, slightly streaked upward like soot, and hides the 20 cm cells
+                float3 q = world * float3(4.0, 2.0, 4.0);
+                float n = ValueNoise3(q) * 0.6 + ValueNoise3(q * 2.7 + 13.1) * 0.4;
+                float soot = saturate(scorch * (0.55 + 0.9 * n));
+
+                return 1.0 - soot * _ScorchDarkness;
             }
 
             //Sideways (xz) displacement for the fire lookup, world metres.
@@ -290,6 +317,11 @@ Shader "Custom/SmokeVolumeStandalone"
                     pos += m.rayDir * m.stepSize;
                     wp  += wStep;
                 }
+
+                //Soot on the wall this ray ends on. With One/OneMinusSrcAlpha the scene is
+                //scaled by (1 - alpha), so folding it into alpha darkens the wall for free.
+                if (_ScorchEnabled > 0.5 && m.hitSurface > 0.5)
+                    transmittance *= ScorchKeep(m.surfacePos);
 
                 return float4(accum, 1.0 - transmittance);
             }

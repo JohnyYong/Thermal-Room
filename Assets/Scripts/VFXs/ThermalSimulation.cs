@@ -111,6 +111,7 @@ public partial class ThermalSimulation : MonoBehaviour
     RenderTexture flameHeatB;
 
     RenderTexture charVolume;
+    RenderTexture scorchVolume;
 
     int copyVolumeKernel;
     ComputeBuffer volumeReadBuffer;
@@ -121,6 +122,7 @@ public partial class ThermalSimulation : MonoBehaviour
     float[] burningData;
 
     int charAccumKernel;
+    int scorchKernel;
     int heatKernel;
     int buoyancyKernel;
     int advectTemperatureKernel;
@@ -260,6 +262,14 @@ public partial class ThermalSimulation : MonoBehaviour
     public float charFullTemp = 400f;
     public bool useTimeForBurn = false;
 
+    //Soot/heat marks on walls that don't burn (steel, concrete, glass). Drawn by the smoke volume pass, no extra draw.
+    [Header("Scorch")]
+    public bool scorchWalls = true;
+    public float scorchStartTemp = 120f;  //wall surface temp where soot starts to stick
+    public float scorchFullTemp = 300f;   //builds at full speed from here
+    public float scorchRate = 0.08f;      //0-1 over ~12 s at full heat, never fades
+    [Range(0f, 1f)] public float scorchDarkness = 0.85f;  //1 = pitch black at full scorch
+
     // Cached once in Start so we don't call FindObjectsOfType twice.
     ThermalMaterial[] _thermalObjects;
 
@@ -382,6 +392,9 @@ public partial class ThermalSimulation : MonoBehaviour
 
         charAccumKernel = simulation.FindKernel("CharAccumStep");
         charVolume = CreateVolume();
+
+        scorchKernel = simulation.FindKernel("ScorchStep");
+        scorchVolume = CreateVolume();
 
         copyVolumeKernel = simulation.FindKernel("CopyVolumeToBuffer");
         volumeReadBuffer = new ComputeBuffer(gridX * gridY * gridZ, sizeof(float));
@@ -634,6 +647,8 @@ public partial class ThermalSimulation : MonoBehaviour
         Shader.SetGlobalVector("_ThermalVolumeMin", bounds.min);
 
         Shader.SetGlobalVector("_ThermalVolumeSize", bounds.size);
+
+        BindScorch();
 
         // Char accumulation only depends on which voxels are currently
         // burning (BurningIn) and where obstacles are -- it doesn't need
@@ -1270,6 +1285,35 @@ public partial class ThermalSimulation : MonoBehaviour
         BindVisibleFireTextures();
 
         fireHeatVolumeMaterial.SetTexture("_FireHeatTex", flameHeatA);
+
+        AccumulateScorch(dt);
+    }
+
+    //Wall soot builds from the wall's own temperature, after this step's heat is in
+    void AccumulateScorch(float dt)
+    {
+        if (!scorchWalls) return;
+
+        simulation.SetTexture(scorchKernel, "SolidTemperatureIn", solidTemperatureA);
+        simulation.SetTexture(scorchKernel, "Obstacle", obstacleVolume);
+        simulation.SetTexture(scorchKernel, "MaterialVolume", materialVolume);
+        simulation.SetTexture(scorchKernel, "ScorchVolume", scorchVolume);
+        simulation.SetFloat("ScorchRate", scorchRate);
+        simulation.SetFloat("ScorchStartTemp", scorchStartTemp);
+        simulation.SetFloat("ScorchFullTemp", scorchFullTemp);
+        simulation.SetFloat("DeltaTime", dt);
+
+        simulation.Dispatch(scorchKernel, Mathf.CeilToInt(gridX / 8f),
+                            Mathf.CeilToInt(gridY / 8f),
+                            Mathf.CeilToInt(gridZ / 8f));
+    }
+
+    //The smoke volume shader reads these to darken the walls it ends on
+    void BindScorch()
+    {
+        Shader.SetGlobalTexture("_ScorchTex", scorchVolume);
+        Shader.SetGlobalFloat("_ScorchEnabled", scorchWalls && scorchVolume != null ? 1f : 0f);
+        Shader.SetGlobalFloat("_ScorchDarkness", scorchDarkness);
     }
 
     // -------------------------------------------------------------------
@@ -1370,8 +1414,11 @@ public partial class ThermalSimulation : MonoBehaviour
             divergence, pressureA, pressureB, obstacleVolume, materialVolume,
             openingVolume, fuelA, fuelB, burningA, burningB,
             suppressantA, suppressantB, solidTemperatureA, solidTemperatureB,
-            curlA, smokeA, smokeB, flameA, flameB, flameHeatA, flameHeatB, charVolume
+            curlA, smokeA, smokeB, flameA, flameB, flameHeatA, flameHeatB, charVolume, scorchVolume
         };
+
+        //Stop the smoke shader sampling a released texture
+        Shader.SetGlobalFloat("_ScorchEnabled", 0f);
         foreach (var rt in all)
             if (rt != null) rt.Release();
 
@@ -2121,6 +2168,7 @@ public partial class ThermalSimulation : MonoBehaviour
 
         // Scorch marks
         ResetChar();
+        if (scorchVolume != null) FillVolume(scorchVolume, 0f);
 
         // Surfaces and volumes show the cleared state immediately,
         // even if the sim is currently paused.
@@ -2143,6 +2191,7 @@ public partial class ThermalSimulation : MonoBehaviour
         Shader.SetGlobalTexture("_BurningTex", burningA);
         Shader.SetGlobalTexture("_FuelTex", fuelA);
         Shader.SetGlobalTexture("_CharTex", charVolume);
+        BindScorch();
 
         if (volumeMaterial) volumeMaterial.SetTexture("_TemperatureTex", temperatureA);
 

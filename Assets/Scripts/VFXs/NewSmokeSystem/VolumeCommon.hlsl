@@ -89,6 +89,8 @@ struct MarchSetup
     float  stepSize;   // box-UVW units per step
     float  stepWorld;  // metres per step
     int    steps;
+    float3 surfacePos; //box space, where the ray hits scene geometry
+    float  hitSurface; //1 if the ray ends on geometry inside the box
 };
 
 // Returns false when there is nothing to march: the ray misses the box,
@@ -133,6 +135,10 @@ bool SetupMarch(v2f i, out MarchSetup m)
     m.stepWorld = travelWorld / steps;
     m.rayDir    = rayDir;
     m.startPos  = rayOrigin + rayDir * (entry + VolumeJitter(i.pos.xy) * m.stepSize);
+
+    //_DepthSlack already pushes this ~2 cm into the surface, which is what scorch sampling wants
+    m.surfacePos = rayOrigin + rayDir * exitDist;
+    m.hitSurface = tScene < hit.y ? 1.0 : 0.0;
 
     return true;
 }

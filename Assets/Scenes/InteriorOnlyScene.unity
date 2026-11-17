@@ -160,6 +160,7 @@ Transform:
   - {fileID: 486333719}
   - {fileID: 1045924576}
   - {fileID: 408007327}
+  - {fileID: 1077433862}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &18917456
@@ -1152,6 +1153,7 @@ GameObject:
   - component: {fileID: 55338655}
   - component: {fileID: 55338654}
   - component: {fileID: 55338659}
+  - component: {fileID: 55338660}
   m_Layer: 0
   m_Name: CustomFireManager (Smoke+Fire)
   m_TagString: Untagged
@@ -1238,6 +1240,7 @@ MonoBehaviour:
   fireNoiseStrength: 11
   fireNoiseSpeed: 6
   smokeMaterial: {fileID: 2100000, guid: 3852d5442683bbc4982d840fae93b82f, type: 2}
+  fireLitSmoke: 1
   simulationHz: 30
   windDirection: 0
   windStrength: 0
@@ -1338,6 +1341,26 @@ MonoBehaviour:
   smokeDecayMultiplier: 0.005
   maxSmokeDecay: -0.8
   undergoingSimulation: 1
+--- !u!114 &55338660
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 55338653}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 5ddbcce2cec6aae459761c4e7b86ec8f, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::FireLight
+  _color: {r: 1, g: 0.55, b: 0.24, a: 1}
+  _smokyColor: {r: 1, g: 0.32, b: 0.1, a: 1}
+  _brightness: 10
+  _range: 9
+  _height: 0.8
+  _flicker: 0.22
+  _smokeDimming: 0.6
+  _fullFireRate: 1
 --- !u!4 &64622231 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: 7679441955810017932, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
@@ -7962,7 +7985,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 150874826118708665, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalPosition.y
-      value: -0.31079
+      value: 0.38
       objectReference: {fileID: 0}
     - target: {fileID: 150874826118708665, guid: 36442245a5e35e449a41df5e2484cb41, type: 3}
       propertyPath: m_LocalPosition.z
@@ -24744,6 +24767,37 @@ Transform:
   m_CorrespondingSourceObject: {fileID: -8679921383154817045, guid: e3623c7a3aa8ab24298671c5fa7c455a, type: 3}
   m_PrefabInstance: {fileID: 1076789650}
   m_PrefabAsset: {fileID: 0}
+--- !u!1 &1077433861
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1077433862}
+  m_Layer: 0
+  m_Name: SpawnPoint
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &1077433862
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1077433861}
+  serializedVersion: 2
+  m_LocalRotation: {x: -0, y: 1, z: -0, w: -0.00000004371139}
+  m_LocalPosition: {x: -0.28064966, y: 0.505, z: 4.02976}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 15882525}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!4 &1083836112 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: 7679441955810017932, guid: 86fbb20edc83bbf45a18544d5bb90c04, type: 3}
@@ -26154,7 +26208,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::RespawnToRoom
   tagToDetect: GameController
-  respawnPos: {fileID: 155604650}
+  respawnPos: {fileID: 1077433862}
   matchRespawnRotation: 1
   refreshSceneCheatCode: 114
 --- !u!1001 &1261012762
@@ -26311,8 +26365,15 @@ MonoBehaviour:
     m_Bits: 4294967295
   thermalObjectsOnly: 0
   ignoreRoot: {fileID: 1707153500}
+  distanceToSpotRatio: 20
+  rayCount: 9
   sampleInterval: 0.1
+  readbackTimeout: 1
   readout: {fileID: 80928940}
+  showDebugReadout: 0
+  onSpotTemperature:
+    m_PersistentCalls:
+      m_Calls: []
   onSurfaceTemperature:
     m_PersistentCalls:
       m_Calls: []
@@ -29430,7 +29491,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: fb4045e951da2d34482ad99d1a0579b5, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::ThermalSampler
-  _sampleInterval: 0.01
+  _sampleInterval: 0.2
 --- !u!1001 &1485064044
 PrefabInstance:
   m_ObjectHideFlags: 0

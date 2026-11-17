@@ -1913,6 +1913,68 @@ void CharAccumStep (uint3 id : SV_DispatchThreadID)
 		CharVolume[id] + burning * CharRate * DeltaTime, 1.0);
 }
 
+//-------------------------------------------------------------------
+//Scorch: soot/heat marks on walls that don't burn (steel, concrete, glass).
+//Builds with time spent hot and never fades, like real soot. Wood/cloth
+//are left out, they get char from CharAccumStep instead.
+//Air cells touching a wall take the wall's value too: the smoke shader
+//samples right at the surface, which sits between a wall cell and an air
+//cell, so without this the mark would read at half strength.
+//-------------------------------------------------------------------
+#pragma kernel ScorchStep
+
+RWTexture3D<float> ScorchVolume;
+float ScorchRate;
+float ScorchStartTemp;
+float ScorchFullTemp;
+
+static const int3 kFaces[6] =
+{
+	int3(1, 0, 0), int3(-1, 0, 0),
+	int3(0, 1, 0), int3(0, -1, 0),
+	int3(0, 0, 1), int3(0, 0, -1)
+};
+
+bool IsScorchable(int3 p)
+{
+	//Separate return so nothing reads outside the grid (HLSL && doesn't short-circuit)
+	if (any(p < 0) || p.x >= GridX || p.y >= GridY || p.z >= GridZ)
+		return false;
+
+	float m = MaterialVolume[p];
+	return Obstacle[p] > 0.5 && m > 1.5 && m < 4.5;
+}
+
+[numthreads(8,8,8)]
+void ScorchStep (uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= (uint)GridX || id.y >= (uint)GridY || id.z >= (uint)GridZ) return;
+
+	int3 p = int3(id);
+	float temp = -1e4;
+
+	if (IsScorchable(p))
+	{
+		temp = SolidTemperatureIn[p];
+	}
+	else if (Obstacle[p] < 0.5)
+	{
+		//Air: hottest wall face next to it
+		[unroll]
+		for (int f = 0; f < 6; f++)
+		{
+			int3 n = p + kFaces[f];
+			if (IsScorchable(n))
+				temp = max(temp, SolidTemperatureIn[n]);
+		}
+	}
+
+	if (temp <= ScorchStartTemp) return;
+
+	float heat = saturate((temp - ScorchStartTemp) / max(ScorchFullTemp - ScorchStartTemp, 1.0));
+	ScorchVolume[id] = min(ScorchVolume[id] + heat * ScorchRate * DeltaTime, 1.0);
+}
+
 // AsyncGPUReadback.Request() does not reliably return the full depth of a
 // Tex3D RenderTexture on all backends -- it can silently give back only the
 // z=0 slice. To read a volume back on the CPU correctly, copy it into a
